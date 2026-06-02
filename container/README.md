@@ -1,7 +1,3 @@
-Here’s a cleaner, more structured, and more “production-grade” version of your docs with better flow, clarity, and fewer ambiguities:
-
----
-
 # Container Setup
 
 This guide shows how to run **jsbox** using Docker Compose.
