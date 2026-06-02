@@ -168,13 +168,13 @@ Optional `config.json` in the working directory. All fields have defaults:
 
 | Field              | Default    | Description                               |
 | ------------------ | ---------- | ----------------------------------------- |
-| `memory_limit`     | `"8mb"`    | Max JS heap per execution                 |
-| `max_stack_size`   | `"256kb"`  | Max native call stack (recursion depth)   |
-| `timeout_ms`       | `100`      | Max wall-clock execution time             |
+| `memory_limit`     | `"32mb"`   | Max JS heap per execution                 |
+| `max_stack_size`   | `"512kb"`  | Max native call stack (recursion depth)   |
+| `timeout_ms`       | `4000`     | Max wall-clock execution time             |
 | `pool_size`        | `0` (auto) | QuickJS runtime pool size (0 = CPU cores) |
 | `max_script_size`  | `"1mb"`    | Max script source size                    |
-| `max_context_size` | `"5mb"`    | Max context JSON size                     |
-| `max_ops`          | `50`       | Max HTTP + DB operations per execution    |
+| `max_context_size` | `"10mb"`   | Max context JSON size                     |
+| `max_ops`          | `2000`     | Max HTTP + DB operations per execution    |
 
 Size fields accept `"8mb"`, `"256kb"`, `"1gb"`, or plain numbers in bytes.
 

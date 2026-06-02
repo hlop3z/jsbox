@@ -69,16 +69,45 @@ impl Default for ServerConfig {
     }
 }
 
+
+
+/// EngineConfig
+///
+/// This configuration controls execution limits for the scripting engine,
+/// and each group of settings maps to a specific safety boundary:
+///
+/// # CPU safety
+/// - `max_ops`: limits total instruction execution count per script
+/// - `timeout_ms`: limits wall-clock execution time
+///
+/// Together, these prevent runaway computation and infinite loops.
+///
+/// # Data safety
+/// - `memory_limit`: caps total heap usage for script execution
+/// - `max_context_size`: limits size of input context passed into the script
+///
+/// Together, these prevent memory exhaustion from large payloads or allocations.
+///
+/// # Recursion safety
+/// - `max_stack_size`: limits call stack depth and prevents stack overflow
+///
+/// This protects against deep recursion or excessively nested function calls.
+///
+/// # Throughput
+/// - `pool_size`: controls number of concurrent execution workers
+///
+/// Higher values increase parallelism and request throughput, but may increase
+/// resource contention under load.
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            memory_limit: 8 * 1024 * 1024,
-            max_stack_size: 256 * 1024,
-            timeout_ms: 100,
-            pool_size: 0,
-            max_script_size: 1024 * 1024,
-            max_context_size: 5 * 1024 * 1024,
-            max_ops: 50,
+            memory_limit: 32 * 1024 * 1024,      // 32mb
+            max_stack_size: 512 * 1024,          // 512kb
+            timeout_ms: 4000,                    // 4s balanced default
+            pool_size: 0,                        // Auto
+            max_script_size: 1* 1024 * 1024,     // 1mb
+            max_context_size: 10 * 1024 * 1024,  // 10mb
+            max_ops: 1500,                       // safe cap for API workloads
         }
     }
 }
