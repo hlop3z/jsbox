@@ -7,7 +7,7 @@ Powered by QuickJS (via rquickjs), axum, and mimalloc.
 ## [Docker](https://github.com/hlop3z/jsbox/pkgs/container/jsbox)
 
 ```sh
-docker run --rm -it -p 4172:3000 ghcr.io/hlop3z/jsbox:sha-81bcbb9
+docker run --rm -it -p 4172:3000 ghcr.io/hlop3z/jsbox:latest
 ```
 
 ```sh
