@@ -4,6 +4,20 @@ A sandboxed JavaScript execution engine built in Rust. Send a JS handler functio
 
 Powered by QuickJS (via rquickjs), axum, and mimalloc.
 
+## [Docker](https://github.com/hlop3z/jsbox/pkgs/container/jsbox)
+
+```sh
+docker run --rm -it -p 4172:3000 ghcr.io/hlop3z/jsbox:sha-81bcbb9
+```
+
+```sh
+curl -X POST http://localhost:4172/execute -H "Content-Type: application/json" \
+-d '{
+  "script": "function handler(ctx) { return json({ greeting: \"hello \" + ctx.name }, null); }",
+  "context": { "name": "Alice" }
+}'
+```
+
 ## Quick start
 
 ```sh
