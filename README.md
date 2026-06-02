@@ -114,7 +114,7 @@ function handler(ctx) {
 ```
 
 `.round()` is half-up. Holds ~28–29 significant digits. Divide-by-zero and overflow throw.
-See [`docs/06-decimal.md`](docs/06-decimal.md).
+See [`docs/05-decimal.md`](docs/05-decimal.md).
 
 ### api.get / post / put / patch / delete
 

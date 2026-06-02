@@ -102,4 +102,4 @@ doesn't work.
 Each send is listed in `meta.mail_requests` (how many recipients, the size, whether it
 was accepted). Great for double-checking.
 
-**Next:** [Numbers & Decimals →](05-decimal.md)
+**Next:** [Exact Decimal Math →](05-decimal.md)

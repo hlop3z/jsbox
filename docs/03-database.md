@@ -127,6 +127,6 @@ report it nicely in the `errors` spot.
 Some numbers come back as **text in quotes**, like `"19.99"` or `"9007199254740993"`.
 This is on purpose, so no digits get lost. It matters a lot for **money**.
 
-👉 Read **[Numbers & Decimals](05-decimal.md)** next — it's important!
+👉 Read **[Exact Decimal Math](05-decimal.md)** next — it's important!
 
 **Next:** [`mail` — send email →](04-mail.md)

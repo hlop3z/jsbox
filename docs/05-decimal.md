@@ -103,7 +103,7 @@ function handler(ctx) {
 ## Works great with the database 🗄️
 
 Decimals from the database arrive as strings (see
-[Numbers & Decimals](05-decimal.md)). Wrap them in `$` to do exact math,
+[Talk to a Database](03-database.md)). Wrap them in `$` to do exact math,
 then send the result back as a string:
 
 ```js
