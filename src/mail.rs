@@ -1,0 +1,325 @@
+//! SMTP `mail` client for the `QuickJS` sandbox.
+//!
+//! JS API: `mail.send({ from?, to, cc?, bcc?, reply_to?, subject, text?, html? })`.
+//!
+//! Trust model matches `db` (not `http`): the relay host + credentials are
+//! operator-supplied in `config.mail`, so no SSRF / private-IP block is applied —
+//! internal/self-hosted relays are intended to work. Each send is metered.
+
+use std::error::Error;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use lettre::message::{Mailbox, Message, MessageBuilder, MultiPart, SinglePart};
+use lettre::transport::smtp::authentication::Credentials;
+use lettre::{SmtpTransport, Transport};
+use rquickjs::{Ctx, Function, Value as JsValue};
+use serde::{Deserialize, Serialize};
+
+use crate::sandbox::{self, Collector};
+
+/// JS wrapper — loaded from `src/js/mail.js` at compile time.
+const MAIL_WRAPPER: &str = include_str!("js/mail.js");
+
+/// Transport security mode for the SMTP connection.
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TlsMode {
+    /// Upgrade a plaintext connection with STARTTLS (default; usually port 587).
+    #[default]
+    Starttls,
+    /// Implicit TLS from the first byte (SMTPS; usually port 465).
+    Wrapper,
+    /// No transport security (plaintext — internal relays / testing only).
+    None,
+}
+
+/// Per-request mail configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct MailConfig {
+    /// SMTP relay host.
+    pub(crate) host: String,
+    /// SMTP relay port (default 587).
+    #[serde(default = "default_port")]
+    pub(crate) port: u16,
+    /// SMTP auth user (empty = no authentication).
+    #[serde(default)]
+    pub(crate) user: String,
+    /// SMTP auth password.
+    #[serde(default)]
+    pub(crate) password: String,
+    /// Transport security mode (default STARTTLS).
+    #[serde(default)]
+    pub(crate) tls: TlsMode,
+    /// Default From address (used when a send omits `from`).
+    pub(crate) from: String,
+    /// Maximum recipients (to + cc + bcc) per send (default 50).
+    #[serde(default = "default_max_recipients")]
+    pub(crate) max_recipients: usize,
+    /// Connect + send timeout in milliseconds (default 10000).
+    #[serde(default = "default_timeout")]
+    pub(crate) timeout_ms: u64,
+}
+
+/// Default SMTP port.
+const fn default_port() -> u16 { 587 }
+/// Default recipient cap.
+const fn default_max_recipients() -> usize { 50 }
+/// Default timeout in milliseconds.
+const fn default_timeout() -> u64 { 10_000 }
+
+/// Metric recorded for each mail operation.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct MailMetric {
+    /// Operation type.
+    action: String,
+    /// Duration in microseconds.
+    duration_us: u128,
+    /// Number of recipients (to + cc + bcc).
+    recipients: usize,
+    /// Serialized message size in bytes.
+    bytes: usize,
+    /// Whether the send was accepted by the server.
+    accepted: bool,
+}
+
+/// Parsed payload for a `send` operation.
+#[derive(Debug, Deserialize)]
+struct SendPayload {
+    /// From address (empty = use the configured default).
+    #[serde(default)]
+    from: String,
+    /// To recipients.
+    #[serde(default)]
+    to: Vec<String>,
+    /// Cc recipients.
+    #[serde(default)]
+    cc: Vec<String>,
+    /// Bcc recipients.
+    #[serde(default)]
+    bcc: Vec<String>,
+    /// Reply-To address (empty = none).
+    #[serde(default)]
+    reply_to: String,
+    /// Subject line.
+    #[serde(default)]
+    subject: String,
+    /// Plain-text body (empty = none).
+    #[serde(default)]
+    text: String,
+    /// HTML body (empty = none).
+    #[serde(default)]
+    html: String,
+}
+
+/// Successful send result plus the stats needed to build a metric.
+#[derive(Debug)]
+struct SendOutcome {
+    /// JSON returned to JS.
+    json: String,
+    /// Recipient count for the metric.
+    recipients: usize,
+    /// Serialized message size for the metric.
+    bytes: usize,
+    /// Whether the server accepted the message.
+    accepted: bool,
+}
+
+/// Shared context for a single `send` call (keeps the closure arg count low).
+struct SendCtx<'a> {
+    /// The pre-built SMTP transport.
+    transport: &'a SmtpTransport,
+    /// Default From address.
+    default_from: &'a str,
+    /// Recipient cap.
+    max_recipients: usize,
+}
+
+// -- Public API -------------------------------------------------------------
+
+/// Builds the transport and injects the `mail` global. Returns a metrics collector.
+///
+/// # Errors
+///
+/// Returns an error if transport construction or registration fails.
+pub(crate) fn inject_mail(
+    qctx: &Ctx<'_>,
+    config: &MailConfig,
+    max_ops: usize,
+) -> Result<Collector<MailMetric>, Box<dyn Error + Send + Sync>> {
+    let transport = build_transport(config)?;
+    let default_from = config.from.clone();
+    let max_recipients = config.max_recipients;
+
+    let metrics: Collector<MailMetric> = sandbox::new_collector();
+    let metrics_clone = Arc::clone(&metrics);
+
+    let mail_fn = Function::new(
+        qctx.clone(),
+        move |action: String, payload_json: String| -> String {
+            if let Err(err) = sandbox::check_op_limit(&metrics_clone, max_ops) {
+                return sandbox::error_json(&err);
+            }
+
+            let start = Instant::now();
+            let send_ctx = SendCtx {
+                transport: &transport,
+                default_from: &default_from,
+                max_recipients,
+            };
+            let result = dispatch(&send_ctx, &action, &payload_json);
+            let metric = build_metric(&action, result.as_ref().ok(), start);
+            sandbox::record(&metrics_clone, metric);
+
+            match result {
+                Ok(outcome) => outcome.json,
+                Err(err) => sandbox::error_json(&err),
+            }
+        },
+    )?
+    .with_name("__mail")?;
+
+    qctx.globals().set("__mail", mail_fn)?;
+
+    let wrapper: JsValue<'_> = qctx.eval(MAIL_WRAPPER)?;
+    drop(wrapper);
+
+    Ok(metrics)
+}
+
+// -- Dispatch ---------------------------------------------------------------
+
+/// Routes a `__mail` call to the correct handler.
+fn dispatch(send_ctx: &SendCtx<'_>, action: &str, payload_json: &str) -> Result<SendOutcome, String> {
+    match action {
+        "send" => do_send(send_ctx, payload_json),
+        other => Err(format!("unknown mail action: {other}")),
+    }
+}
+
+// -- Transport --------------------------------------------------------------
+
+/// Builds the SMTP transport from config.
+fn build_transport(config: &MailConfig) -> Result<SmtpTransport, Box<dyn Error + Send + Sync>> {
+    let base = match config.tls {
+        TlsMode::Starttls => SmtpTransport::starttls_relay(&config.host)?,
+        TlsMode::Wrapper => SmtpTransport::relay(&config.host)?,
+        TlsMode::None => SmtpTransport::builder_dangerous(&config.host),
+    };
+
+    let mut builder = base
+        .port(config.port)
+        .timeout(Some(Duration::from_millis(config.timeout_ms)));
+
+    if !config.user.is_empty() {
+        let creds = Credentials::new(config.user.clone(), config.password.clone());
+        builder = builder.credentials(creds);
+    }
+
+    Ok(builder.build())
+}
+
+// -- Send -------------------------------------------------------------------
+
+/// Builds and sends an email, returning the outcome.
+fn do_send(send_ctx: &SendCtx<'_>, payload_json: &str) -> Result<SendOutcome, String> {
+    let payload: SendPayload =
+        serde_json::from_str(payload_json).map_err(|err| format!("invalid mail payload: {err}"))?;
+
+    let recipients = count_recipients(&payload);
+    if recipients == 0 {
+        return Err("at least one recipient (to/cc/bcc) is required".into());
+    }
+    if recipients > send_ctx.max_recipients {
+        return Err(format!(
+            "too many recipients: {recipients} (max {})",
+            send_ctx.max_recipients
+        ));
+    }
+
+    let message = build_message(&payload, send_ctx.default_from)?;
+    let bytes = message.formatted().len();
+
+    match send_ctx.transport.send(&message) {
+        Ok(response) => {
+            let accepted = response.is_positive();
+            let line = response.first_line().unwrap_or("");
+            let escaped = serde_json::to_string(line).unwrap_or_else(|_err| "\"\"".into());
+            let json = format!("{{\"accepted\":{accepted},\"response\":{escaped}}}");
+            Ok(SendOutcome { json, recipients, bytes, accepted })
+        }
+        Err(err) => Err(format!("send error: {err}")),
+    }
+}
+
+/// Counts total recipients across to/cc/bcc (saturating).
+const fn count_recipients(payload: &SendPayload) -> usize {
+    payload
+        .to
+        .len()
+        .saturating_add(payload.cc.len())
+        .saturating_add(payload.bcc.len())
+}
+
+/// Builds the `Message` from a payload, validating every address.
+fn build_message(payload: &SendPayload, default_from: &str) -> Result<Message, String> {
+    let from_str = if payload.from.is_empty() { default_from } else { payload.from.as_str() };
+    let mut builder = Message::builder().from(parse_mailbox(from_str, "from")?);
+
+    for addr in &payload.to {
+        builder = builder.to(parse_mailbox(addr, "to")?);
+    }
+    for addr in &payload.cc {
+        builder = builder.cc(parse_mailbox(addr, "cc")?);
+    }
+    for addr in &payload.bcc {
+        builder = builder.bcc(parse_mailbox(addr, "bcc")?);
+    }
+    if !payload.reply_to.is_empty() {
+        builder = builder.reply_to(parse_mailbox(&payload.reply_to, "reply_to")?);
+    }
+
+    builder = builder.subject(payload.subject.as_str());
+    build_body(builder, payload)
+}
+
+/// Parses a single mailbox, mapping failures to a clear error.
+fn parse_mailbox(addr: &str, field: &str) -> Result<Mailbox, String> {
+    addr.parse::<Mailbox>()
+        .map_err(|err| format!("invalid {field} address '{addr}': {err}"))
+}
+
+/// Attaches the body (plain, html, or multipart/alternative) and finalizes.
+fn build_body(builder: MessageBuilder, payload: &SendPayload) -> Result<Message, String> {
+    let has_text = !payload.text.is_empty();
+    let has_html = !payload.html.is_empty();
+
+    let built = if has_text && has_html {
+        builder.multipart(MultiPart::alternative_plain_html(
+            payload.text.clone(),
+            payload.html.clone(),
+        ))
+    } else if has_html {
+        builder.singlepart(SinglePart::html(payload.html.clone()))
+    } else {
+        builder.body(payload.text.clone())
+    };
+
+    built.map_err(|err| format!("failed to build message: {err}"))
+}
+
+// -- Metrics ----------------------------------------------------------------
+
+/// Builds a `MailMetric` from the outcome (or zeros on failure).
+fn build_metric(action: &str, outcome: Option<&SendOutcome>, start: Instant) -> MailMetric {
+    let (recipients, bytes, accepted) =
+        outcome.map_or((0, 0, false), |out| (out.recipients, out.bytes, out.accepted));
+
+    MailMetric {
+        action: action.into(),
+        duration_us: start.elapsed().as_micros(),
+        recipients,
+        bytes,
+        accepted,
+    }
+}

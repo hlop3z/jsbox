@@ -2,9 +2,11 @@
 
 mod config;
 mod db;
+mod decimal;
 mod engine;
 mod handler;
 mod http;
+mod mail;
 mod pool;
 mod sandbox;
 
@@ -86,12 +88,10 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        drop(
-            signal::unix::signal(signal::unix::SignalKind::terminate())
-                .unwrap_or_else(|_err| unreachable!())
-                .recv()
-                .await,
-        );
+        let _ = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .unwrap_or_else(|_err| unreachable!())
+            .recv()
+            .await;
     };
 
     #[cfg(not(unix))]

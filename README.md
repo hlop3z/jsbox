@@ -4,6 +4,9 @@ A sandboxed JavaScript execution engine built in Rust. Send a JS handler functio
 
 Powered by QuickJS (via rquickjs), axum, and mimalloc.
 
+> 🧒 **New here?** Start with the friendly, beginner-first guide in **[`docs/`](docs/README.md)** —
+> it explains `api`, `db`, `mail`, and how to handle money/decimals in plain language.
+
 ## [Docker](https://github.com/hlop3z/jsbox/pkgs/container/jsbox)
 
 - [Docker-Compose](container/)
@@ -58,6 +61,7 @@ POST /execute
 | `context`              | no       | JSON object passed as `ctx` to the handler                              |
 | `config.allowed_hosts` | no       | Hosts the script can reach via `api.*` (`["*"]` = any, `[]` = disabled) |
 | `config.db`            | no       | PostgreSQL/CockroachDB connection (omit to disable `db.*`)              |
+| `config.mail`          | no       | SMTP relay connection (omit to disable `mail.*`)                        |
 
 ### Response
 
@@ -71,7 +75,8 @@ POST /execute
     "total_input_bytes": 98,
     "exec_time_us": 950,
     "http_requests": [],
-    "db_requests": []
+    "db_requests": [],
+    "mail_requests": []
   }
 }
 ```
@@ -92,6 +97,24 @@ function handler(ctx) {
   return json({ greeting: "hello " + ctx.name }, null);
 }
 ```
+
+### $ / Decimal — exact decimal math
+
+Always available (no config). Backed by the same `rust_decimal` engine that reads
+`NUMERIC` columns, so in-script math matches the database exactly. JavaScript has no
+operator overloading, so use **methods**, not `+ - * /`:
+
+```js
+function handler(ctx) {
+  var total = $("19.99").mul(ctx.qty).add("0.01").round(2);
+  // methods: add sub mul div neg abs round(places) cmp eq lt lte gt gte isZero
+  // output:  toString() | toNumber() (lossy) | json() serializes as the exact string
+  return json({ total: total }, null); // { "total": "..." }
+}
+```
+
+`.round()` is half-up. Holds ~28–29 significant digits. Divide-by-zero and overflow throw.
+See [`docs/06-decimal.md`](docs/06-decimal.md).
 
 ### api.get / post / put / patch / delete
 
@@ -145,6 +168,57 @@ function handler(ctx) {
 ```
 
 BIGINT and NUMERIC values are always returned as strings (JS number precision safety).
+
+### mail.send
+
+SMTP client (requires `config.mail`):
+
+```js
+function handler(ctx) {
+  var res = mail.send({
+    from: "App <no-reply@example.com>", // optional, falls back to config.mail.from
+    to: ctx.email, // string or array of strings
+    cc: ["ops@example.com"], // optional
+    bcc: [], // optional
+    reply_to: "support@example.com", // optional
+    subject: "Welcome, " + ctx.name,
+    text: "Plain-text body",
+    html: "<b>HTML body</b>", // text + html => multipart/alternative
+  });
+  // res = { accepted: true, response: "2.0.0 Ok: queued" }
+  return json(res, null);
+}
+```
+
+`config.mail` (operator-supplied, like `config.db` — the relay host is trusted, so
+private/internal relays are allowed):
+
+```json
+{
+  "host": "smtp.example.com",
+  "port": 587,
+  "user": "apikey",
+  "password": "secret",
+  "tls": "starttls",
+  "from": "no-reply@example.com",
+  "max_recipients": 50,
+  "timeout_ms": 10000
+}
+```
+
+| Field            | Default      | Description                                                 |
+| ---------------- | ------------ | ----------------------------------------------------------- |
+| `host`           | (required)   | SMTP relay host                                             |
+| `port`           | `587`        | Relay port                                                  |
+| `user`           | `""`         | SMTP auth user (empty = no authentication)                  |
+| `password`       | `""`         | SMTP auth password                                          |
+| `tls`            | `"starttls"` | `"starttls"` (587) · `"wrapper"` (465, implicit) · `"none"` |
+| `from`           | (required)   | Default From address                                        |
+| `max_recipients` | `50`         | Max recipients (to + cc + bcc) per send                     |
+| `timeout_ms`     | `10000`      | Connect + send timeout                                      |
+
+Addresses, subject, and bodies are assembled with a typed message builder, so caller
+input cannot inject SMTP headers (CRLF injection is rejected at parse time).
 
 ## Configuration
 
@@ -217,12 +291,13 @@ HTTP request
           -> inject json() bridge
           -> inject api.* (if allowed_hosts)
           -> inject db.* (if config.db)
+          -> inject mail.* (if config.mail)
           -> eval user script
           -> remove eval/Proxy
           -> call handler(context)
         <- extract JSON result
       <- release runtime to pool (GC first)
-    <- attach meta (sizes, timing, http/db metrics)
+    <- attach meta (sizes, timing, http/db/mail metrics)
   <- {data, errors, meta} response
 ```
 

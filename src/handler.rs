@@ -17,6 +17,7 @@ use crate::engine;
 use crate::sandbox;
 use crate::engine::{ExecParams, ExecResult};
 use crate::http::HttpMetric;
+use crate::mail::{MailConfig, MailMetric};
 use crate::pool::JsPool;
 
 /// Pre-allocated `Box<RawValue>` for `{}` — used as default context.
@@ -49,6 +50,9 @@ pub(crate) struct RequestConfig {
     /// Database connection config (omit to disable `db` in JS).
     #[serde(default)]
     pub(crate) db: Option<DbConfig>,
+    /// Mail/SMTP config (omit to disable `mail` in JS).
+    #[serde(default)]
+    pub(crate) mail: Option<MailConfig>,
 }
 
 /// Returns a clone of the pre-allocated default context.
@@ -71,6 +75,8 @@ struct Meta {
     http_requests: Vec<HttpMetric>,
     /// Database operations made by the script.
     db_requests: Vec<DbMetric>,
+    /// Mail operations made by the script.
+    mail_requests: Vec<MailMetric>,
 }
 
 impl Meta {
@@ -83,13 +89,20 @@ impl Meta {
             exec_time_us,
             http_requests: Vec::new(),
             db_requests: Vec::new(),
+            mail_requests: Vec::new(),
         }
     }
 
-    /// Attaches HTTP and DB metrics to this metadata.
-    fn with_metrics(mut self, http_requests: Vec<HttpMetric>, db_requests: Vec<DbMetric>) -> Self {
+    /// Attaches HTTP, DB, and mail metrics to this metadata.
+    fn with_metrics(
+        mut self,
+        http_requests: Vec<HttpMetric>,
+        db_requests: Vec<DbMetric>,
+        mail_requests: Vec<MailMetric>,
+    ) -> Self {
         self.http_requests = http_requests;
         self.db_requests = db_requests;
+        self.mail_requests = mail_requests;
         self
     }
 }
@@ -165,6 +178,7 @@ pub(crate) async fn execute(
     let context_json: String = req.context.get().into();
     let allowed_hosts = req.config.allowed_hosts;
     let db_config = req.config.db;
+    let mail_config = req.config.mail;
 
     let start = Instant::now();
 
@@ -177,6 +191,7 @@ pub(crate) async fn execute(
             timeout: engine_cfg.timeout(),
             allowed_hosts: &allowed_hosts,
             db_config: db_config.as_ref(),
+            mail_config: mail_config.as_ref(),
             max_ops: engine_cfg.max_ops,
         });
         js_pool.release(runtime);
@@ -187,9 +202,9 @@ pub(crate) async fn execute(
     let exec_time_us = start.elapsed().as_micros();
 
     // Extract metrics from the result (or empty if it failed).
-    let (engine_result, http_requests, db_requests) = match result {
-        Ok(Ok(exec)) => (Ok(exec.js_json), exec.http_metrics, exec.db_metrics),
-        Ok(Err(err)) => (Err(err), Vec::new(), Vec::new()),
+    let (engine_result, http_requests, db_requests, mail_requests) = match result {
+        Ok(Ok(exec)) => (Ok(exec.js_json), exec.http_metrics, exec.db_metrics, exec.mail_metrics),
+        Ok(Err(err)) => (Err(err), Vec::new(), Vec::new(), Vec::new()),
         Err(join_err) => {
             return infra_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -200,7 +215,7 @@ pub(crate) async fn execute(
     };
 
     let meta = Meta::new(script_bytes, context_bytes, exec_time_us)
-        .with_metrics(http_requests, db_requests);
+        .with_metrics(http_requests, db_requests, mail_requests);
 
     build_response(&engine_result, meta)
 }

@@ -71,7 +71,7 @@ impl Default for ServerConfig {
 
 
 
-/// EngineConfig
+/// `EngineConfig`
 ///
 /// This configuration controls execution limits for the scripting engine,
 /// and each group of settings maps to a specific safety boundary:
@@ -105,7 +105,7 @@ impl Default for EngineConfig {
             max_stack_size: 512 * 1024,          // 512kb
             timeout_ms: 4000,                    // 4s balanced default
             pool_size: 0,                        // Auto
-            max_script_size: 1* 1024 * 1024,     // 1mb
+            max_script_size: 1024 * 1024,        // 1mb
             max_context_size: 10 * 1024 * 1024,  // 10mb
             max_ops: 1500,                       // safe cap for API workloads
         }

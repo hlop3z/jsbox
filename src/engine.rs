@@ -14,8 +14,11 @@ use rquickjs::{Context, Function, Object, Runtime, Value as JsValue};
 
 use crate::db;
 use crate::db::{DbConfig, DbMetric};
+use crate::decimal;
 use crate::http;
 use crate::http::HttpMetric;
+use crate::mail;
+use crate::mail::{MailConfig, MailMetric};
 use crate::sandbox::{self, Collector};
 
 /// The `json()` bridge — loaded from `src/js/bridge.js` at compile time.
@@ -35,6 +38,8 @@ pub(crate) struct ExecParams<'a> {
     pub(crate) allowed_hosts: &'a [String],
     /// Database config (None = disabled).
     pub(crate) db_config: Option<&'a DbConfig>,
+    /// Mail config (None = disabled).
+    pub(crate) mail_config: Option<&'a MailConfig>,
     /// Max operations per execution.
     pub(crate) max_ops: usize,
 }
@@ -47,6 +52,8 @@ pub(crate) struct ExecResult {
     pub(crate) http_metrics: Vec<HttpMetric>,
     /// DB operations made during execution.
     pub(crate) db_metrics: Vec<DbMetric>,
+    /// Mail operations made during execution.
+    pub(crate) mail_metrics: Vec<MailMetric>,
 }
 
 /// Runs the script in a sandboxed context.
@@ -61,10 +68,12 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, Box<dyn Error +
 
     let mut http_collector: Option<Collector<HttpMetric>> = None;
     let mut db_collector: Option<Collector<DbMetric>> = None;
+    let mut mail_collector: Option<Collector<MailMetric>> = None;
 
     let js_result = ctx.with(|qctx| -> Result<String, Box<dyn Error + Send + Sync>> {
         inject_bridge(&qctx)?;
-        inject_apis(&qctx, params, &mut http_collector, &mut db_collector)?;
+        decimal::inject_decimal(&qctx)?;
+        inject_apis(&qctx, params, &mut http_collector, &mut db_collector, &mut mail_collector)?;
         eval_script(&qctx, params.script)?;
         sanitize_globals(&qctx)?;
         call_handler(&qctx, params.context_json, &timed_out, params.timeout)
@@ -77,6 +86,7 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, Box<dyn Error +
         js_json: js_result?,
         http_metrics: sandbox::drain(http_collector.as_ref()),
         db_metrics: sandbox::drain(db_collector.as_ref()),
+        mail_metrics: sandbox::drain(mail_collector.as_ref()),
     })
 }
 
@@ -110,12 +120,16 @@ fn inject_apis(
     params: &ExecParams<'_>,
     http_collector: &mut Option<Collector<HttpMetric>>,
     db_collector: &mut Option<Collector<DbMetric>>,
+    mail_collector: &mut Option<Collector<MailMetric>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if !params.allowed_hosts.is_empty() {
         *http_collector = Some(http::inject_api(qctx, params.allowed_hosts, params.max_ops)?);
     }
     if let Some(db_cfg) = params.db_config {
         *db_collector = Some(db::inject_db(qctx, db_cfg, params.max_ops)?);
+    }
+    if let Some(mail_cfg) = params.mail_config {
+        *mail_collector = Some(mail::inject_mail(qctx, mail_cfg, params.max_ops)?);
     }
     Ok(())
 }
