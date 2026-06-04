@@ -18,13 +18,17 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rquickjs::{Ctx, Function, Value as JsValue};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::bytesize::deserialize_byte_size;
 use crate::sandbox::{self, Collector};
 use crate::ssrf;
 
@@ -77,6 +81,11 @@ pub(crate) struct S3Config {
     /// Hard cap on link lifetime in seconds (`SigV4` max is 604800 = 7 days).
     #[serde(default = "default_max_expires")]
     pub(crate) max_expires: u64,
+    /// Maximum upload size for `presignPost`, human-readable (`"25mb"`, `"50gb"`, or
+    /// bytes). Operator-supplied — the script can never raise or set it. Required for
+    /// `presignPost` (0 = unset → `presignPost` errors). Unused by `presignPut`/`Get`.
+    #[serde(default, deserialize_with = "deserialize_byte_size")]
+    pub(crate) max_upload_size: usize,
 }
 
 /// Default presigned-link lifetime in seconds (15 minutes).
@@ -87,7 +96,7 @@ const fn default_max_expires() -> u64 { 604_800 }
 /// Metric recorded for each S3 operation.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct S3Metric {
-    /// Operation type (always `presign`).
+    /// Operation type (`presign` or `presign_post`).
     action: String,
     /// HTTP method the URL is signed for.
     method: String,
@@ -103,6 +112,20 @@ struct PresignPayload {
     /// HTTP method (empty = `PUT`).
     #[serde(default)]
     method: String,
+    /// Object key (path within the bucket).
+    #[serde(default)]
+    key: String,
+    /// Requested lifetime in seconds (0 = use the configured default).
+    #[serde(default)]
+    expires: u64,
+}
+
+/// Parsed payload for a `presign_post` operation.
+///
+/// Note: there is **no** size field — the upload cap comes only from
+/// `config.s3.max_upload_size`, never from the (untrusted) script payload.
+#[derive(Debug, Deserialize)]
+struct PresignPostPayload {
     /// Object key (path within the bucket).
     #[serde(default)]
     key: String,
@@ -133,6 +156,7 @@ pub(crate) fn inject_s3(
     qctx: &Ctx<'_>,
     config: &S3Config,
     max_ops: usize,
+    allow_private: bool,
 ) -> Result<Collector<S3Metric>, Box<dyn Error + Send + Sync>> {
     let owned = config.clone();
 
@@ -147,7 +171,7 @@ pub(crate) fn inject_s3(
             }
 
             let start = Instant::now();
-            let result = dispatch(&owned, &action, &payload_json);
+            let result = dispatch(&owned, &action, &payload_json, allow_private);
             let metric = build_metric(&action, result.as_ref().ok(), start);
             sandbox::record(&metrics_clone, metric);
 
@@ -170,9 +194,15 @@ pub(crate) fn inject_s3(
 // -- Dispatch ---------------------------------------------------------------
 
 /// Routes a `__s3` call to the correct handler.
-fn dispatch(config: &S3Config, action: &str, payload_json: &str) -> Result<PresignOutcome, String> {
+fn dispatch(
+    config: &S3Config,
+    action: &str,
+    payload_json: &str,
+    allow_private: bool,
+) -> Result<PresignOutcome, String> {
     match action {
-        "presign" => do_presign(config, payload_json),
+        "presign" => do_presign(config, payload_json, allow_private),
+        "presign_post" => do_presign_post(config, payload_json, allow_private),
         other => Err(format!("unknown s3 action: {other}")),
     }
 }
@@ -180,7 +210,11 @@ fn dispatch(config: &S3Config, action: &str, payload_json: &str) -> Result<Presi
 // -- Presign ----------------------------------------------------------------
 
 /// Builds a `SigV4` presigned URL for one object operation.
-fn do_presign(config: &S3Config, payload_json: &str) -> Result<PresignOutcome, String> {
+fn do_presign(
+    config: &S3Config,
+    payload_json: &str,
+    allow_private: bool,
+) -> Result<PresignOutcome, String> {
     let payload: PresignPayload =
         serde_json::from_str(payload_json).map_err(|err| format!("invalid s3 payload: {err}"))?;
 
@@ -190,8 +224,8 @@ fn do_presign(config: &S3Config, payload_json: &str) -> Result<PresignOutcome, S
     }
     let expires = clamp_expires(payload.expires, config);
 
-    let (amz_date, datestamp) = current_timestamps()?;
-    let (scheme, host) = resolve_host(config)?;
+    let (amz_date, datestamp, _now_secs) = current_timestamps()?;
+    let (scheme, host) = resolve_host(config, allow_private)?;
     let canonical_uri = build_uri(config, &payload.key);
     let scope = format!("{datestamp}/{}/{SERVICE}/aws4_request", config.region);
     let query = build_canonical_query(&config.access_key, &scope, &amz_date, expires);
@@ -214,6 +248,85 @@ fn do_presign(config: &S3Config, payload_json: &str) -> Result<PresignOutcome, S
     let json = format!("{{\"url\":{escaped_url},\"method\":\"{method}\",\"expires\":{expires}}}");
 
     Ok(PresignOutcome { json, method: method.to_owned(), expires })
+}
+
+// -- Presign POST (browser form upload with size policy) --------------------
+
+/// Builds a `SigV4` presigned POST policy for a direct browser form upload.
+///
+/// The policy's `content-length-range` condition is enforced by the object store,
+/// which rejects an upload larger than `config.max_upload_size`. The size cap is
+/// **config-only** — the script supplies just the key, never a size.
+fn do_presign_post(
+    config: &S3Config,
+    payload_json: &str,
+    allow_private: bool,
+) -> Result<PresignOutcome, String> {
+    let payload: PresignPostPayload =
+        serde_json::from_str(payload_json).map_err(|err| format!("invalid s3 payload: {err}"))?;
+
+    if payload.key.trim().is_empty() {
+        return Err("s3 presignPost requires a non-empty key".to_owned());
+    }
+    let max_bytes = config.max_upload_size;
+    if max_bytes == 0 {
+        return Err("config.s3.max_upload_size is required for presignPost".to_owned());
+    }
+    let expires = clamp_expires(payload.expires, config);
+
+    let (amz_date, datestamp, now_secs) = current_timestamps()?;
+    let (scheme, host) = resolve_host(config, allow_private)?;
+    let expiration = iso8601_expiration(now_secs, expires)?;
+    let credential =
+        format!("{}/{datestamp}/{}/{SERVICE}/aws4_request", config.access_key, config.region);
+
+    let policy = json!({
+        "expiration": expiration,
+        "conditions": [
+            {"bucket": config.bucket},
+            {"key": payload.key},
+            {"x-amz-algorithm": "AWS4-HMAC-SHA256"},
+            {"x-amz-credential": credential},
+            {"x-amz-date": amz_date},
+            ["content-length-range", 0, max_bytes],
+        ],
+    });
+    let policy_str =
+        serde_json::to_string(&policy).map_err(|err| format!("failed to encode policy: {err}"))?;
+    let policy_b64 = BASE64.encode(policy_str);
+
+    let signing_key = derive_signing_key(&config.secret_key, &datestamp, &config.region)?;
+    let signature = hex::encode(hmac_sha256(&signing_key, policy_b64.as_bytes())?);
+
+    let response = json!({
+        "url": post_url(&scheme, &host, config),
+        "fields": {
+            "key": payload.key,
+            "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+            "X-Amz-Credential": credential,
+            "X-Amz-Date": amz_date,
+            "Policy": policy_b64,
+            "X-Amz-Signature": signature,
+        },
+        "maxBytes": max_bytes,
+        "expires": expires,
+    });
+    let json_out = serde_json::to_string(&response)
+        .map_err(|err| format!("failed to encode response: {err}"))?;
+
+    Ok(PresignOutcome { json: json_out, method: "POST".to_owned(), expires })
+}
+
+/// Builds the POST target URL for the configured addressing mode.
+///
+/// Virtual-hosted: `scheme://{bucket.host}/`. Path-style: `scheme://{host}/{bucket}`.
+fn post_url(scheme: &str, host: &str, config: &S3Config) -> String {
+    if config.path_style {
+        let bucket = utf8_percent_encode(&config.bucket, SEGMENT_SET);
+        format!("{scheme}://{host}/{bucket}")
+    } else {
+        format!("{scheme}://{host}/")
+    }
 }
 
 /// Inputs to the `SigV4` signing step (grouped to keep the arg count low).
@@ -277,7 +390,7 @@ fn clamp_expires(requested: u64, config: &S3Config) -> u64 {
 /// Splits the endpoint into `(scheme, host)` for the configured addressing mode.
 ///
 /// Virtual-hosted: `bucket.host[:port]`. Path-style: `host[:port]` unchanged.
-fn resolve_host(config: &S3Config) -> Result<(String, String), String> {
+fn resolve_host(config: &S3Config, allow_private: bool) -> Result<(String, String), String> {
     let (scheme, authority) = config
         .endpoint
         .split_once("://")
@@ -296,11 +409,11 @@ fn resolve_host(config: &S3Config) -> Result<(String, String), String> {
     let (host_only, port_suffix) = split_host_port(authority_clean);
 
     // SSRF guard — identical to `http`: reject localhost and any private/internal
-    // address so a presigned URL can never name a local/internal target. This
-    // resolves the host (one DNS lookup); literal IPs are checked without DNS.
+    // address so a presigned URL can never name a local/internal target (relaxed only
+    // in `debug` mode). Resolves the host (one DNS lookup); literal IPs need no DNS.
     let port = endpoint_port(scheme, &port_suffix)?;
     let bare_host = host_only.trim_start_matches('[').trim_end_matches(']');
-    ssrf::block_private_ip(bare_host, port)?;
+    ssrf::block_private_ip(bare_host, port, allow_private)?;
 
     if config.path_style {
         Ok((scheme.to_owned(), authority_clean.to_owned()))
@@ -398,8 +511,10 @@ fn sha256_hex(data: &[u8]) -> String {
 
 // -- Time -------------------------------------------------------------------
 
-/// Returns the current UTC `(amz_date, datestamp)` pair for `SigV4`.
-fn current_timestamps() -> Result<(String, String), String> {
+/// Returns the current UTC `(amz_date, datestamp, unix_secs)` for `SigV4`.
+///
+/// `unix_secs` lets callers derive a coherent expiration from the same instant.
+fn current_timestamps() -> Result<(String, String, i64), String> {
     let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|err| format!("clock error: {err}"))?;
@@ -409,7 +524,19 @@ fn current_timestamps() -> Result<(String, String), String> {
         DateTime::<Utc>::from_timestamp(secs, 0).ok_or_else(|| "invalid timestamp".to_owned())?;
     let amz_date = datetime.format("%Y%m%dT%H%M%SZ").to_string();
     let datestamp = datetime.format("%Y%m%d").to_string();
-    Ok((amz_date, datestamp))
+    Ok((amz_date, datestamp, secs))
+}
+
+/// Formats an ISO8601 UTC timestamp (`2026-06-04T07:00:00.000Z`) for a POST policy
+/// expiration, `expires` seconds after `now_secs`.
+fn iso8601_expiration(now_secs: i64, expires: u64) -> Result<String, String> {
+    let delta = i64::try_from(expires).map_err(|err| format!("expires out of range: {err}"))?;
+    let exp_secs = now_secs
+        .checked_add(delta)
+        .ok_or_else(|| "expiration overflow".to_owned())?;
+    let datetime = DateTime::<Utc>::from_timestamp(exp_secs, 0)
+        .ok_or_else(|| "invalid expiration timestamp".to_owned())?;
+    Ok(datetime.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
 }
 
 // -- Metrics ----------------------------------------------------------------

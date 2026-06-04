@@ -46,6 +46,8 @@ pub(crate) struct ExecParams<'a> {
     pub(crate) s3_config: Option<&'a S3Config>,
     /// Max operations per execution.
     pub(crate) max_ops: usize,
+    /// Debug mode: relax the SSRF private-IP block (`api`/`s3`) for local testing.
+    pub(crate) allow_private_targets: bool,
 }
 
 /// Result of a script execution.
@@ -151,7 +153,12 @@ fn inject_apis(
     collectors: &mut Collectors<'_>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if !params.allowed_hosts.is_empty() {
-        *collectors.http = Some(http::inject_api(qctx, params.allowed_hosts, params.max_ops)?);
+        *collectors.http = Some(http::inject_api(
+            qctx,
+            params.allowed_hosts,
+            params.max_ops,
+            params.allow_private_targets,
+        )?);
     }
     if let Some(db_cfg) = params.db_config {
         *collectors.db = Some(db::inject_db(qctx, db_cfg, params.max_ops)?);
@@ -160,7 +167,8 @@ fn inject_apis(
         *collectors.mail = Some(mail::inject_mail(qctx, mail_cfg, params.max_ops)?);
     }
     if let Some(s3_cfg) = params.s3_config {
-        *collectors.s3 = Some(s3::inject_s3(qctx, s3_cfg, params.max_ops)?);
+        *collectors.s3 =
+            Some(s3::inject_s3(qctx, s3_cfg, params.max_ops, params.allow_private_targets)?);
     }
     Ok(())
 }

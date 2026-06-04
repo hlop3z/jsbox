@@ -23,6 +23,8 @@ pub(crate) struct JsPool {
     size: usize,
     /// Engine config applied to each runtime.
     engine_config: EngineConfig,
+    /// Local-dev flag: relax the SSRF private-IP block when `true`.
+    debug: bool,
 }
 
 impl JsPool {
@@ -31,7 +33,10 @@ impl JsPool {
     /// # Errors
     ///
     /// Returns an error if runtime creation fails.
-    pub(crate) fn new(engine_config: EngineConfig) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    pub(crate) fn new(
+        engine_config: EngineConfig,
+        debug: bool,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let size = if engine_config.pool_size > 0 {
             engine_config.pool_size
         } else {
@@ -51,6 +56,7 @@ impl JsPool {
             inner: Arc::new(queue),
             size,
             engine_config,
+            debug,
         })
     }
 
@@ -79,6 +85,11 @@ impl JsPool {
     /// Returns the engine config.
     pub(crate) const fn engine_config(&self) -> &EngineConfig {
         &self.engine_config
+    }
+
+    /// Returns whether debug mode (relaxed SSRF guard) is enabled.
+    pub(crate) const fn debug(&self) -> bool {
+        self.debug
     }
 }
 

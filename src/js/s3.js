@@ -22,6 +22,14 @@
     presignGet: function(opts) {
       opts = opts || {};
       return presign({ method: 'GET', key: opts.key, expires: opts.expires });
+    },
+    presignPost: function(opts) {
+      opts = opts || {};
+      // No size field: the upload cap comes only from config.s3.max_upload_size.
+      return call('presign_post', {
+        key: opts.key || '',
+        expires: opts.expires || 0
+      });
     }
   };
 })();

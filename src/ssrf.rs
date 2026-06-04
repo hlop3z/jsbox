@@ -16,10 +16,17 @@ use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 /// every returned address is checked. DNS failure is not fatal here: the eventual
 /// connection will fail on its own.
 ///
+/// When `allow_private` is `true` (server `debug` mode), the check is skipped so
+/// localhost / LAN targets work for local testing. Production runs with it `false`.
+///
 /// # Errors
 ///
 /// Returns an error if the host is, or resolves to, a private/internal address.
-pub(crate) fn block_private_ip(host: &str, port: u16) -> Result<(), String> {
+pub(crate) fn block_private_ip(host: &str, port: u16, allow_private: bool) -> Result<(), String> {
+    if allow_private {
+        return Ok(());
+    }
+
     // Literal IP check (no DNS needed).
     if let Ok(addr) = host.parse::<IpAddr>() {
         if is_private_ip(&addr) {

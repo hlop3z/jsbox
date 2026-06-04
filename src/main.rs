@@ -1,5 +1,6 @@
 //! jsbox: A sandboxed JS execution service powered by `QuickJS`.
 
+mod bytesize;
 mod config;
 mod db;
 mod decimal;
@@ -51,7 +52,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         "engine config"
     );
 
-    let js_pool = JsPool::new(config.engine)?;
+    if config.debug {
+        info!("DEBUG MODE: SSRF private-IP block relaxed (local testing only — do not use in production)");
+    }
+
+    let js_pool = JsPool::new(config.engine, config.debug)?;
     info!("JS runtime pool: {} slots", js_pool.size());
 
     let body_limit = js_pool.engine_config().max_body_size();

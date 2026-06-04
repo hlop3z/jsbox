@@ -58,6 +58,7 @@ pub(crate) fn inject_api(
     qctx: &Ctx<'_>,
     allowed_hosts: &[String],
     max_ops: usize,
+    allow_private: bool,
 ) -> Result<Collector<HttpMetric>, Box<dyn Error + Send + Sync>> {
     let hosts = Arc::new(allowed_hosts.to_vec());
     let metrics = sandbox::new_collector();
@@ -65,7 +66,7 @@ pub(crate) fn inject_api(
     // Build client with redirect policy that validates each hop.
     let redirect_hosts = Arc::clone(&hosts);
     let policy = redirect::Policy::custom(move |attempt| {
-        validate_redirect(&redirect_hosts, attempt)
+        validate_redirect(&redirect_hosts, attempt, allow_private)
     });
     let client = Client::builder()
         .timeout(HTTP_TIMEOUT)
@@ -84,7 +85,7 @@ pub(crate) fn inject_api(
 
             let start = Instant::now();
 
-            let host = match validate_url(&url, &closure_hosts) {
+            let host = match validate_url(&url, &closure_hosts, allow_private) {
                 Ok(validated_host) => validated_host,
                 Err(err) => {
                     let mctx = MetricCtx {
@@ -161,7 +162,7 @@ impl MetricCtx<'_> {
 
 /// Validates URL: checks allowed hosts and blocks private/internal IPs.
 /// Returns the host string (for metrics) on success.
-fn validate_url(url: &str, allowed: &[String]) -> Result<String, String> {
+fn validate_url(url: &str, allowed: &[String], allow_private: bool) -> Result<String, String> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|err| format!("invalid URL '{url}': {err}"))?;
 
@@ -174,13 +175,17 @@ fn validate_url(url: &str, allowed: &[String]) -> Result<String, String> {
     }
 
     let port = parsed.port_or_known_default().unwrap_or(80);
-    block_private_ip(host, port)?;
+    block_private_ip(host, port, allow_private)?;
 
     Ok(host.into())
 }
 
 /// Validates a redirect hop against allowed hosts and private IPs.
-fn validate_redirect(hosts: &[String], attempt: redirect::Attempt<'_>) -> redirect::Action {
+fn validate_redirect(
+    hosts: &[String],
+    attempt: redirect::Attempt<'_>,
+    allow_private: bool,
+) -> redirect::Action {
     if attempt.previous().len() >= MAX_REDIRECTS {
         return attempt.stop();
     }
@@ -190,7 +195,7 @@ fn validate_redirect(hosts: &[String], attempt: redirect::Attempt<'_>) -> redire
         return attempt.stop();
     }
     let port = url.port_or_known_default().unwrap_or(80);
-    if block_private_ip(host, port).is_err() {
+    if block_private_ip(host, port, allow_private).is_err() {
         return attempt.stop();
     }
     attempt.follow()

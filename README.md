@@ -222,7 +222,7 @@ private/internal relays are allowed):
 Addresses, subject, and bodies are assembled with a typed message builder, so caller
 input cannot inject SMTP headers (CRLF injection is rejected at parse time).
 
-### s3.presignPut / s3.presignGet / s3.presign
+### s3.presignPut / s3.presignGet / s3.presignPost / s3.presign
 
 Presigned-URL generator for direct browser uploads/downloads (requires `config.s3`):
 
@@ -254,7 +254,8 @@ internal one. The sandboxed script cannot set `endpoint`; only operator config c
 
 > ⚠️ Because of the guard, a `MinIO`/S3 instance on `localhost` or a private LAN is
 > **blocked** — point `s3` at a public endpoint (AWS S3, Cloudflare R2, or `MinIO`
-> exposed on a public address).
+> exposed on a public address). For local development, set top-level `"debug": true` in
+> the server config to relax this (see [Configuration](#configuration)); never in production.
 
 `config.s3` (operator-supplied, like `config.db`/`config.mail`). Works with any
 SigV4 store — AWS S3, Cloudflare R2, MinIO, Backblaze B2, DigitalOcean Spaces:
@@ -272,16 +273,51 @@ SigV4 store — AWS S3, Cloudflare R2, MinIO, Backblaze B2, DigitalOcean Spaces:
 }
 ```
 
-| Field         | Default      | Description                                                            |
-| ------------- | ------------ | --------------------------------------------------------------------- |
-| `endpoint`    | (required)   | Public store URL incl. scheme (`https://s3.us-east-1.amazonaws.com`)  |
-| `region`      | (required)   | SigV4 region scope (`us-east-1`; R2 uses `auto`)                       |
-| `bucket`      | (required)   | Bucket name                                                           |
-| `access_key`  | (required)   | Access key id                                                         |
-| `secret_key`  | (required)   | Secret access key                                                    |
-| `path_style`  | `false`      | `true` = `host/bucket/key` (MinIO); `false` = `bucket.host/key` (AWS) |
-| `expires`     | `900`        | Default link lifetime in seconds                                     |
-| `max_expires` | `604800`     | Hard cap on link lifetime (SigV4 max, 7 days)                         |
+| Field             | Default    | Description                                                           |
+| ----------------- | ---------- | --------------------------------------------------------------------- |
+| `endpoint`        | (required) | Public store URL incl. scheme (`https://s3.us-east-1.amazonaws.com`)  |
+| `region`          | (required) | SigV4 region scope (`us-east-1`; R2 uses `auto`)                      |
+| `bucket`          | (required) | Bucket name                                                           |
+| `access_key`      | (required) | Access key id                                                         |
+| `secret_key`      | (required) | Secret access key                                                     |
+| `path_style`      | `false`    | `true` = `host/bucket/key` (MinIO); `false` = `bucket.host/key` (AWS) |
+| `expires`         | `900`      | Default link lifetime in seconds                                      |
+| `max_expires`     | `604800`   | Hard cap on link lifetime (SigV4 max, 7 days)                         |
+| `max_upload_size` | (unset)    | **`presignPost` only** — max object bytes, human-readable (`"25mb"`)  |
+
+#### s3.presignPost — size-enforced browser uploads
+
+`presignPut` does not cap the body size. `presignPost` returns a **POST policy** whose
+`content-length-range` the object store **enforces** — it rejects an upload larger than
+`config.s3.max_upload_size`. The cap is **operator-config only**; the script supplies just
+the `key` and can never set or raise the size (it cannot read it from `ctx`). This is the
+primitive for storage quotas.
+
+```js
+function handler(ctx) {
+  // max size comes from config.s3.max_upload_size — NOT from ctx.
+  var up = s3.presignPost({
+    key: "customers/" + ctx.id + "/" + ctx.filename,
+    expires: 300,
+  });
+  // up = { url, fields: { key, "X-Amz-Algorithm", "X-Amz-Credential",
+  //                       "X-Amz-Date", "Policy", "X-Amz-Signature" },
+  //        maxBytes: 26214400, expires: 300 }
+  return json(up, null);
+}
+```
+
+Frontend (`multipart/form-data`, the `file` field MUST be last):
+
+```js
+const form = new FormData();
+Object.entries(up.fields).forEach(([k, v]) => form.append(k, v));
+form.append("file", file);
+await fetch(up.url, { method: "POST", body: form }); // 204 ok · 400 if > maxBytes
+```
+
+`config.s3.max_upload_size` is required for `presignPost` (human-readable like
+`"25mb"`/`"50gb"`, or bytes). Without it, `presignPost` errors.
 
 ## Configuration
 
@@ -289,6 +325,7 @@ Optional `config.json` in the working directory. All fields have defaults:
 
 ```json
 {
+  "debug": false,
   "server": {
     "host": "127.0.0.1",
     "port": 3000
@@ -305,15 +342,16 @@ Optional `config.json` in the working directory. All fields have defaults:
 }
 ```
 
-| Field              | Default    | Description                               |
-| ------------------ | ---------- | ----------------------------------------- |
-| `memory_limit`     | `"32mb"`   | Max JS heap per execution                 |
-| `max_stack_size`   | `"512kb"`  | Max native call stack (recursion depth)   |
-| `timeout_ms`       | `4000`     | Max wall-clock execution time             |
-| `pool_size`        | `0` (auto) | QuickJS runtime pool size (0 = CPU cores) |
-| `max_script_size`  | `"1mb"`    | Max script source size                    |
-| `max_context_size` | `"10mb"`   | Max context JSON size                     |
-| `max_ops`          | `1500`     | Max HTTP + DB operations per execution    |
+| Field              | Default    | Description                                                                                                                            |
+| ------------------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `debug`            | `false`    | **Dev only.** Relaxes the SSRF private-IP block for `s3`/`api` so localhost/LAN targets (e.g. MinIO) work. Never enable in production. |
+| `memory_limit`     | `"32mb"`   | Max JS heap per execution                                                                                                              |
+| `max_stack_size`   | `"512kb"`  | Max native call stack (recursion depth)                                                                                                |
+| `timeout_ms`       | `4000`     | Max wall-clock execution time                                                                                                          |
+| `pool_size`        | `0` (auto) | QuickJS runtime pool size (0 = CPU cores)                                                                                              |
+| `max_script_size`  | `"1mb"`    | Max script source size                                                                                                                 |
+| `max_context_size` | `"10mb"`   | Max context JSON size                                                                                                                  |
+| `max_ops`          | `1500`     | Max HTTP + DB operations per execution                                                                                                 |
 
 Size fields accept `"8mb"`, `"256kb"`, `"1gb"`, or plain numbers in bytes.
 

@@ -198,6 +198,7 @@ pub(crate) async fn execute(
     let s3_config = req.config.s3;
 
     let start = Instant::now();
+    let allow_private_targets = js_pool.debug();
 
     let result = task::spawn_blocking(move || -> Result<ExecResult, Box<dyn Error + Send + Sync>> {
         let runtime = js_pool.acquire()?;
@@ -211,6 +212,7 @@ pub(crate) async fn execute(
             mail_config: mail_config.as_ref(),
             s3_config: s3_config.as_ref(),
             max_ops: engine_cfg.max_ops,
+            allow_private_targets,
         });
         js_pool.release(runtime);
         res
