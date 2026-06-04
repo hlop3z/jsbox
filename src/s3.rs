@@ -16,13 +16,15 @@
 
 use std::error::Error;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use reqwest::blocking::Client;
+use reqwest::redirect;
 use rquickjs::{Ctx, Function, Value as JsValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -96,14 +98,20 @@ const fn default_max_expires() -> u64 { 604_800 }
 /// Metric recorded for each S3 operation.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct S3Metric {
-    /// Operation type (`presign` or `presign_post`).
+    /// Operation type (`presign`, `presign_post`, or `usage`).
     action: String,
     /// HTTP method the URL is signed for.
     method: String,
     /// Duration in microseconds.
     duration_us: u128,
-    /// Link lifetime in seconds.
+    /// Link lifetime in seconds (`0` for `usage`, which sends a request itself).
     expires: u64,
+    /// Bytes summed in this `usage` list page (omitted for presign ops).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<u64>,
+    /// Objects counted in this `usage` list page (omitted for presign ops).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    objects: Option<u64>,
 }
 
 /// Parsed payload for a `presign` operation.
@@ -132,6 +140,14 @@ struct PresignPostPayload {
     /// Requested lifetime in seconds (0 = use the configured default).
     #[serde(default)]
     expires: u64,
+}
+
+/// Parsed payload for a `usage` operation (folder-size scan).
+#[derive(Debug, Deserialize)]
+struct UsagePayload {
+    /// Key prefix to total (e.g. `"user-a/"`); empty totals the whole bucket.
+    #[serde(default)]
+    prefix: String,
 }
 
 /// Successful presign result plus the stats needed to build a metric.
@@ -168,6 +184,16 @@ pub(crate) fn inject_s3(
         move |action: String, payload_json: String| -> String {
             if let Err(err) = sandbox::check_op_limit(&metrics_clone, max_ops) {
                 return sandbox::error_json(&err);
+            }
+
+            // `usage` paginates and meters each list request itself, so it is
+            // handled here rather than through the single-metric `dispatch` path.
+            if action == "usage" {
+                return match do_usage(&owned, &payload_json, allow_private, &metrics_clone, max_ops)
+                {
+                    Ok(json) => json,
+                    Err(err) => sandbox::error_json(&err),
+                };
             }
 
             let start = Instant::now();
@@ -327,6 +353,225 @@ fn post_url(scheme: &str, host: &str, config: &S3Config) -> String {
     } else {
         format!("{scheme}://{host}/")
     }
+}
+
+// -- Usage (folder size via ListObjectsV2) ----------------------------------
+
+/// Totals the bytes and object count under a key prefix.
+///
+/// Unlike presign, this **connects to the store** (trusted, operator-supplied
+/// config — same model as `db`/`mail`; the endpoint host stays SSRF-guarded via
+/// [`resolve_host`]). It signs and sends `GET /?list-type=2&prefix=...`, paging
+/// through `NextContinuationToken` and summing each `<Size>`. There is no single
+/// "folder size" API in S3 — a prefix is just a key namespace — so this is the
+/// only truthful total. Each page counts as one op against `max_ops`, so a huge
+/// prefix errors with the op-limit message rather than running unbounded.
+fn do_usage(
+    config: &S3Config,
+    payload_json: &str,
+    allow_private: bool,
+    metrics: &Collector<S3Metric>,
+    max_ops: usize,
+) -> Result<String, String> {
+    let payload: UsagePayload =
+        serde_json::from_str(payload_json).map_err(|err| format!("invalid s3 payload: {err}"))?;
+
+    let (scheme, host) = resolve_host(config, allow_private)?;
+    let client = build_blocking_client()?;
+    let target = ListTarget { config, scheme: &scheme, host: &host, prefix: &payload.prefix };
+
+    let mut total_bytes: u64 = 0;
+    let mut total_objects: u64 = 0;
+    let mut token: Option<String> = None;
+
+    loop {
+        sandbox::check_op_limit(metrics, max_ops)?;
+        let start = Instant::now();
+        let (page_bytes, page_objects, next) =
+            fetch_list_page(&client, &target, token.as_deref())?;
+        sandbox::record(
+            metrics,
+            S3Metric {
+                action: "usage".to_owned(),
+                method: "GET".to_owned(),
+                duration_us: start.elapsed().as_micros(),
+                expires: 0,
+                bytes: Some(page_bytes),
+                objects: Some(page_objects),
+            },
+        );
+        total_bytes = total_bytes
+            .checked_add(page_bytes)
+            .ok_or_else(|| "usage byte total overflow".to_owned())?;
+        total_objects = total_objects
+            .checked_add(page_objects)
+            .ok_or_else(|| "usage object total overflow".to_owned())?;
+        match next {
+            Some(next_token) => token = Some(next_token),
+            None => break,
+        }
+    }
+
+    let response = json!({
+        "prefix": payload.prefix,
+        "bytes": total_bytes,
+        "objects": total_objects,
+    });
+    serde_json::to_string(&response)
+        .map_err(|err| format!("failed to encode usage response: {err}"))
+}
+
+/// Resolved listing target, shared unchanged across paginated requests.
+struct ListTarget<'a> {
+    /// Operator-supplied S3 configuration.
+    config: &'a S3Config,
+    /// URL scheme (`http`/`https`).
+    scheme: &'a str,
+    /// Host authority (matches the signed `host` header).
+    host: &'a str,
+    /// Key prefix being totalled (empty = whole bucket).
+    prefix: &'a str,
+}
+
+/// Builds a short-timeout, no-redirect blocking client for list requests.
+///
+/// Redirects are disabled so a `301`/`307` can never bounce the request to an
+/// unvalidated host (the endpoint host is checked once in [`resolve_host`]).
+fn build_blocking_client() -> Result<Client, String> {
+    Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(redirect::Policy::none())
+        .build()
+        .map_err(|err| format!("failed to build s3 client: {err}"))
+}
+
+/// Fetches one `ListObjectsV2` page, returning `(bytes, objects, next_token)`.
+fn fetch_list_page(
+    client: &Client,
+    target: &ListTarget<'_>,
+    token: Option<&str>,
+) -> Result<(u64, u64, Option<String>), String> {
+    let url = build_list_url(target, token)?;
+    let response = client
+        .get(&url)
+        .send()
+        .map_err(|err| format!("s3 list request failed: {err}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|err| format!("s3 list read failed: {err}"))?;
+    if !status.is_success() {
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("s3 list returned HTTP {}: {snippet}", status.as_u16()));
+    }
+    let (bytes, objects) = sum_sizes(&body)?;
+    let next =
+        extract_tag(&body, "<NextContinuationToken>", "</NextContinuationToken>")
+            .filter(|tok| !tok.is_empty());
+    Ok((bytes, objects, next))
+}
+
+/// Builds the signed `ListObjectsV2` URL for one page.
+fn build_list_url(target: &ListTarget<'_>, token: Option<&str>) -> Result<String, String> {
+    let config = target.config;
+    let (amz_date, datestamp, _now_secs) = current_timestamps()?;
+    let canonical_uri = list_uri(config);
+    let scope = format!("{datestamp}/{}/{SERVICE}/aws4_request", config.region);
+    let credential = format!("{}/{scope}", config.access_key);
+
+    // The link is used immediately server-side, so a 60s lifetime is ample.
+    let mut pairs: Vec<(&str, String)> = vec![
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_owned()),
+        ("X-Amz-Credential", credential),
+        ("X-Amz-Date", amz_date.clone()),
+        ("X-Amz-Expires", "60".to_owned()),
+        ("X-Amz-SignedHeaders", "host".to_owned()),
+        ("list-type", "2".to_owned()),
+        ("max-keys", "1000".to_owned()),
+    ];
+    if !target.prefix.is_empty() {
+        pairs.push(("prefix", target.prefix.to_owned()));
+    }
+    if let Some(continuation) = token {
+        pairs.push(("continuation-token", continuation.to_owned()));
+    }
+
+    let query = canonical_query_from_pairs(&pairs);
+    let signature = sign(&SignInput {
+        secret_key: &config.secret_key,
+        region: &config.region,
+        datestamp: &datestamp,
+        amz_date: &amz_date,
+        scope: &scope,
+        method: "GET",
+        canonical_uri: &canonical_uri,
+        query: &query,
+        host: target.host,
+    })?;
+
+    Ok(format!(
+        "{}://{}{canonical_uri}?{query}&X-Amz-Signature={signature}",
+        target.scheme, target.host
+    ))
+}
+
+/// Canonical request path for a bucket listing in the configured addressing mode.
+///
+/// Path-style targets `host/bucket`, so the path is `/{bucket}`; virtual-hosted
+/// puts the bucket in the host, so the path is `/`.
+fn list_uri(config: &S3Config) -> String {
+    if config.path_style {
+        let bucket = utf8_percent_encode(&config.bucket, SEGMENT_SET).to_string();
+        format!("/{bucket}")
+    } else {
+        "/".to_owned()
+    }
+}
+
+/// Builds a `SigV4` canonical query string from key/value pairs (sorted, encoded).
+fn canonical_query_from_pairs(pairs: &[(&str, String)]) -> String {
+    let mut encoded: Vec<(String, String)> = pairs
+        .iter()
+        .map(|(key, value)| (encode_token(key), encode_token(value)))
+        .collect();
+    encoded.sort_by(|left, right| left.0.cmp(&right.0));
+    encoded
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Sums every `<Size>` element in a `ListObjectsV2` page, returning
+/// `(total_bytes, object_count)`.
+///
+/// With no delimiter the response is a flat list of `<Contents>` (no
+/// `<CommonPrefixes>`), and `<Size>` appears only inside `<Contents>` — so one
+/// `<Size>` per object. Hand-parsed to avoid pulling in an XML dependency.
+fn sum_sizes(xml: &str) -> Result<(u64, u64), String> {
+    let mut total: u64 = 0;
+    let mut count: u64 = 0;
+    for segment in xml.split("<Size>").skip(1) {
+        let raw = segment.split("</Size>").next().unwrap_or("").trim();
+        let value: u64 = raw
+            .parse()
+            .map_err(|_err| format!("malformed S3 <Size> value: {raw}"))?;
+        total = total
+            .checked_add(value)
+            .ok_or_else(|| "size sum overflow".to_owned())?;
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| "object count overflow".to_owned())?;
+    }
+    Ok((total, count))
+}
+
+/// Extracts the text between the first `open`/`close` tag pair, if present.
+fn extract_tag(xml: &str, open: &str, close: &str) -> Option<String> {
+    xml.split(open)
+        .nth(1)
+        .and_then(|rest| rest.split(close).next())
+        .map(|inner| inner.trim().to_owned())
 }
 
 /// Inputs to the `SigV4` signing step (grouped to keep the arg count low).
@@ -551,5 +796,7 @@ fn build_metric(action: &str, outcome: Option<&PresignOutcome>, start: Instant) 
         method,
         duration_us: start.elapsed().as_micros(),
         expires,
+        bytes: None,
+        objects: None,
     }
 }

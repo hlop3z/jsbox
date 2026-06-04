@@ -1,0 +1,28 @@
+{
+  // Editor support for jsbox handler scripts: autocomplete + type-checking for
+  // the sandbox globals (json, $, api, db, mail, s3) declared in types.d.ts.
+  // Nothing is ever emitted — jsbox runs your .js as-is in QuickJS.
+  "compilerOptions": {
+    "noEmit": true,
+    "allowJs": true,
+    "checkJs": true,
+
+    // QuickJS target: modern ES, but no Node, no DOM, no bundler globals.
+    "target": "ES2020",
+    "lib": ["ES2020"],
+    "types": [],
+
+    "strict": true,
+    // Authors write `function handler(ctx) { ... }` without annotating ctx;
+    // keep that ergonomic (ctx is `any`) while still catching real mistakes.
+    "noImplicitAny": false,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+
+  // types.d.ts plus your own top-level scripts. The tests/ folder is excluded:
+  // each example declares a global `handler`, and compiling them together would
+  // collide (at runtime each script runs in its own isolated context).
+  "include": ["types.d.ts", "*.js"],
+  "exclude": ["node_modules", "tests"]
+}

@@ -30,6 +30,11 @@
         key: opts.key || '',
         expires: opts.expires || 0
       });
+    },
+    usage: function(opts) {
+      opts = opts || {};
+      // Totals { prefix, bytes, objects } for a key prefix (e.g. "user-a/").
+      return call('usage', { prefix: opts.prefix || '' });
     }
   };
 })();

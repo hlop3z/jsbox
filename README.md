@@ -320,6 +320,26 @@ await fetch(up.url, { method: "POST", body: form }); // 204 ok · 400 if > maxBy
 `config.s3.max_upload_size` is required for `presignPost` (human-readable like
 `"25mb"`/`"50gb"`, or bytes). Without it, `presignPost` errors.
 
+#### s3.usage — total bytes/objects under a prefix
+
+```js
+function handler(ctx) {
+  var u = s3.usage({ prefix: "user-a/" }); // omit prefix → whole bucket
+  // u = { prefix: "user-a/", bytes: 5242880, objects: 137 }
+  return json(u, null);
+}
+```
+
+The **only** `s3` op that connects to the store: it signs and sends a `ListObjectsV2`
+(`GET /?list-type=2&prefix=…`), pages through `NextContinuationToken`, and sums each
+object's `<Size>`. Trusted/operator-config model like `db`/`mail`, but the endpoint host
+still goes through the [`ssrf`](src/ssrf.rs) guard ([`resolve_host`](src/s3.rs)); the
+list client follows **no redirects**. S3 has no native folder-size API — a prefix is just
+a key namespace — so a full scan is the only exact total. Each 1000-key page counts as one
+op against `max_ops`, so an oversized prefix fails with the op-limit error instead of
+running unbounded; for very large prefixes maintain your own counter (via `db`) and use
+`usage` to reconcile. `bytes`/`objects` are returned as JSON numbers (exact below 2⁵³).
+
 ## Configuration
 
 Optional `config.json` in the working directory. All fields have defaults:

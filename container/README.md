@@ -73,6 +73,30 @@ curl -X POST http://localhost:4172/execute \
 
 ---
 
+## Writing handler scripts (autocomplete + type-checking)
+
+This folder ships `types.d.ts` and `tsconfig.json` so your editor gives you
+**autocomplete and type-checking** for the sandbox globals (`json`, `$`,
+`api`, `db`, `mail`, `s3`) with zero setup — just write a `.js` file here:
+
+```js
+/** @type {Handler} */
+function handler(ctx) {
+  const usage = s3.usage({ prefix: "user-a/" });
+  return json({ bytes: usage.bytes, files: usage.objects }, null);
+}
+```
+
+Open the file in VS Code (or any TypeScript-aware editor) and `s3.`, `db.`,
+`ctx.`, etc. autocomplete; mistakes are flagged inline. Nothing is compiled —
+jsbox runs your `.js` as-is in QuickJS; `tsconfig.json` is editor-only
+(`noEmit`). Keep one handler script per file at the top level (each declares a
+global `handler`). The `tests/` examples are excluded for that reason.
+
+> `api`, `db`, `mail`, and `s3` are typed as always-present for convenience, but
+> at runtime each exists only when you send its `config` block — guard optional
+> ones with `typeof`.
+
 ## Notes
 
 - Ensure Docker is running before starting Compose
