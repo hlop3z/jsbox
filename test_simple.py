@@ -93,8 +93,8 @@ def h_raw(script: str, ctx=None, config=None) -> dict:
 # -- Assertion helpers -------------------------------------------------------
 
 def data_eq(expected):
-    """Assert data == expected and no errors."""
-    return lambda r: r["data"] == expected and r["errors"] is None
+    """Assert data == expected and no error."""
+    return lambda r: r["data"] == expected and r["error"] is None
 
 
 def data_is_none():
@@ -102,15 +102,15 @@ def data_is_none():
 
 
 def has_error():
-    return lambda r: r["errors"] is not None
+    return lambda r: r["error"] is not None
 
 
 def error_contains(text: str):
-    return lambda r: r["errors"] is not None and text in str(r["errors"])
+    return lambda r: r["error"] is not None and text in str(r["error"])
 
 
 def data_none_with_error():
-    return lambda r: r["data"] is None and r["errors"] is not None
+    return lambda r: r["data"] is None and r["error"] is not None
 
 
 # -- Test definitions --------------------------------------------------------
@@ -132,13 +132,13 @@ def test_user_errors(t: Runner):
     t.section("User-defined errors")
     t.test("push error messages",
            h('var e = {messages: []}; if (!ctx.name) e.messages.push("name required"); return json(null, e);'),
-           lambda r: r["errors"]["messages"][0] == "name required")
+           lambda r: r["error"]["messages"][0] == "name required")
     t.test("custom error object",
            h('return json(null, {code: 400, detail: "bad input"});'),
-           lambda r: r["errors"]["code"] == 400 and r["errors"]["detail"] == "bad input")
+           lambda r: r["error"]["code"] == 400 and r["error"]["detail"] == "bad input")
     t.test("data with warnings",
            h('return json({status: "ok"}, {warnings: ["low battery"]});'),
-           lambda r: r["data"]["status"] == "ok" and r["errors"]["warnings"][0] == "low battery")
+           lambda r: r["data"]["status"] == "ok" and r["error"]["warnings"][0] == "low battery")
 
 
 def test_exceptions(t: Runner):
@@ -159,7 +159,7 @@ def test_sandbox(t: Runner):
 def test_json_bridge(t: Runner):
     t.section("json() bridge")
     t.test("data only",               h("return json(42);"),               data_eq(42))
-    t.test("null data and errors",     h("return json(null, null);"),       lambda r: r["data"] is None and r["errors"] is None)
+    t.test("null data and error",      h("return json(null, null);"),       lambda r: r["data"] is None and r["error"] is None)
 
 
 def test_meta(t: Runner):

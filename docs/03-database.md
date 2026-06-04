@@ -120,7 +120,7 @@ function handler(ctx) {
 ## When something goes wrong
 
 If a query fails, `db` **throws an error**. Catch it with `try/catch` (like above) and
-report it nicely in the `errors` spot.
+report it nicely in the `error` spot.
 
 ## A heads-up about numbers ⚠️
 

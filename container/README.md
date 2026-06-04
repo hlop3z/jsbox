@@ -64,7 +64,7 @@ curl -X POST http://localhost:4172/execute \
 ```json
 {
   "data": { "greeting": "hello Alice" },
-  "errors": null,
+  "error": null,
   "meta": {
     // ...
   }

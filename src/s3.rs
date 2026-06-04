@@ -1,11 +1,14 @@
-//! S3 presigned-URL generator for the `QuickJS` sandbox (`s3`).
+//! S3 object helper for the `QuickJS` sandbox (`s3`).
 //!
-//! JS API: `s3.presignPut({ key, expires? })` / `s3.presignGet({ key, expires? })`
-//! (also `s3.presign({ method, key, expires? })`).
+//! JS API: `s3.presignPut/{Get}({ key, expires? })`, `s3.presignPost({ key })`,
+//! `s3.usage({ prefix })`, and `s3.delete({ key })` (also `s3.presign({ method, key })`).
 //!
-//! The server **never connects** to the object store: it computes an AWS `SigV4`
-//! presigned URL and returns it to the script, which hands it to the frontend for a
-//! direct browser upload/download. Signing itself is pure crypto.
+//! **Presign** ops are pure crypto — the server computes an AWS `SigV4` URL and hands
+//! it to the script for a direct browser upload/download; it never connects. **`usage`**
+//! and **`delete`** *do* connect to the store (trusted, operator-supplied config, same
+//! model as `db`/`mail`; the host stays SSRF-guarded). `delete` is destructive, so it is
+//! gated behind `config.s3.allow_delete` — off unless the operator opts in, even when
+//! `s3` is otherwise configured (presigning a `DELETE` URL is gated the same way).
 //!
 //! Endpoint + credentials are operator-supplied in `config.s3`. The endpoint host is
 //! put through the **same SSRF guard as `http`** ([`crate::ssrf`]): non-`http(s)`
@@ -88,6 +91,11 @@ pub(crate) struct S3Config {
     /// `presignPost` (0 = unset → `presignPost` errors). Unused by `presignPut`/`Get`.
     #[serde(default, deserialize_with = "deserialize_byte_size")]
     pub(crate) max_upload_size: usize,
+    /// Allow object deletion (`s3.delete(...)` and presigning a `DELETE` URL).
+    /// **Off by default** — deletion is destructive, so the operator must opt in
+    /// per request even when `s3` is otherwise configured.
+    #[serde(default)]
+    pub(crate) allow_delete: bool,
 }
 
 /// Default presigned-link lifetime in seconds (15 minutes).
@@ -98,7 +106,7 @@ const fn default_max_expires() -> u64 { 604_800 }
 /// Metric recorded for each S3 operation.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct S3Metric {
-    /// Operation type (`presign`, `presign_post`, or `usage`).
+    /// Operation type (`presign`, `presign_post`, `usage`, or `delete`).
     action: String,
     /// HTTP method the URL is signed for.
     method: String,
@@ -150,6 +158,14 @@ struct UsagePayload {
     prefix: String,
 }
 
+/// Parsed payload for a `delete` operation.
+#[derive(Debug, Deserialize)]
+struct DeletePayload {
+    /// Object key to delete (path within the bucket).
+    #[serde(default)]
+    key: String,
+}
+
 /// Successful presign result plus the stats needed to build a metric.
 #[derive(Debug)]
 struct PresignOutcome {
@@ -191,6 +207,14 @@ pub(crate) fn inject_s3(
             if action == "usage" {
                 return match do_usage(&owned, &payload_json, allow_private, &metrics_clone, max_ops)
                 {
+                    Ok(json) => json,
+                    Err(err) => sandbox::error_json(&err),
+                };
+            }
+
+            // `delete` connects to the store and records its own metric, like `usage`.
+            if action == "delete" {
+                return match do_delete(&owned, &payload_json, allow_private, &metrics_clone) {
                     Ok(json) => json,
                     Err(err) => sandbox::error_json(&err),
                 };
@@ -245,6 +269,9 @@ fn do_presign(
         serde_json::from_str(payload_json).map_err(|err| format!("invalid s3 payload: {err}"))?;
 
     let method = normalize_method(&payload.method)?;
+    if method == "DELETE" && !config.allow_delete {
+        return Err("s3 DELETE is disabled (set config.s3.allow_delete = true to enable)".to_owned());
+    }
     if payload.key.trim().is_empty() {
         return Err("s3 presign requires a non-empty key".to_owned());
     }
@@ -572,6 +599,99 @@ fn extract_tag(xml: &str, open: &str, close: &str) -> Option<String> {
         .nth(1)
         .and_then(|rest| rest.split(close).next())
         .map(|inner| inner.trim().to_owned())
+}
+
+// -- Delete (server-side object deletion, gated) ----------------------------
+
+/// Deletes one object from the store. Gated by `config.s3.allow_delete`.
+///
+/// Like `usage`, this **connects to the store** (trusted, operator-supplied config;
+/// the host stays SSRF-guarded via [`resolve_host`]). It signs and sends a short-lived
+/// `DELETE /{bucket}/{key}` and counts as one op. S3 delete is idempotent — deleting a
+/// missing key still returns success (HTTP 204).
+fn do_delete(
+    config: &S3Config,
+    payload_json: &str,
+    allow_private: bool,
+    metrics: &Collector<S3Metric>,
+) -> Result<String, String> {
+    if !config.allow_delete {
+        return Err(
+            "s3 delete is disabled (set config.s3.allow_delete = true to enable)".to_owned(),
+        );
+    }
+    let payload: DeletePayload =
+        serde_json::from_str(payload_json).map_err(|err| format!("invalid s3 payload: {err}"))?;
+    if payload.key.trim().is_empty() {
+        return Err("s3 delete requires a non-empty key".to_owned());
+    }
+
+    let (scheme, host) = resolve_host(config, allow_private)?;
+    let url = build_delete_url(config, &scheme, &host, &payload.key)?;
+    let client = build_blocking_client()?;
+
+    let start = Instant::now();
+    let response = client
+        .delete(&url)
+        .send()
+        .map_err(|err| format!("s3 delete request failed: {err}"))?;
+    sandbox::record(
+        metrics,
+        S3Metric {
+            action: "delete".to_owned(),
+            method: "DELETE".to_owned(),
+            duration_us: start.elapsed().as_micros(),
+            expires: 0,
+            bytes: None,
+            objects: None,
+        },
+    );
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().map_err(|err| format!("s3 delete read failed: {err}"))?;
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("s3 delete returned HTTP {}: {snippet}", status.as_u16()));
+    }
+
+    let out = json!({ "key": payload.key, "deleted": true });
+    serde_json::to_string(&out).map_err(|err| format!("failed to encode delete response: {err}"))
+}
+
+/// Builds a short-lived signed `DELETE` URL for one object (consumed immediately
+/// server-side, so a 60s lifetime is ample).
+fn build_delete_url(
+    config: &S3Config,
+    scheme: &str,
+    host: &str,
+    key: &str,
+) -> Result<String, String> {
+    let (amz_date, datestamp, _now_secs) = current_timestamps()?;
+    let canonical_uri = build_uri(config, key);
+    let scope = format!("{datestamp}/{}/{SERVICE}/aws4_request", config.region);
+    let credential = format!("{}/{scope}", config.access_key);
+
+    let pairs: Vec<(&str, String)> = vec![
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_owned()),
+        ("X-Amz-Credential", credential),
+        ("X-Amz-Date", amz_date.clone()),
+        ("X-Amz-Expires", "60".to_owned()),
+        ("X-Amz-SignedHeaders", "host".to_owned()),
+    ];
+    let query = canonical_query_from_pairs(&pairs);
+    let signature = sign(&SignInput {
+        secret_key: &config.secret_key,
+        region: &config.region,
+        datestamp: &datestamp,
+        amz_date: &amz_date,
+        scope: &scope,
+        method: "DELETE",
+        canonical_uri: &canonical_uri,
+        query: &query,
+        host,
+    })?;
+
+    Ok(format!("{scheme}://{host}{canonical_uri}?{query}&X-Amz-Signature={signature}"))
 }
 
 /// Inputs to the `SigV4` signing step (grouped to keep the arg count low).

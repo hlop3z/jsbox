@@ -7,7 +7,7 @@
 Every script you give the robot follows **two rules**:
 
 1. You must write a function called **`handler`**. It gets one thing: `ctx` (your data).
-2. You must give your answer back using **`json(data, errors)`**.
+2. You must give your answer back using **`json(data, error)`**.
 
 Here is the smallest script that works:
 
@@ -18,7 +18,7 @@ function handler(ctx) {
 ```
 
 - The first part, `{ message: "Hello!" }`, is your **data** (the good stuff).
-- The second part, `null`, is your **errors** (nothing went wrong, so `null`).
+- The second part, `null`, is your **error** (nothing went wrong, so `null`).
 
 ## Sending it to the robot
 
@@ -49,12 +49,12 @@ curl -X POST http://localhost:3000/execute -H "Content-Type: application/json" -
 
 ## What the robot hands back
 
-The answer is **always** the same shape. Three boxes: `data`, `errors`, and `meta`.
+The answer is **always** the same shape. Three boxes: `data`, `error`, and `meta`.
 
 ```json
 {
   "data": { "greeting": "hi Mia" },
-  "errors": null,
+  "error": null,
   "meta": {
     "exec_time_us": 950,
     "http_requests": [],
@@ -65,14 +65,14 @@ The answer is **always** the same shape. Three boxes: `data`, `errors`, and `met
 ```
 
 - **`data`** — what your script returned as the good stuff.
-- **`errors`** — `null` if all went well, or your error message if not.
+- **`error`** — `null` if all went well, or your error message if not.
 - **`meta`** — a little **receipt** 🧾 the robot fills in for you: how long it took,
   and a list of every internet/database/email action it did. You don't write this —
   the robot does.
 
 ## Saying "oops, something went wrong"
 
-If your script needs to report a problem, put a message in the **errors** spot:
+If your script needs to report a problem, put a message in the **error** spot:
 
 ```js
 function handler(ctx) {
@@ -83,8 +83,8 @@ function handler(ctx) {
 }
 ```
 
-When `errors` has something in it, `data` is usually `null`. Think of it like a
-traffic light: **green** = data, **red** = errors. 🟢🔴
+When `error` has something in it, `data` is usually `null`. Think of it like a
+traffic light: **green** = data, **red** = error. 🟢🔴
 
 ## House rules (so nobody breaks the box) 🧱
 

@@ -1,6 +1,6 @@
-globalThis.json = function(data, errors) {
+globalThis.json = function(data, error) {
   return JSON.stringify({
     data: data !== undefined ? data : null,
-    errors: errors !== undefined ? errors : null
+    error: error !== undefined ? error : null
   });
 };

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 jsbox is a sandboxed JavaScript execution service in Rust. Clients `POST /execute` a JS
 `handler(ctx)` function plus a JSON context; the server runs it in an isolated QuickJS
-context and returns `{data, errors, meta}`. The single endpoint is the whole product.
+context and returns `{data, error, meta}`. The single endpoint is the whole product.
 
 ## Commands
 
@@ -38,7 +38,7 @@ The strict lint contract lives in `[lints.clippy]` in `Cargo.toml`, and **`cargo
 1. **`handler.rs`** — `execute()` validates input sizes, then `tokio::task::spawn_blocking` (QuickJS is synchronous/single-threaded and must run off the async runtime).
 2. **`pool.rs`** — `JsPool` is a fixed pool of pre-warmed `Runtime`s (sized to CPU cores). `acquire()`/`release()`; a fresh `Context` is created per request (cheap) so global scope never leaks between requests. `release()` runs GC.
 3. **`engine.rs`** — `run()` is the orchestrator: sets a timeout interrupt handler, makes a `Context`, injects the `json()` bridge → injects `$`/Decimal → injects capabilities (`inject_apis`) → evals the user script → removes `eval`/`Proxy` → calls `handler(ctx)` → extracts the JSON result. Returns `ExecResult { js_json, http_metrics, db_metrics, mail_metrics }`.
-4. **`handler.rs`** — parses the JS `{data, errors}` envelope (zero-copy via `RawValue`), attaches the Rust-computed `meta`, returns `{data, errors, meta}`.
+4. **`handler.rs`** — parses the JS `{data, error}` envelope (zero-copy via `RawValue`), attaches the Rust-computed `meta`, returns `{data, error, meta}`.
 
 `config.rs` loads optional `config.json` (server bind + engine sandbox limits, with human-readable byte sizes like `"32mb"`). Sandbox limits: memory, stack, wall-clock timeout, max script/context bytes, and `max_ops` (caps total external operations per execution).
 

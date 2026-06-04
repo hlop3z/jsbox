@@ -31,20 +31,20 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Builds the `{ data, errors }` envelope your `handler` must return. The server
- * attaches `meta` and replies with `{ data, errors, meta }`.
+ * Builds the `{ data, error }` envelope your `handler` must return. The server
+ * attaches `meta` and replies with `{ data, error, meta }`.
  *
  * Pass `null` for whichever side doesn't apply.
  *
- * @param data   The success payload (any JSON-serializable value, or `null`).
- * @param errors The error payload (any JSON-serializable value, or `null`).
+ * @param data  The success payload (any JSON-serializable value, or `null`).
+ * @param error The error payload (any JSON-serializable value, or `null`).
  *
  * @example
  * return json({ ok: true }, null);     // success
  * @example
  * return json(null, { message: "bad input" }); // failure
  */
-declare function json(data: unknown, errors?: unknown): string;
+declare function json(data: unknown, error?: unknown): string;
 
 /**
  * The function the sandbox calls. Define `function handler(ctx) { ... }` in your
@@ -348,14 +348,28 @@ interface S3UsageResult {
   objects: number;
 }
 
+/** Options for {@link S3.delete}. */
+interface S3DeleteOptions {
+  /** Object key to delete, e.g. `"user-a/photo.jpg"`. */
+  key: string;
+}
+
+/** Result of {@link S3.delete}. */
+interface S3DeleteResult {
+  /** The key that was deleted. */
+  key: string;
+  /** Always `true` on success (S3 delete is idempotent — a missing key still succeeds). */
+  deleted: boolean;
+}
+
 /**
  * S3-compatible storage helper for `config.s3` (AWS S3, Cloudflare R2, MinIO,
  * Backblaze B2, …). `presign*` is pure crypto — the server never touches your
- * files; `usage` is the one call that connects (to list objects). The `endpoint`
- * is operator-config and SSRF-guarded. `presign*` throws on an empty `key`.
+ * files; `usage` and `delete` are the calls that connect. The `endpoint` is
+ * operator-config and SSRF-guarded. `presign*`/`delete` throw on an empty `key`.
  */
 interface S3 {
-  /** Signs a URL for the given `method` (default `"PUT"`). */
+  /** Signs a URL for the given `method` (default `"PUT"`). `DELETE` needs `config.s3.allow_delete`. */
   presign(opts: S3PresignGeneralOptions): S3PresignResult;
   /** Signs a `PUT` upload URL. */
   presignPut(opts: S3PresignOptions): S3PresignResult;
@@ -370,6 +384,12 @@ interface S3 {
    * @example const u = s3.usage({ prefix: "user-a/" }); // { prefix, bytes, objects }
    */
   usage(opts?: S3UsageOptions): S3UsageResult;
+  /**
+   * Deletes one object. **Destructive and opt-in** — throws unless the operator
+   * set `config.s3.allow_delete = true`, even when `s3` is otherwise configured.
+   * @example const d = s3.delete({ key: "user-a/old.jpg" }); // { key, deleted: true }
+   */
+  delete(opts: S3DeleteOptions): S3DeleteResult;
 }
 
 /** S3 storage helper. Present only when `config.s3` is supplied. */

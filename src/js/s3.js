@@ -35,6 +35,12 @@
       opts = opts || {};
       // Totals { prefix, bytes, objects } for a key prefix (e.g. "user-a/").
       return call('usage', { prefix: opts.prefix || '' });
+    },
+    delete: function(opts) {
+      opts = opts || {};
+      // Deletes one object -> { key, deleted: true }. Throws unless the operator
+      // set config.s3.allow_delete = true (destructive, so it is opt-in).
+      return call('delete', { key: opts.key || '' });
     }
   };
 })();

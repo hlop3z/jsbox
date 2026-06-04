@@ -52,7 +52,7 @@ pub(crate) struct ExecParams<'a> {
 
 /// Result of a script execution.
 pub(crate) struct ExecResult {
-    /// The JS-produced `{"data": ..., "errors": ...}` JSON string.
+    /// The JS-produced `{"data": ..., "error": ...}` JSON string.
     pub(crate) js_json: String,
     /// HTTP requests made during execution.
     pub(crate) http_metrics: Vec<HttpMetric>,
@@ -139,7 +139,7 @@ fn setup_timeout(runtime: &Runtime, timeout: Duration) -> Arc<AtomicBool> {
     timed_out
 }
 
-/// Injects the `json(data, errors)` bridge function.
+/// Injects the `json(data, error)` bridge function.
 fn inject_bridge(qctx: &rquickjs::Ctx<'_>) -> Result<(), Box<dyn Error + Send + Sync>> {
     let bridge: JsValue<'_> = qctx.eval(JSON_BRIDGE)?;
     drop(bridge);
@@ -244,6 +244,6 @@ fn extract_json_string<'js>(
     let stringified = qctx.json_stringify(result)?;
     match stringified {
         Some(js_str) => Ok(js_str.to_string()?),
-        None => Ok("{\"data\":null,\"errors\":null}".into()),
+        None => Ok("{\"data\":null,\"error\":null}".into()),
     }
 }

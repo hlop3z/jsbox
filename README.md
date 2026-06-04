@@ -1,6 +1,6 @@
 # jsbox
 
-A sandboxed JavaScript execution engine built in Rust. Send a JS handler function + context via HTTP, get structured `{data, errors, meta}` back.
+A sandboxed JavaScript execution engine built in Rust. Send a JS handler function + context via HTTP, get structured `{data, error, meta}` back.
 
 Powered by QuickJS (via rquickjs), axum, and mimalloc.
 
@@ -69,7 +69,7 @@ POST /execute
 ```json
 {
   "data": { "greeting": "hello Alice" },
-  "errors": null,
+  "error": null,
   "meta": {
     "script_bytes": 82,
     "context_bytes": 16,
@@ -83,11 +83,11 @@ POST /execute
 }
 ```
 
-Always `{data, errors, meta}`. The handler controls `data` and `errors` via the `json()` bridge.
+Always `{data, error, meta}`. The handler controls `data` and `error` via the `json()` bridge.
 
 ## JS API
 
-### json(data, errors)
+### json(data, error)
 
 The return contract. Every handler must return via `json()`:
 
@@ -285,6 +285,7 @@ SigV4 store — AWS S3, Cloudflare R2, MinIO, Backblaze B2, DigitalOcean Spaces:
 | `expires`         | `900`      | Default link lifetime in seconds                                      |
 | `max_expires`     | `604800`   | Hard cap on link lifetime (SigV4 max, 7 days)                         |
 | `max_upload_size` | (unset)    | **`presignPost` only** — max object bytes, human-readable (`"25mb"`)  |
+| `allow_delete`    | `false`    | Enable `s3.delete` + presigning `DELETE` URLs (destructive — opt-in)  |
 
 #### s3.presignPost — size-enforced browser uploads
 
@@ -339,6 +340,24 @@ a key namespace — so a full scan is the only exact total. Each 1000-key page c
 op against `max_ops`, so an oversized prefix fails with the op-limit error instead of
 running unbounded; for very large prefixes maintain your own counter (via `db`) and use
 `usage` to reconcile. `bytes`/`objects` are returned as JSON numbers (exact below 2⁵³).
+
+#### s3.delete — remove an object (opt-in)
+
+```js
+function handler(ctx) {
+  var d = s3.delete({ key: "customers/" + ctx.id + "/photo.jpg" });
+  // d = { key: "customers/1/photo.jpg", deleted: true }
+  return json(d, null);
+}
+```
+
+Like `usage`, this **connects to the store** (trusted/operator-config, SSRF-guarded host).
+It signs and sends a short-lived `DELETE /{bucket}/{key}`. S3 delete is **idempotent** — a
+missing key still returns `deleted: true` (HTTP 204). Because deletion is destructive, it
+is **gated behind `config.s3.allow_delete`** (default `false`): even with `s3` otherwise
+configured, `s3.delete(...)` — and presigning a `DELETE` URL via `s3.presign({ method:
+"DELETE" })` — throws unless the operator sets `allow_delete: true`. Counts as one op
+against `max_ops`.
 
 ## Configuration
 
@@ -421,7 +440,7 @@ HTTP request
         <- extract JSON result
       <- release runtime to pool (GC first)
     <- attach meta (sizes, timing, http/db/mail/s3 metrics)
-  <- {data, errors, meta} response
+  <- {data, error, meta} response
 ```
 
 ## License

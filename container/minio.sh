@@ -72,8 +72,11 @@ mc ls -r "t/$BKT"
 # config.s3.endpoint of http://jsbox-minio:9000 resolves.
 connect_jsbox() {
   running jsbox || return 0
-  if docker network inspect "$NETWORK" --format '{{range .Containers}}{{.Name}} {{end}}' \
-       | grep -qw jsbox; then
+  # One name per line + exact-line match. (A space-joined list with `grep -w`
+  # false-positives: `-w` treats `-` as a word boundary, so "jsbox-minio"
+  # matches "jsbox" and the attach gets skipped.)
+  if docker network inspect "$NETWORK" --format '{{range .Containers}}{{println .Name}}{{end}}' \
+       | grep -qx jsbox; then
     return 0
   fi
   docker network connect "$NETWORK" jsbox && echo "Attached running 'jsbox' container to $NETWORK."

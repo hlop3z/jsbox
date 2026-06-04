@@ -123,13 +123,13 @@ impl Meta {
     }
 }
 
-/// Full response: JS-produced `{data, errors}` as borrowed `RawValue` + Rust meta.
+/// Full response: JS-produced `{data, error}` as borrowed `RawValue` + Rust meta.
 #[derive(Debug, Serialize)]
 struct Response<'a> {
     /// The data field from the JS handler (borrowed, never copied).
     data: &'a RawValue,
-    /// The errors field from the JS handler (borrowed, never copied).
-    errors: &'a RawValue,
+    /// The error field from the JS handler (borrowed, never copied).
+    error: &'a RawValue,
     /// Metadata computed by Rust.
     meta: Meta,
 }
@@ -140,7 +140,7 @@ struct InfraResponse {
     /// Always null on infra failure.
     data: Option<()>,
     /// The error detail.
-    errors: InfraErrorDetail,
+    error: InfraErrorDetail,
     /// Metadata computed by Rust.
     meta: Meta,
 }
@@ -158,9 +158,9 @@ struct Envelope<'a> {
     /// Raw data from JS (zero-copy borrow).
     #[serde(default = "raw_null_ref", borrow)]
     data: &'a RawValue,
-    /// Raw errors from JS (zero-copy borrow).
+    /// Raw error from JS (zero-copy borrow).
     #[serde(default = "raw_null_ref", borrow)]
-    errors: &'a RawValue,
+    error: &'a RawValue,
 }
 
 /// Returns a reference to the pre-allocated `null` raw value.
@@ -168,7 +168,7 @@ fn raw_null_ref() -> &'static RawValue {
     &RAW_NULL
 }
 
-/// Executes a JS `handler(context)` and returns `{data, errors, meta}` JSON.
+/// Executes a JS `handler(context)` and returns `{data, error, meta}` JSON.
 pub(crate) async fn execute(
     State(js_pool): State<JsPool>,
     Json(req): Json<ExecRequest>,
@@ -256,7 +256,7 @@ fn build_response(
         Ok(js_json) => match serde_json::from_str::<Envelope<'_>>(js_json) {
             Ok(env) => (
                 StatusCode::OK,
-                Json(Response { data: env.data, errors: env.errors, meta }),
+                Json(Response { data: env.data, error: env.error, meta }),
             )
                 .into_response(),
             Err(parse_err) => infra_error(
@@ -275,7 +275,7 @@ fn infra_error(status: StatusCode, message: String, meta: Meta) -> AxumResponse 
         status,
         Json(InfraResponse {
             data: None,
-            errors: InfraErrorDetail { message },
+            error: InfraErrorDetail { message },
             meta,
         }),
     )
