@@ -269,7 +269,8 @@ SigV4 store — AWS S3, Cloudflare R2, MinIO, Backblaze B2, DigitalOcean Spaces:
   "secret_key": "SECRET...",
   "path_style": false,
   "expires": 900,
-  "max_expires": 604800
+  "max_expires": 604800,
+  "max_upload_size": "25mb"
 }
 ```
 
