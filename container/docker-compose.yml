@@ -1,8 +1,10 @@
 services:
   jsbox:
+    container_name: jsbox
     image: ghcr.io/hlop3z/jsbox:latest
     ports:
       - "4172:3000"
     volumes:
       - ./config.json:/app/config.json:ro
     restart: unless-stopped
+    
