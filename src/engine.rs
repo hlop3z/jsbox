@@ -19,6 +19,8 @@ use crate::http;
 use crate::http::HttpMetric;
 use crate::mail;
 use crate::mail::{MailConfig, MailMetric};
+use crate::s3;
+use crate::s3::{S3Config, S3Metric};
 use crate::sandbox::{self, Collector};
 
 /// The `json()` bridge — loaded from `src/js/bridge.js` at compile time.
@@ -40,6 +42,8 @@ pub(crate) struct ExecParams<'a> {
     pub(crate) db_config: Option<&'a DbConfig>,
     /// Mail config (None = disabled).
     pub(crate) mail_config: Option<&'a MailConfig>,
+    /// S3 config (None = disabled).
+    pub(crate) s3_config: Option<&'a S3Config>,
     /// Max operations per execution.
     pub(crate) max_ops: usize,
 }
@@ -54,6 +58,8 @@ pub(crate) struct ExecResult {
     pub(crate) db_metrics: Vec<DbMetric>,
     /// Mail operations made during execution.
     pub(crate) mail_metrics: Vec<MailMetric>,
+    /// S3 operations made during execution.
+    pub(crate) s3_metrics: Vec<S3Metric>,
 }
 
 /// Runs the script in a sandboxed context.
@@ -69,11 +75,19 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, Box<dyn Error +
     let mut http_collector: Option<Collector<HttpMetric>> = None;
     let mut db_collector: Option<Collector<DbMetric>> = None;
     let mut mail_collector: Option<Collector<MailMetric>> = None;
+    let mut s3_collector: Option<Collector<S3Metric>> = None;
+
+    let mut collectors = Collectors {
+        http: &mut http_collector,
+        db: &mut db_collector,
+        mail: &mut mail_collector,
+        s3: &mut s3_collector,
+    };
 
     let js_result = ctx.with(|qctx| -> Result<String, Box<dyn Error + Send + Sync>> {
         inject_bridge(&qctx)?;
         decimal::inject_decimal(&qctx)?;
-        inject_apis(&qctx, params, &mut http_collector, &mut db_collector, &mut mail_collector)?;
+        inject_apis(&qctx, params, &mut collectors)?;
         eval_script(&qctx, params.script)?;
         sanitize_globals(&qctx)?;
         call_handler(&qctx, params.context_json, &timed_out, params.timeout)
@@ -87,7 +101,23 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, Box<dyn Error +
         http_metrics: sandbox::drain(http_collector.as_ref()),
         db_metrics: sandbox::drain(db_collector.as_ref()),
         mail_metrics: sandbox::drain(mail_collector.as_ref()),
+        s3_metrics: sandbox::drain(s3_collector.as_ref()),
     })
+}
+
+/// Mutable references to the per-capability metric collectors.
+///
+/// Grouped into one struct so [`inject_apis`] stays within the argument-count
+/// limit as capabilities are added.
+struct Collectors<'a> {
+    /// HTTP metrics collector slot.
+    http: &'a mut Option<Collector<HttpMetric>>,
+    /// DB metrics collector slot.
+    db: &'a mut Option<Collector<DbMetric>>,
+    /// Mail metrics collector slot.
+    mail: &'a mut Option<Collector<MailMetric>>,
+    /// S3 metrics collector slot.
+    s3: &'a mut Option<Collector<S3Metric>>,
 }
 
 // -- Setup helpers ----------------------------------------------------------
@@ -114,22 +144,23 @@ fn inject_bridge(qctx: &rquickjs::Ctx<'_>) -> Result<(), Box<dyn Error + Send + 
     Ok(())
 }
 
-/// Injects HTTP and DB APIs if configured.
+/// Injects the HTTP, DB, mail, and S3 APIs if configured.
 fn inject_apis(
     qctx: &rquickjs::Ctx<'_>,
     params: &ExecParams<'_>,
-    http_collector: &mut Option<Collector<HttpMetric>>,
-    db_collector: &mut Option<Collector<DbMetric>>,
-    mail_collector: &mut Option<Collector<MailMetric>>,
+    collectors: &mut Collectors<'_>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if !params.allowed_hosts.is_empty() {
-        *http_collector = Some(http::inject_api(qctx, params.allowed_hosts, params.max_ops)?);
+        *collectors.http = Some(http::inject_api(qctx, params.allowed_hosts, params.max_ops)?);
     }
     if let Some(db_cfg) = params.db_config {
-        *db_collector = Some(db::inject_db(qctx, db_cfg, params.max_ops)?);
+        *collectors.db = Some(db::inject_db(qctx, db_cfg, params.max_ops)?);
     }
     if let Some(mail_cfg) = params.mail_config {
-        *mail_collector = Some(mail::inject_mail(qctx, mail_cfg, params.max_ops)?);
+        *collectors.mail = Some(mail::inject_mail(qctx, mail_cfg, params.max_ops)?);
+    }
+    if let Some(s3_cfg) = params.s3_config {
+        *collectors.s3 = Some(s3::inject_s3(qctx, s3_cfg, params.max_ops)?);
     }
     Ok(())
 }

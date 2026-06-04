@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,6 +15,7 @@ use rquickjs::{Ctx, Function, Value as JsValue};
 use serde::Serialize;
 
 use crate::sandbox::{self, Collector};
+use crate::ssrf::block_private_ip;
 
 /// Timeout for each HTTP request from JS.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -211,56 +211,6 @@ fn extract_host(url: &str) -> String {
         .ok()
         .and_then(|parsed| parsed.host_str().map(String::from))
         .unwrap_or_else(|| "unknown".into())
-}
-
-// -- SSRF protection --------------------------------------------------------
-
-/// Blocks requests to private/internal IP addresses (SSRF protection).
-fn block_private_ip(host: &str, port: u16) -> Result<(), String> {
-    // Literal IP check (no DNS needed).
-    if let Ok(addr) = host.parse::<IpAddr>() {
-        if is_private_ip(&addr) {
-            return Err(format!("requests to private IP {addr} are blocked"));
-        }
-        return Ok(());
-    }
-
-    // Resolve hostname and check all addresses.
-    if let Ok(addrs) = (host, port).to_socket_addrs() {
-        for sock_addr in addrs {
-            if is_private_ip(&sock_addr.ip()) {
-                return Err(format!(
-                    "host '{host}' resolves to private IP {}, blocked",
-                    sock_addr.ip()
-                ));
-            }
-        }
-    }
-    // DNS failure will surface later when reqwest tries to connect.
-    Ok(())
-}
-
-/// Returns `true` for loopback, private, link-local, and other non-public IPv4.
-const fn is_private_v4(ip: Ipv4Addr) -> bool {
-    let [oct_a, oct_b, _, _] = ip.octets();
-    ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_unspecified()
-        || (oct_a == 100 && oct_b >= 64 && oct_b <= 127) // CGNAT 100.64.0.0/10
-}
-
-/// Returns `true` if the address is private/internal (SSRF protection).
-fn is_private_ip(addr: &IpAddr) -> bool {
-    match *addr {
-        IpAddr::V4(ip) => is_private_v4(ip),
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.to_ipv4_mapped().is_some_and(is_private_v4)
-        }
-    }
 }
 
 // -- Headers ----------------------------------------------------------------

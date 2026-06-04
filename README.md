@@ -5,7 +5,7 @@ A sandboxed JavaScript execution engine built in Rust. Send a JS handler functio
 Powered by QuickJS (via rquickjs), axum, and mimalloc.
 
 > 🧒 **New here?** Start with the friendly, beginner-first guide in **[`docs/`](docs/README.md)** —
-> it explains `api`, `db`, `mail`, and how to handle money/decimals in plain language.
+> it explains `api`, `db`, `mail`, `s3`, and how to handle money/decimals in plain language.
 
 ## [Docker](https://github.com/hlop3z/jsbox/pkgs/container/jsbox)
 
@@ -62,6 +62,7 @@ POST /execute
 | `config.allowed_hosts` | no       | Hosts the script can reach via `api.*` (`["*"]` = any, `[]` = disabled) |
 | `config.db`            | no       | PostgreSQL/CockroachDB connection (omit to disable `db.*`)              |
 | `config.mail`          | no       | SMTP relay connection (omit to disable `mail.*`)                        |
+| `config.s3`            | no       | S3/R2/MinIO connection for presigned URLs (omit to disable `s3.*`)      |
 
 ### Response
 
@@ -76,7 +77,8 @@ POST /execute
     "exec_time_us": 950,
     "http_requests": [],
     "db_requests": [],
-    "mail_requests": []
+    "mail_requests": [],
+    "s3_requests": []
   }
 }
 ```
@@ -220,6 +222,67 @@ private/internal relays are allowed):
 Addresses, subject, and bodies are assembled with a typed message builder, so caller
 input cannot inject SMTP headers (CRLF injection is rejected at parse time).
 
+### s3.presignPut / s3.presignGet / s3.presign
+
+Presigned-URL generator for direct browser uploads/downloads (requires `config.s3`):
+
+```js
+function handler(ctx) {
+  // Sign a URL the browser uses to PUT the file straight to the bucket.
+  var put = s3.presignPut({ key: "uploads/" + ctx.filename, expires: 300 });
+  // put = { url: "https://...&X-Amz-Signature=...", method: "PUT", expires: 300 }
+
+  // Sign a short-lived download link.
+  var get = s3.presignGet({ key: "uploads/" + ctx.filename });
+
+  // s3.presign({ method, key, expires }) is the general form (PUT/GET/HEAD/DELETE).
+  return json({ upload: put.url, download: get.url }, null);
+}
+```
+
+The server **never connects** to the object store — signing is pure AWS SigV4 crypto.
+The signed URL goes back to the script, which hands it to the frontend; the browser
+does the actual transfer. `expires` is in seconds (clamped to `[1, max_expires]`,
+default 15 min, SigV4 max 7 days).
+
+**SSRF-guarded like `api`/`http`:** the `endpoint` must use the `http`/`https` scheme
+(no `file://`), and its host is checked against the same private/internal-IP blocklist
+([`src/ssrf.rs`](src/ssrf.rs)) — `localhost`, `127.0.0.1`, `10.x`, `192.168.x`,
+link-local, etc. are **rejected** (one DNS lookup resolves hostnames). So a presigned
+URL can only ever target a **publicly reachable** object store, never a local or
+internal one. The sandboxed script cannot set `endpoint`; only operator config can.
+
+> ⚠️ Because of the guard, a `MinIO`/S3 instance on `localhost` or a private LAN is
+> **blocked** — point `s3` at a public endpoint (AWS S3, Cloudflare R2, or `MinIO`
+> exposed on a public address).
+
+`config.s3` (operator-supplied, like `config.db`/`config.mail`). Works with any
+SigV4 store — AWS S3, Cloudflare R2, MinIO, Backblaze B2, DigitalOcean Spaces:
+
+```json
+{
+  "endpoint": "https://ACCOUNT.r2.cloudflarestorage.com",
+  "region": "auto",
+  "bucket": "uploads",
+  "access_key": "AKID...",
+  "secret_key": "SECRET...",
+  "path_style": false,
+  "expires": 900,
+  "max_expires": 604800
+}
+```
+
+| Field         | Default      | Description                                                            |
+| ------------- | ------------ | --------------------------------------------------------------------- |
+| `endpoint`    | (required)   | Public store URL incl. scheme (`https://s3.us-east-1.amazonaws.com`)  |
+| `region`      | (required)   | SigV4 region scope (`us-east-1`; R2 uses `auto`)                       |
+| `bucket`      | (required)   | Bucket name                                                           |
+| `access_key`  | (required)   | Access key id                                                         |
+| `secret_key`  | (required)   | Secret access key                                                    |
+| `path_style`  | `false`      | `true` = `host/bucket/key` (MinIO); `false` = `bucket.host/key` (AWS) |
+| `expires`     | `900`        | Default link lifetime in seconds                                     |
+| `max_expires` | `604800`     | Hard cap on link lifetime (SigV4 max, 7 days)                         |
+
 ## Configuration
 
 Optional `config.json` in the working directory. All fields have defaults:
@@ -292,12 +355,13 @@ HTTP request
           -> inject api.* (if allowed_hosts)
           -> inject db.* (if config.db)
           -> inject mail.* (if config.mail)
+          -> inject s3.* (if config.s3)
           -> eval user script
           -> remove eval/Proxy
           -> call handler(context)
         <- extract JSON result
       <- release runtime to pool (GC first)
-    <- attach meta (sizes, timing, http/db/mail metrics)
+    <- attach meta (sizes, timing, http/db/mail/s3 metrics)
   <- {data, errors, meta} response
 ```
 

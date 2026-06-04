@@ -8,7 +8,9 @@ mod handler;
 mod http;
 mod mail;
 mod pool;
+mod s3;
 mod sandbox;
+mod ssrf;
 
 use std::error::Error;
 use std::path::PathBuf;

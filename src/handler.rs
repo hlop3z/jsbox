@@ -18,6 +18,7 @@ use crate::sandbox;
 use crate::engine::{ExecParams, ExecResult};
 use crate::http::HttpMetric;
 use crate::mail::{MailConfig, MailMetric};
+use crate::s3::{S3Config, S3Metric};
 use crate::pool::JsPool;
 
 /// Pre-allocated `Box<RawValue>` for `{}` — used as default context.
@@ -53,11 +54,27 @@ pub(crate) struct RequestConfig {
     /// Mail/SMTP config (omit to disable `mail` in JS).
     #[serde(default)]
     pub(crate) mail: Option<MailConfig>,
+    /// S3 presigning config (omit to disable `s3` in JS).
+    #[serde(default)]
+    pub(crate) s3: Option<S3Config>,
 }
 
 /// Returns a clone of the pre-allocated default context.
 fn default_context() -> Box<RawValue> {
     DEFAULT_CONTEXT.clone()
+}
+
+/// Per-capability metrics drained from one execution.
+#[derive(Debug, Default)]
+struct ExecMetrics {
+    /// HTTP request metrics.
+    http: Vec<HttpMetric>,
+    /// DB operation metrics.
+    db: Vec<DbMetric>,
+    /// Mail operation metrics.
+    mail: Vec<MailMetric>,
+    /// S3 presign metrics.
+    s3: Vec<S3Metric>,
 }
 
 /// Metadata computed by Rust.
@@ -77,6 +94,8 @@ struct Meta {
     db_requests: Vec<DbMetric>,
     /// Mail operations made by the script.
     mail_requests: Vec<MailMetric>,
+    /// S3 presign operations made by the script.
+    s3_requests: Vec<S3Metric>,
 }
 
 impl Meta {
@@ -90,19 +109,16 @@ impl Meta {
             http_requests: Vec::new(),
             db_requests: Vec::new(),
             mail_requests: Vec::new(),
+            s3_requests: Vec::new(),
         }
     }
 
-    /// Attaches HTTP, DB, and mail metrics to this metadata.
-    fn with_metrics(
-        mut self,
-        http_requests: Vec<HttpMetric>,
-        db_requests: Vec<DbMetric>,
-        mail_requests: Vec<MailMetric>,
-    ) -> Self {
-        self.http_requests = http_requests;
-        self.db_requests = db_requests;
-        self.mail_requests = mail_requests;
+    /// Attaches HTTP, DB, mail, and S3 metrics to this metadata.
+    fn with_metrics(mut self, metrics: ExecMetrics) -> Self {
+        self.http_requests = metrics.http;
+        self.db_requests = metrics.db;
+        self.mail_requests = metrics.mail;
+        self.s3_requests = metrics.s3;
         self
     }
 }
@@ -179,6 +195,7 @@ pub(crate) async fn execute(
     let allowed_hosts = req.config.allowed_hosts;
     let db_config = req.config.db;
     let mail_config = req.config.mail;
+    let s3_config = req.config.s3;
 
     let start = Instant::now();
 
@@ -192,6 +209,7 @@ pub(crate) async fn execute(
             allowed_hosts: &allowed_hosts,
             db_config: db_config.as_ref(),
             mail_config: mail_config.as_ref(),
+            s3_config: s3_config.as_ref(),
             max_ops: engine_cfg.max_ops,
         });
         js_pool.release(runtime);
@@ -202,9 +220,17 @@ pub(crate) async fn execute(
     let exec_time_us = start.elapsed().as_micros();
 
     // Extract metrics from the result (or empty if it failed).
-    let (engine_result, http_requests, db_requests, mail_requests) = match result {
-        Ok(Ok(exec)) => (Ok(exec.js_json), exec.http_metrics, exec.db_metrics, exec.mail_metrics),
-        Ok(Err(err)) => (Err(err), Vec::new(), Vec::new(), Vec::new()),
+    let (engine_result, metrics) = match result {
+        Ok(Ok(exec)) => (
+            Ok(exec.js_json),
+            ExecMetrics {
+                http: exec.http_metrics,
+                db: exec.db_metrics,
+                mail: exec.mail_metrics,
+                s3: exec.s3_metrics,
+            },
+        ),
+        Ok(Err(err)) => (Err(err), ExecMetrics::default()),
         Err(join_err) => {
             return infra_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -214,8 +240,7 @@ pub(crate) async fn execute(
         }
     };
 
-    let meta = Meta::new(script_bytes, context_bytes, exec_time_us)
-        .with_metrics(http_requests, db_requests, mail_requests);
+    let meta = Meta::new(script_bytes, context_bytes, exec_time_us).with_metrics(metrics);
 
     build_response(&engine_result, meta)
 }

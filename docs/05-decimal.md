@@ -1,4 +1,4 @@
-# 6. `$` — Exact Decimal Math 💵
+# 5. `$` — Exact Decimal Math 💵
 
 [← Back to the guide](README.md)
 
@@ -131,5 +131,7 @@ function handler(ctx) {
 - Use **methods** (`.add .sub .mul .div`), **not** `+ - * /`.
 - `.toString()` to show/save, `.round(2)` for cents.
 - In `json(...)`, decimals become exact strings for free.
+
+**Next:** [Signed Upload & Download Links →](06-s3.md)
 
 [← Back to the guide](README.md)

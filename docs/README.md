@@ -25,6 +25,8 @@ Read these in order. Each one is short.
 4. **[`mail` — send email](04-mail.md)** — send a real email.
 5. **[`$` — Exact Decimal Math](05-decimal.md)** — the built-in money helper. Do exact
    decimal math with `$("19.99").mul(3)`. Always on, no setup. 💵
+6. **[`s3` — signed upload/download links](06-s3.md)** — let a browser upload files
+   straight to your bucket (S3, R2, MinIO…). 🔗
 
 ## The three super-powers 🦸
 
@@ -36,6 +38,7 @@ little `config` to your message. That keeps things safe.
 | `api`       | Talk to other websites | `config.allowed_hosts` |
 | `db`        | Talk to a database     | `config.db`            |
 | `mail`      | Send email             | `config.mail`          |
+| `s3`        | Signed upload links    | `config.s3`            |
 
 If you don't turn a super-power on, the robot simply doesn't have it. (For example,
 if there's no `config.mail`, then `mail` is `undefined` — it isn't there at all.)
