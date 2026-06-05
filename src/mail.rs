@@ -12,14 +12,56 @@ use std::time::{Duration, Instant};
 
 use lettre::message::{Mailbox, Message, MessageBuilder, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::Error as SmtpError;
 use lettre::{SmtpTransport, Transport};
 use rquickjs::{Ctx, Function, Value as JsValue};
 use serde::{Deserialize, Serialize};
 
+use crate::errors::{self, ErrorOwner, ErrorSource, Fault};
 use crate::sandbox::{self, Collector};
 
 /// JS wrapper — loaded from `src/js/mail.js` at compile time.
 const MAIL_WRAPPER: &str = include_str!("js/mail.js");
+
+/// Fallback fault for any mail error that isn't a classified SMTP reply.
+const MAIL_FALLBACK: Fault = Fault::new("MAIL_ERROR", true, ErrorOwner::Operator);
+/// Fault for exhausting the per-execution op budget mid-send.
+const MAIL_OP_LIMIT: Fault = Fault::new("MAIL_OP_LIMIT", false, ErrorOwner::Developer);
+
+/// A mail error carrying its classified [`Fault`] plus the raw message.
+#[derive(Debug)]
+struct MailError {
+    /// Classified code + retry hint.
+    fault: Fault,
+    /// Raw driver/usage message.
+    message: String,
+}
+
+impl MailError {
+    /// Builds a fallback (`MAIL_ERROR`) error — used for non-SMTP failures (payload
+    /// parsing, recipient validation, address parsing, message building).
+    const fn fallback(message: String) -> Self {
+        Self { fault: MAIL_FALLBACK, message }
+    }
+
+    /// Classifies an SMTP send error by transient/permanent reply class.
+    fn from_driver(err: &SmtpError) -> Self {
+        Self { fault: classify(err), message: err.to_string() }
+    }
+}
+
+/// Maps an SMTP error to a [`Fault`] (docs/error-envelope.md §5). A 4xx reply is
+/// transient (retry); a 5xx reply is permanent; anything else (connect/TLS/IO) falls
+/// back to the retryable `MAIL_ERROR`.
+fn classify(err: &SmtpError) -> Fault {
+    if err.is_transient() {
+        Fault::new("MAIL_TRANSIENT", true, ErrorOwner::Operator)
+    } else if err.is_permanent() {
+        Fault::new("MAIL_PERMANENT", false, ErrorOwner::Developer)
+    } else {
+        MAIL_FALLBACK
+    }
+}
 
 /// Transport security mode for the SMTP connection.
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
@@ -158,7 +200,7 @@ pub(crate) fn inject_mail(
         qctx.clone(),
         move |action: String, payload_json: String| -> String {
             if let Err(err) = sandbox::check_op_limit(&metrics_clone, max_ops) {
-                return sandbox::error_json(&err);
+                return errors::capability_fault_json(ErrorSource::Mail, MAIL_OP_LIMIT, &err, None);
             }
 
             let start = Instant::now();
@@ -173,7 +215,12 @@ pub(crate) fn inject_mail(
 
             match result {
                 Ok(outcome) => outcome.json,
-                Err(err) => sandbox::error_json(&err),
+                Err(mail_err) => errors::capability_fault_json(
+                    ErrorSource::Mail,
+                    mail_err.fault,
+                    &mail_err.message,
+                    None,
+                ),
             }
         },
     )?
@@ -190,10 +237,14 @@ pub(crate) fn inject_mail(
 // -- Dispatch ---------------------------------------------------------------
 
 /// Routes a `__mail` call to the correct handler.
-fn dispatch(send_ctx: &SendCtx<'_>, action: &str, payload_json: &str) -> Result<SendOutcome, String> {
+fn dispatch(
+    send_ctx: &SendCtx<'_>,
+    action: &str,
+    payload_json: &str,
+) -> Result<SendOutcome, MailError> {
     match action {
         "send" => do_send(send_ctx, payload_json),
-        other => Err(format!("unknown mail action: {other}")),
+        other => Err(MailError::fallback(format!("unknown mail action: {other}"))),
     }
 }
 
@@ -222,22 +273,24 @@ fn build_transport(config: &MailConfig) -> Result<SmtpTransport, Box<dyn Error +
 // -- Send -------------------------------------------------------------------
 
 /// Builds and sends an email, returning the outcome.
-fn do_send(send_ctx: &SendCtx<'_>, payload_json: &str) -> Result<SendOutcome, String> {
-    let payload: SendPayload =
-        serde_json::from_str(payload_json).map_err(|err| format!("invalid mail payload: {err}"))?;
+fn do_send(send_ctx: &SendCtx<'_>, payload_json: &str) -> Result<SendOutcome, MailError> {
+    let payload: SendPayload = serde_json::from_str(payload_json)
+        .map_err(|err| MailError::fallback(format!("invalid mail payload: {err}")))?;
 
     let recipients = count_recipients(&payload);
     if recipients == 0 {
-        return Err("at least one recipient (to/cc/bcc) is required".into());
-    }
-    if recipients > send_ctx.max_recipients {
-        return Err(format!(
-            "too many recipients: {recipients} (max {})",
-            send_ctx.max_recipients
+        return Err(MailError::fallback(
+            "at least one recipient (to/cc/bcc) is required".to_owned(),
         ));
     }
+    if recipients > send_ctx.max_recipients {
+        return Err(MailError::fallback(format!(
+            "too many recipients: {recipients} (max {})",
+            send_ctx.max_recipients
+        )));
+    }
 
-    let message = build_message(&payload, send_ctx.default_from)?;
+    let message = build_message(&payload, send_ctx.default_from).map_err(MailError::fallback)?;
     let bytes = message.formatted().len();
 
     match send_ctx.transport.send(&message) {
@@ -248,7 +301,7 @@ fn do_send(send_ctx: &SendCtx<'_>, payload_json: &str) -> Result<SendOutcome, St
             let json = format!("{{\"accepted\":{accepted},\"response\":{escaped}}}");
             Ok(SendOutcome { json, recipients, bytes, accepted })
         }
-        Err(err) => Err(format!("send error: {err}")),
+        Err(err) => Err(MailError::from_driver(&err)),
     }
 }
 

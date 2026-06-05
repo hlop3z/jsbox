@@ -14,6 +14,7 @@ use reqwest::redirect;
 use rquickjs::{Ctx, Function, Value as JsValue};
 use serde::Serialize;
 
+use crate::errors::{self, ErrorOwner, Fault};
 use crate::sandbox::{self, Collector};
 use crate::ssrf::block_private_ip;
 
@@ -31,6 +32,50 @@ const PROTECTED_HEADERS: &[&str] = &["content-type", "content-length", "host", "
 
 /// JS wrapper — loaded from `src/js/api.js` at compile time.
 const API_WRAPPER: &str = include_str!("js/api.js");
+
+/// Fallback fault for an HTTP transport error with no specific predicate.
+const HTTP_FALLBACK: Fault = Fault::new("HTTP_ERROR", true, ErrorOwner::Operator);
+/// Per-execution op budget exhausted before the request.
+const HTTP_OP_LIMIT: Fault = Fault::new("HTTP_OP_LIMIT", false, ErrorOwner::Developer);
+/// URL rejected by the SSRF guard / `allowed_hosts` (deterministic) — the script chose it.
+const HTTP_SSRF_BLOCKED: Fault = Fault::new("HTTP_SSRF_BLOCKED", false, ErrorOwner::Developer);
+/// Response exceeded the body size cap (deterministic).
+const HTTP_BODY_TOO_LARGE: Fault = Fault::new("HTTP_BODY_TOO_LARGE", false, ErrorOwner::Developer);
+
+/// An HTTP error carrying its classified [`Fault`] plus the raw message.
+///
+/// Unlike `db`/`mail`/`s3`, `api` never throws (§13): the closure turns this into an
+/// **in-band** `{ status: 0, error }` value the script inspects.
+#[derive(Debug)]
+struct HttpError {
+    /// Classified code + retry hint.
+    fault: Fault,
+    /// Raw message.
+    message: String,
+}
+
+impl HttpError {
+    /// Builds an error with an explicit fault.
+    const fn new(fault: Fault, message: String) -> Self {
+        Self { fault, message }
+    }
+
+    /// Classifies a `reqwest` transport error by its predicates.
+    fn from_transport(err: &reqwest::Error, method: &str, url: &str) -> Self {
+        Self { fault: classify(err), message: format!("HTTP {method} {url}: {err}") }
+    }
+}
+
+/// Maps a `reqwest::Error` to a [`Fault`] (docs/error-envelope.md §5).
+fn classify(err: &reqwest::Error) -> Fault {
+    if err.is_timeout() {
+        Fault::new("HTTP_TIMEOUT", true, ErrorOwner::Operator)
+    } else if err.is_connect() {
+        Fault::new("HTTP_CONNECT", true, ErrorOwner::Operator)
+    } else {
+        HTTP_FALLBACK
+    }
+}
 
 /// Metric recorded for each HTTP request.
 #[derive(Debug, Clone, Serialize)]
@@ -80,7 +125,7 @@ pub(crate) fn inject_api(
         qctx.clone(),
         move |method: String, url: String, body: String, headers_json: String| -> String {
             if let Err(err) = sandbox::check_op_limit(&closure_metrics, max_ops) {
-                return sandbox::http_error_json(&err);
+                return errors::api_inband_error_json(HTTP_OP_LIMIT, &err);
             }
 
             let start = Instant::now();
@@ -95,7 +140,7 @@ pub(crate) fn inject_api(
                         start,
                     };
                     sandbox::record(&closure_metrics, mctx.finish(0, 0));
-                    return sandbox::http_error_json(&err);
+                    return errors::api_inband_error_json(HTTP_SSRF_BLOCKED, &err);
                 }
             };
 
@@ -113,9 +158,9 @@ pub(crate) fn inject_api(
                     sandbox::record(&closure_metrics, mctx.finish(status, response_bytes));
                     json
                 }
-                Err(err) => {
+                Err(http_err) => {
                     sandbox::record(&closure_metrics, mctx.finish(0, 0));
-                    sandbox::http_error_json(&err)
+                    errors::api_inband_error_json(http_err.fault, &http_err.message)
                 }
             }
         },
@@ -242,10 +287,10 @@ fn execute_http(
     url: &str,
     body: &str,
     headers: &BTreeMap<String, String>,
-) -> Result<(u16, usize, String), String> {
-    let req_method: reqwest::Method = method
-        .parse()
-        .map_err(|err| format!("invalid HTTP method '{method}': {err}"))?;
+) -> Result<(u16, usize, String), HttpError> {
+    let req_method: reqwest::Method = method.parse().map_err(|err| {
+        HttpError::new(HTTP_FALLBACK, format!("invalid HTTP method '{method}': {err}"))
+    })?;
 
     let mut request = client.request(req_method, url);
 
@@ -261,7 +306,7 @@ fn execute_http(
 
     let response = request
         .send()
-        .map_err(|err| format!("HTTP {method} {url}: {err}"))?;
+        .map_err(|err| HttpError::from_transport(&err, method, url))?;
 
     let status = response.status().as_u16();
 
@@ -269,27 +314,29 @@ fn execute_http(
     if let Some(len) = response.content_length() {
         let size = usize::try_from(len).unwrap_or(usize::MAX);
         if size > MAX_RESPONSE_BYTES {
-            return Err(format!(
-                "response too large: {len} bytes (max {MAX_RESPONSE_BYTES})"
+            return Err(HttpError::new(
+                HTTP_BODY_TOO_LARGE,
+                format!("response too large: {len} bytes (max {MAX_RESPONSE_BYTES})"),
             ));
         }
     }
 
-    let response_body = response
-        .text()
-        .map_err(|err| format!("failed to read response body: {err}"))?;
+    let response_body = response.text().map_err(|err| {
+        HttpError::new(HTTP_FALLBACK, format!("failed to read response body: {err}"))
+    })?;
 
     // Post-read check (Content-Length can lie or be absent).
     if response_body.len() > MAX_RESPONSE_BYTES {
-        return Err(format!(
-            "response too large: {} bytes (max {MAX_RESPONSE_BYTES})",
-            response_body.len()
+        return Err(HttpError::new(
+            HTTP_BODY_TOO_LARGE,
+            format!("response too large: {} bytes (max {MAX_RESPONSE_BYTES})", response_body.len()),
         ));
     }
 
     let response_bytes = response_body.len();
-    let escaped_body = serde_json::to_string(&response_body)
-        .map_err(|err| format!("failed to serialize response: {err}"))?;
+    let escaped_body = serde_json::to_string(&response_body).map_err(|err| {
+        HttpError::new(HTTP_FALLBACK, format!("failed to serialize response: {err}"))
+    })?;
 
     Ok((status, response_bytes, format!("{{\"status\":{status},\"body\":{escaped_body}}}")))
 }

@@ -6,7 +6,11 @@
   function call(action, payload) {
     var raw = __mail(action, JSON.stringify(payload || {}));
     var res = JSON.parse(raw);
-    if (res && res.error) throw new Error(res.error);
+    if (res && res.error) {
+      var err = new Error(res.error);
+      err.__jsbox = res; // { error, code, retryable, source } — engine classifies off this
+      throw err;
+    }
     return res;
   }
   globalThis.mail = {

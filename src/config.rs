@@ -17,17 +17,32 @@ use serde::Deserialize;
 use crate::bytesize::deserialize_byte_size;
 
 /// Top-level configuration.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub(crate) struct Config {
     /// Local-dev switch. When `true`, the SSRF private-IP block is relaxed so
     /// localhost / LAN targets (e.g. `MinIO`) work for `s3` and `api`. Never enable in
     /// production — it removes the guard against internal/local targets.
     pub(crate) debug: bool,
+    /// Include `error.debug` (stack traces) in responses. Default `true` because
+    /// `/execute` runs as an internal service; set `false` at an exposed edge. Kept
+    /// separate from `debug` (which only relaxes the SSRF guard) so the two don't entangle.
+    pub(crate) error_debug: bool,
     /// Server configuration.
     pub(crate) server: ServerConfig,
     /// JS engine sandbox limits.
     pub(crate) engine: EngineConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            debug: false,
+            error_debug: true,
+            server: ServerConfig::default(),
+            engine: EngineConfig::default(),
+        }
+    }
 }
 
 /// HTTP server settings.

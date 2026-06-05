@@ -146,10 +146,29 @@ interface QueryParams {
 
 /** Result of an `api.*` call. */
 interface ApiResponse<T = any> {
-  /** HTTP status code, or `0` if the request was blocked or failed. */
+  /** HTTP status code, or `0` if the request failed before a response (transport error). */
   status: number;
-  /** Parsed JSON response body; the raw string if it wasn't valid JSON. */
-  data: T;
+  /** Parsed JSON body (raw string if not JSON). Present on any HTTP response; absent on a transport failure. */
+  data?: T;
+  /**
+   * In-band transport error — present only when `status === 0` (the request never reached
+   * a response). `api` never throws (§13): inspect this inline instead of `try/catch`.
+   */
+  error?: ApiTransportError;
+}
+
+/** Structured transport error on an `api.*` call (`status: 0`). */
+interface ApiTransportError {
+  /** Stable code: `HTTP_TIMEOUT` | `HTTP_CONNECT` | `HTTP_SSRF_BLOCKED` | `HTTP_BODY_TOO_LARGE` | `HTTP_OP_LIMIT` | `HTTP_ERROR`. */
+  code: string;
+  /** `true` ⇒ a retry may succeed (transient). */
+  retryable: boolean;
+  /** Who should act: `"operator"` (network/upstream) or `"developer"` (e.g. blocked host). */
+  owner: string;
+  /** Always `"api"`. */
+  source: string;
+  /** Human-safe cause. */
+  message?: string;
 }
 
 /**

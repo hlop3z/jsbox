@@ -1,6 +1,5 @@
 //! HTTP handler for the `/execute` endpoint.
 
-use std::error::Error;
 use std::sync::LazyLock;
 use std::time::Instant;
 
@@ -11,15 +10,17 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::task;
+use tracing::warn;
+use uuid::Uuid;
 
 use crate::db::{DbConfig, DbMetric};
-use crate::engine;
-use crate::sandbox;
-use crate::engine::{ExecParams, ExecResult};
+use crate::engine::{self, EngineError, ExecOutcome, ExecParams, ExecResult};
+use crate::errors::{ErrorCategory, ErrorEnvelope, ErrorOwner, ErrorSource};
 use crate::http::HttpMetric;
 use crate::mail::{MailConfig, MailMetric};
-use crate::s3::{S3Config, S3Metric};
 use crate::pool::JsPool;
+use crate::s3::{S3Config, S3Metric};
+use crate::sandbox;
 
 /// Pre-allocated `Box<RawValue>` for `{}` — used as default context.
 static DEFAULT_CONTEXT: LazyLock<Box<RawValue>> =
@@ -80,6 +81,9 @@ struct ExecMetrics {
 /// Metadata computed by Rust.
 #[derive(Debug, Serialize)]
 struct Meta {
+    /// Correlation ID — also logged server-side with the raw cause, so support can grep
+    /// one ID across the mesh. Present on every response (success and error).
+    trace_id: String,
     /// Size of the script in bytes.
     script_bytes: usize,
     /// Size of the context payload in bytes.
@@ -99,9 +103,10 @@ struct Meta {
 }
 
 impl Meta {
-    /// Creates a new `Meta` with the given sizes and empty metrics.
-    const fn new(script_bytes: usize, context_bytes: usize, exec_time_us: u128) -> Self {
+    /// Creates a new `Meta` with the given correlation ID, sizes, and empty metrics.
+    const fn new(trace_id: String, script_bytes: usize, context_bytes: usize, exec_time_us: u128) -> Self {
         Self {
+            trace_id,
             script_bytes,
             context_bytes,
             total_input_bytes: script_bytes.saturating_add(context_bytes),
@@ -123,33 +128,26 @@ impl Meta {
     }
 }
 
-/// Full response: JS-produced `{data, error}` as borrowed `RawValue` + Rust meta.
+/// Success response: JS-produced `{data, error}` as borrowed `RawValue` + Rust meta.
 #[derive(Debug, Serialize)]
 struct Response<'a> {
     /// The data field from the JS handler (borrowed, never copied).
     data: &'a RawValue,
-    /// The error field from the JS handler (borrowed, never copied).
+    /// The error field from the JS handler (borrowed, never copied; D1 passthrough).
     error: &'a RawValue,
     /// Metadata computed by Rust.
     meta: Meta,
 }
 
-/// Infrastructure error response (runtime failures, syntax errors).
+/// System-error response: `data` is `null`, `error` is the structured envelope.
 #[derive(Debug, Serialize)]
-struct InfraResponse {
-    /// Always null on infra failure.
+struct SystemErrorResponse {
+    /// Always `null` on a system error.
     data: Option<()>,
-    /// The error detail.
-    error: InfraErrorDetail,
+    /// The structured error envelope.
+    error: ErrorEnvelope,
     /// Metadata computed by Rust.
     meta: Meta,
-}
-
-/// Detail for infrastructure errors.
-#[derive(Debug, Serialize)]
-struct InfraErrorDetail {
-    /// The error message.
-    message: String,
 }
 
 /// Envelope parsed from the JS response — borrows from the source string.
@@ -176,18 +174,24 @@ pub(crate) async fn execute(
     let script_bytes = req.script.len();
     let context_bytes = req.context.get().len();
 
-    // Early validation — reject oversized inputs before spawning a task.
     let engine_cfg = js_pool.engine_config().clone();
+    let error_debug = js_pool.error_debug();
+    let trace_id = Uuid::new_v4().to_string();
 
-    if let Err(msg) = sandbox::validate_input_sizes(
+    // Early validation — reject oversized inputs before spawning a task.
+    if let Err((code, message)) = sandbox::validate_input_sizes(
         script_bytes, context_bytes,
         engine_cfg.max_script_size, engine_cfg.max_context_size,
     ) {
-        return infra_error(
-            StatusCode::BAD_REQUEST,
-            msg,
-            Meta::new(script_bytes, context_bytes, 0),
-        );
+        let envelope = ErrorEnvelope::new(
+            ErrorCategory::Request,
+            ErrorSource::Request,
+            code.to_owned(),
+            false,
+            ErrorOwner::Caller,
+        )
+        .with_message(message);
+        return system_error_response(envelope, 400, Meta::new(trace_id, script_bytes, context_bytes, 0));
     }
 
     let script = req.script;
@@ -200,8 +204,8 @@ pub(crate) async fn execute(
     let start = Instant::now();
     let allow_private_targets = js_pool.debug();
 
-    let result = task::spawn_blocking(move || -> Result<ExecResult, Box<dyn Error + Send + Sync>> {
-        let runtime = js_pool.acquire()?;
+    let result = task::spawn_blocking(move || -> Result<ExecResult, EngineError> {
+        let runtime = js_pool.acquire().map_err(|err| EngineError::Internal(err.to_string()))?;
         let res = engine::run(&ExecParams {
             runtime: &runtime,
             script: &script,
@@ -220,64 +224,62 @@ pub(crate) async fn execute(
     .await;
 
     let exec_time_us = start.elapsed().as_micros();
+    let base_meta = || Meta::new(trace_id.clone(), script_bytes, context_bytes, exec_time_us);
 
-    // Extract metrics from the result (or empty if it failed).
-    let (engine_result, metrics) = match result {
-        Ok(Ok(exec)) => (
-            Ok(exec.js_json),
-            ExecMetrics {
+    match result {
+        Ok(Ok(exec)) => {
+            let metrics = ExecMetrics {
                 http: exec.http_metrics,
                 db: exec.db_metrics,
                 mail: exec.mail_metrics,
                 s3: exec.s3_metrics,
-            },
-        ),
-        Ok(Err(err)) => (Err(err), ExecMetrics::default()),
-        Err(join_err) => {
-            return infra_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("task panicked: {join_err}"),
-                Meta::new(script_bytes, context_bytes, exec_time_us),
-            );
+            };
+            let meta = base_meta().with_metrics(metrics);
+            match exec.outcome {
+                ExecOutcome::Success(js_json) => success_response(&js_json, meta, error_debug),
+                ExecOutcome::Error(engine_err) => {
+                    engine_error_response(engine_err, meta, error_debug)
+                }
+            }
         }
-    };
-
-    let meta = Meta::new(script_bytes, context_bytes, exec_time_us).with_metrics(metrics);
-
-    build_response(&engine_result, meta)
-}
-
-/// Builds the final HTTP response from the engine result.
-fn build_response(
-    engine_result: &Result<String, Box<dyn Error + Send + Sync>>,
-    meta: Meta,
-) -> AxumResponse {
-    match engine_result {
-        Ok(js_json) => match serde_json::from_str::<Envelope<'_>>(js_json) {
-            Ok(env) => (
-                StatusCode::OK,
-                Json(Response { data: env.data, error: env.error, meta }),
-            )
-                .into_response(),
-            Err(parse_err) => infra_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("malformed handler response: {parse_err}"),
-                meta,
-            ),
-        },
-        Err(err) => infra_error(StatusCode::UNPROCESSABLE_ENTITY, err.to_string(), meta),
+        Ok(Err(engine_err)) => engine_error_response(engine_err, base_meta(), error_debug),
+        Err(join_err) => engine_error_response(
+            EngineError::Internal(format!("task panicked: {join_err}")),
+            base_meta(),
+            error_debug,
+        ),
     }
 }
 
-/// Builds an infrastructure error response.
-fn infra_error(status: StatusCode, message: String, meta: Meta) -> AxumResponse {
-    (
-        status,
-        Json(InfraResponse {
-            data: None,
-            error: InfraErrorDetail { message },
+/// Builds the success response, or a `MALFORMED_RESPONSE` error if the JS envelope
+/// can't be parsed.
+fn success_response(js_json: &str, meta: Meta, error_debug: bool) -> AxumResponse {
+    match serde_json::from_str::<Envelope<'_>>(js_json) {
+        Ok(env) => (
+            StatusCode::OK,
+            Json(Response { data: env.data, error: env.error, meta }),
+        )
+            .into_response(),
+        Err(parse_err) => engine_error_response(
+            EngineError::Malformed(format!("malformed handler response: {parse_err}")),
             meta,
-        }),
-    )
-        .into_response()
+            error_debug,
+        ),
+    }
+}
+
+/// Maps a classified [`EngineError`] to its envelope (debug-gated) + HTTP status, and
+/// logs the full (raw) error server-side keyed by `trace_id` — so the raw cause is
+/// always captured for support even when `error_debug` strips it from the response.
+fn engine_error_response(err: EngineError, meta: Meta, error_debug: bool) -> AxumResponse {
+    let status = err.http_status();
+    warn!(trace_id = %meta.trace_id, status, error = ?err, "execute system error");
+    let envelope = err.into_envelope(error_debug);
+    system_error_response(envelope, status, meta)
+}
+
+/// Serializes a `{ data: null, error, meta }` response at the given status.
+fn system_error_response(error: ErrorEnvelope, status: u16, meta: Meta) -> AxumResponse {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (code, Json(SystemErrorResponse { data: None, error, meta })).into_response()
 }

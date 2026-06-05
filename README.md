@@ -71,6 +71,7 @@ POST /execute
   "data": { "greeting": "hello Alice" },
   "error": null,
   "meta": {
+    "trace_id": "be04701d-2480-45ec-acb9-787a1be024ba",
     "script_bytes": 82,
     "context_bytes": 16,
     "total_input_bytes": 98,
@@ -83,7 +84,11 @@ POST /execute
 }
 ```
 
-Always `{data, error, meta}`. The handler controls `data` and `error` via the `json()` bridge.
+Always `{data, error, meta}`. The handler controls `data` and `error` via the `json()`
+bridge. On a **system-generated** failure, `error` is a structured envelope —
+`{ type, source, code, message, retryable, owner, details?, debug? }` — that a client can
+branch on without parsing strings; `meta.trace_id` correlates it with server logs. See
+[`docs/error-envelope.md`](docs/error-envelope.md) for the full contract.
 
 ## JS API
 
@@ -385,6 +390,7 @@ Optional `config.json` in the working directory. All fields have defaults:
 | Field              | Default    | Description                                                                                                                            |
 | ------------------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------- |
 | `debug`            | `false`    | **Dev only.** Relaxes the SSRF private-IP block for `s3`/`api` so localhost/LAN targets (e.g. MinIO) work. Never enable in production. |
+| `error_debug`      | `true`     | Include `error.debug` (stack traces) in system-error responses. Set `false` at an exposed edge to omit them.                          |
 | `memory_limit`     | `"32mb"`   | Max JS heap per execution                                                                                                              |
 | `max_stack_size`   | `"512kb"`  | Max native call stack (recursion depth)                                                                                                |
 | `timeout_ms`       | `4000`     | Max wall-clock execution time                                                                                                          |

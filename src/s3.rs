@@ -30,15 +30,73 @@ use reqwest::blocking::Client;
 use reqwest::redirect;
 use rquickjs::{Ctx, Function, Value as JsValue};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::bytesize::deserialize_byte_size;
+use crate::errors::{self, ErrorOwner, ErrorSource, Fault};
 use crate::sandbox::{self, Collector};
 use crate::ssrf;
 
 /// JS wrapper — loaded from `src/js/s3.js` at compile time.
 const S3_WRAPPER: &str = include_str!("js/s3.js");
+
+/// Fallback fault for s3 errors with no upstream/gate context (signing, payload,
+/// validation) — deterministic, so not retryable; the developer's bug.
+const S3_FALLBACK: Fault = Fault::new("S3_ERROR", false, ErrorOwner::Developer);
+/// Object store returned an error or was unreachable (`usage`/`delete`).
+const S3_UPSTREAM: Fault = Fault::new("S3_UPSTREAM", true, ErrorOwner::Operator);
+/// Per-execution op budget exhausted mid-listing.
+const S3_OP_LIMIT: Fault = Fault::new("S3_OP_LIMIT", false, ErrorOwner::Developer);
+/// `delete` (or presigning a `DELETE` URL) attempted with `allow_delete = false`.
+const S3_FORBIDDEN: Fault = Fault::new("S3_FORBIDDEN", false, ErrorOwner::Operator);
+
+/// An s3 error carrying its classified [`Fault`], the raw message, and structured details.
+#[derive(Debug)]
+struct S3Error {
+    /// Classified code + retry hint + owner.
+    fault: Fault,
+    /// Raw message.
+    message: String,
+    /// Structured machine context (e.g. `{http_status}`), surfaced ungated in `details`.
+    details: Option<Value>,
+}
+
+impl S3Error {
+    /// Signing / payload / validation failure (`S3_ERROR`, deterministic).
+    const fn signing(message: String) -> Self {
+        Self { fault: S3_FALLBACK, message, details: None }
+    }
+    /// Object store unreachable or non-2xx (`S3_UPSTREAM`, retryable).
+    const fn upstream(message: String) -> Self {
+        Self { fault: S3_UPSTREAM, message, details: None }
+    }
+    /// Object store returned a non-2xx status, captured as `{http_status}` detail.
+    fn upstream_status(message: String, status: u16) -> Self {
+        Self {
+            fault: S3_UPSTREAM,
+            message,
+            details: Some(serde_json::json!({ "http_status": status })),
+        }
+    }
+    /// Deletion attempted without `allow_delete` (`S3_FORBIDDEN`).
+    const fn forbidden(message: String) -> Self {
+        Self { fault: S3_FORBIDDEN, message, details: None }
+    }
+}
+
+/// String errors from the signing helpers default to the deterministic `S3_ERROR`;
+/// upstream / op-limit / forbidden sites construct their fault explicitly.
+impl From<String> for S3Error {
+    fn from(message: String) -> Self {
+        Self::signing(message)
+    }
+}
+
+/// Builds the FFI failure JSON for an [`S3Error`] — DRY helper for the closure arms.
+fn s3_error_json(err: S3Error) -> String {
+    errors::capability_fault_json(ErrorSource::S3, err.fault, &err.message, err.details)
+}
 
 /// `SigV4` service name for S3.
 const SERVICE: &str = "s3";
@@ -199,7 +257,7 @@ pub(crate) fn inject_s3(
         qctx.clone(),
         move |action: String, payload_json: String| -> String {
             if let Err(err) = sandbox::check_op_limit(&metrics_clone, max_ops) {
-                return sandbox::error_json(&err);
+                return errors::capability_fault_json(ErrorSource::S3, S3_OP_LIMIT, &err, None);
             }
 
             // `usage` paginates and meters each list request itself, so it is
@@ -208,7 +266,7 @@ pub(crate) fn inject_s3(
                 return match do_usage(&owned, &payload_json, allow_private, &metrics_clone, max_ops)
                 {
                     Ok(json) => json,
-                    Err(err) => sandbox::error_json(&err),
+                    Err(err) => s3_error_json(err),
                 };
             }
 
@@ -216,7 +274,7 @@ pub(crate) fn inject_s3(
             if action == "delete" {
                 return match do_delete(&owned, &payload_json, allow_private, &metrics_clone) {
                     Ok(json) => json,
-                    Err(err) => sandbox::error_json(&err),
+                    Err(err) => s3_error_json(err),
                 };
             }
 
@@ -227,7 +285,7 @@ pub(crate) fn inject_s3(
 
             match result {
                 Ok(outcome) => outcome.json,
-                Err(err) => sandbox::error_json(&err),
+                Err(err) => s3_error_json(err),
             }
         },
     )?
@@ -249,11 +307,11 @@ fn dispatch(
     action: &str,
     payload_json: &str,
     allow_private: bool,
-) -> Result<PresignOutcome, String> {
+) -> Result<PresignOutcome, S3Error> {
     match action {
         "presign" => do_presign(config, payload_json, allow_private),
         "presign_post" => do_presign_post(config, payload_json, allow_private),
-        other => Err(format!("unknown s3 action: {other}")),
+        other => Err(S3Error::signing(format!("unknown s3 action: {other}"))),
     }
 }
 
@@ -264,16 +322,18 @@ fn do_presign(
     config: &S3Config,
     payload_json: &str,
     allow_private: bool,
-) -> Result<PresignOutcome, String> {
+) -> Result<PresignOutcome, S3Error> {
     let payload: PresignPayload =
         serde_json::from_str(payload_json).map_err(|err| format!("invalid s3 payload: {err}"))?;
 
     let method = normalize_method(&payload.method)?;
     if method == "DELETE" && !config.allow_delete {
-        return Err("s3 DELETE is disabled (set config.s3.allow_delete = true to enable)".to_owned());
+        return Err(S3Error::forbidden(
+            "s3 DELETE is disabled (set config.s3.allow_delete = true to enable)".to_owned(),
+        ));
     }
     if payload.key.trim().is_empty() {
-        return Err("s3 presign requires a non-empty key".to_owned());
+        return Err(S3Error::signing("s3 presign requires a non-empty key".to_owned()));
     }
     let expires = clamp_expires(payload.expires, config);
 
@@ -314,16 +374,18 @@ fn do_presign_post(
     config: &S3Config,
     payload_json: &str,
     allow_private: bool,
-) -> Result<PresignOutcome, String> {
+) -> Result<PresignOutcome, S3Error> {
     let payload: PresignPostPayload =
         serde_json::from_str(payload_json).map_err(|err| format!("invalid s3 payload: {err}"))?;
 
     if payload.key.trim().is_empty() {
-        return Err("s3 presignPost requires a non-empty key".to_owned());
+        return Err(S3Error::signing("s3 presignPost requires a non-empty key".to_owned()));
     }
     let max_bytes = config.max_upload_size;
     if max_bytes == 0 {
-        return Err("config.s3.max_upload_size is required for presignPost".to_owned());
+        return Err(S3Error::signing(
+            "config.s3.max_upload_size is required for presignPost".to_owned(),
+        ));
     }
     let expires = clamp_expires(payload.expires, config);
 
@@ -399,7 +461,7 @@ fn do_usage(
     allow_private: bool,
     metrics: &Collector<S3Metric>,
     max_ops: usize,
-) -> Result<String, String> {
+) -> Result<String, S3Error> {
     let payload: UsagePayload =
         serde_json::from_str(payload_json).map_err(|err| format!("invalid s3 payload: {err}"))?;
 
@@ -412,10 +474,11 @@ fn do_usage(
     let mut token: Option<String> = None;
 
     loop {
-        sandbox::check_op_limit(metrics, max_ops)?;
+        sandbox::check_op_limit(metrics, max_ops)
+            .map_err(|err| S3Error { fault: S3_OP_LIMIT, message: err, details: None })?;
         let start = Instant::now();
         let (page_bytes, page_objects, next) =
-            fetch_list_page(&client, &target, token.as_deref())?;
+            fetch_list_page(&client, &target, token.as_deref()).map_err(S3Error::upstream)?;
         sandbox::record(
             metrics,
             S3Metric {
@@ -445,7 +508,7 @@ fn do_usage(
         "objects": total_objects,
     });
     serde_json::to_string(&response)
-        .map_err(|err| format!("failed to encode usage response: {err}"))
+        .map_err(|err| S3Error::signing(format!("failed to encode usage response: {err}")))
 }
 
 /// Resolved listing target, shared unchanged across paginated requests.
@@ -614,16 +677,16 @@ fn do_delete(
     payload_json: &str,
     allow_private: bool,
     metrics: &Collector<S3Metric>,
-) -> Result<String, String> {
+) -> Result<String, S3Error> {
     if !config.allow_delete {
-        return Err(
+        return Err(S3Error::forbidden(
             "s3 delete is disabled (set config.s3.allow_delete = true to enable)".to_owned(),
-        );
+        ));
     }
     let payload: DeletePayload =
         serde_json::from_str(payload_json).map_err(|err| format!("invalid s3 payload: {err}"))?;
     if payload.key.trim().is_empty() {
-        return Err("s3 delete requires a non-empty key".to_owned());
+        return Err(S3Error::signing("s3 delete requires a non-empty key".to_owned()));
     }
 
     let (scheme, host) = resolve_host(config, allow_private)?;
@@ -634,7 +697,7 @@ fn do_delete(
     let response = client
         .delete(&url)
         .send()
-        .map_err(|err| format!("s3 delete request failed: {err}"))?;
+        .map_err(|err| S3Error::upstream(format!("s3 delete request failed: {err}")))?;
     sandbox::record(
         metrics,
         S3Metric {
@@ -649,13 +712,19 @@ fn do_delete(
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().map_err(|err| format!("s3 delete read failed: {err}"))?;
+        let body = response
+            .text()
+            .map_err(|err| S3Error::upstream(format!("s3 delete read failed: {err}")))?;
         let snippet: String = body.chars().take(200).collect();
-        return Err(format!("s3 delete returned HTTP {}: {snippet}", status.as_u16()));
+        return Err(S3Error::upstream_status(
+            format!("s3 delete returned HTTP {}: {snippet}", status.as_u16()),
+            status.as_u16(),
+        ));
     }
 
     let out = json!({ "key": payload.key, "deleted": true });
-    serde_json::to_string(&out).map_err(|err| format!("failed to encode delete response: {err}"))
+    serde_json::to_string(&out)
+        .map_err(|err| S3Error::signing(format!("failed to encode delete response: {err}")))
 }
 
 /// Builds a short-lived signed `DELETE` URL for one object (consumed immediately

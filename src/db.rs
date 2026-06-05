@@ -18,10 +18,80 @@ use rquickjs::{Ctx, Function, Value as JsValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::errors::{self, ErrorOwner, ErrorSource, Fault};
 use crate::sandbox::{self, Collector};
 
 /// JS wrapper — loaded from `src/js/db.js` at compile time.
 const DB_WRAPPER: &str = include_str!("js/db.js");
+
+/// Fallback fault for any db error without a recognized driver `SqlState`.
+const DB_FALLBACK: Fault = Fault::new("DB_ERROR", true, ErrorOwner::Operator);
+/// Fault for exhausting the per-execution op budget mid-db-call.
+const DB_OP_LIMIT: Fault = Fault::new("DB_OP_LIMIT", false, ErrorOwner::Developer);
+/// Fault for a failure to reach the database — used for inject-time connect failures
+/// (a query-time `08xxx` drop is classified the same way in [`classify_by_class`]).
+pub(crate) const DB_CONNECTION_FAULT: Fault =
+    Fault::new("DB_CONNECTION", true, ErrorOwner::Operator);
+
+/// A db error carrying its classified [`Fault`], the raw message, and structured details.
+#[derive(Debug)]
+struct DbError {
+    /// Classified code + retry hint + owner.
+    fault: Fault,
+    /// Raw driver/usage message.
+    message: String,
+    /// Structured machine context (e.g. `{sqlstate}`), surfaced ungated in `details`.
+    details: Option<Value>,
+}
+
+impl DbError {
+    /// Builds a fallback (`DB_ERROR`) error from a message — used for non-driver
+    /// failures (param parsing, lock, serialization, unknown action).
+    const fn fallback(message: String) -> Self {
+        Self { fault: DB_FALLBACK, message, details: None }
+    }
+
+    /// Classifies a `postgres` driver error by its `SqlState`, attaching the raw
+    /// `sqlstate` as structured detail.
+    fn from_driver(err: &postgres::Error) -> Self {
+        let details = err.code().map(|state| serde_json::json!({ "sqlstate": state.code() }));
+        Self { fault: classify(err), message: err.to_string(), details }
+    }
+}
+
+/// Returns `true` if an `inject_db` error is a driver (connection) failure — a boxed
+/// `postgres::Error` — vs an engine-setup failure (function registration / eval). Lets
+/// the engine map a dead database to a retryable `capability/db/DB_CONNECTION` instead
+/// of an alert-worthy `runtime/INTERNAL`.
+pub(crate) fn is_connect_error(err: &(dyn Error + Send + Sync + 'static)) -> bool {
+    err.downcast_ref::<postgres::Error>().is_some()
+}
+
+/// Maps a `postgres::Error` to a [`Fault`] by `SqlState` (docs/error-envelope.md §4).
+///
+/// The `SqlState` exists only here, above the "stringify cliff" — once the error is
+/// `format!`'d into a message the class is gone, so classification must happen now.
+fn classify(err: &postgres::Error) -> Fault {
+    let Some(state) = err.code() else {
+        return DB_FALLBACK;
+    };
+    match state.code() {
+        "40001" => Fault::new("DB_SERIALIZATION", true, ErrorOwner::Operator),
+        "40P01" => Fault::new("DB_DEADLOCK", true, ErrorOwner::Operator),
+        "57014" => Fault::new("DB_CANCELED", true, ErrorOwner::Operator),
+        other => classify_by_class(other),
+    }
+}
+
+/// Classifies by `SqlState` class (the first two chars) for the range-based codes.
+fn classify_by_class(code: &str) -> Fault {
+    match code.get(..2) {
+        Some("08") => DB_CONNECTION_FAULT,
+        Some("23") => Fault::new("DB_CONSTRAINT", false, ErrorOwner::Developer),
+        Some("42") => Fault::new("DB_QUERY", false, ErrorOwner::Developer),
+        _ => DB_FALLBACK,
+    }
+}
 
 /// Per-request database configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -94,7 +164,7 @@ pub(crate) fn inject_db(
         qctx.clone(),
         move |action: String, query: String, params_json: String| -> String {
             if let Err(err) = sandbox::check_op_limit(&metrics_clone, max_ops) {
-                return sandbox::error_json(&err);
+                return errors::capability_fault_json(ErrorSource::Db, DB_OP_LIMIT, &err, None);
             }
 
             let start = Instant::now();
@@ -104,7 +174,12 @@ pub(crate) fn inject_db(
 
             match result {
                 Ok(json) => json,
-                Err(err) => sandbox::error_json(&err),
+                Err(db_err) => errors::capability_fault_json(
+                    ErrorSource::Db,
+                    db_err.fault,
+                    &db_err.message,
+                    db_err.details,
+                ),
             }
         },
     )?
@@ -127,14 +202,14 @@ fn dispatch(
     query: &str,
     params_json: &str,
     max_rows: usize,
-) -> Result<String, String> {
+) -> Result<String, DbError> {
     match action {
         "query" => do_query(client, query, params_json, max_rows),
         "execute" => do_execute(client, query, params_json),
         "begin" => do_simple(client, "BEGIN"),
         "commit" => do_simple(client, "COMMIT"),
         "rollback" => do_simple(client, "ROLLBACK"),
-        other => Err(format!("unknown db action: {other}")),
+        other => Err(DbError::fallback(format!("unknown db action: {other}"))),
     }
 }
 
@@ -184,13 +259,13 @@ fn do_query(
     sql: &str,
     params_json: &str,
     max_rows: usize,
-) -> Result<String, String> {
-    let params = parse_params(params_json)?;
+) -> Result<String, DbError> {
+    let params = parse_params(params_json).map_err(DbError::fallback)?;
     let param_refs = build_param_refs(&params);
 
     let rows = {
-        let mut guard = lock_client(client)?;
-        guard.query(sql, &param_refs).map_err(|err| format!("query error: {err}"))?
+        let mut guard = lock_client(client).map_err(DbError::fallback)?;
+        guard.query(sql, &param_refs).map_err(|err| DbError::from_driver(&err))?
     };
 
     let columns = extract_columns(&rows);
@@ -204,7 +279,8 @@ fn do_query(
         "truncated": truncated,
     });
 
-    serde_json::to_string(&result).map_err(|err| format!("serialize error: {err}"))
+    serde_json::to_string(&result)
+        .map_err(|err| DbError::fallback(format!("serialize error: {err}")))
 }
 
 /// INSERT/UPDATE/DELETE — returns `{rows_affected}`.
@@ -212,23 +288,23 @@ fn do_execute(
     client: &Arc<Mutex<Client>>,
     sql: &str,
     params_json: &str,
-) -> Result<String, String> {
-    let params = parse_params(params_json)?;
+) -> Result<String, DbError> {
+    let params = parse_params(params_json).map_err(DbError::fallback)?;
     let param_refs = build_param_refs(&params);
 
     let affected = {
-        let mut guard = lock_client(client)?;
-        guard.execute(sql, &param_refs).map_err(|err| format!("execute error: {err}"))?
+        let mut guard = lock_client(client).map_err(DbError::fallback)?;
+        guard.execute(sql, &param_refs).map_err(|err| DbError::from_driver(&err))?
     };
 
     Ok(format!("{{\"rows_affected\":{affected}}}"))
 }
 
 /// Simple command (BEGIN/COMMIT/ROLLBACK).
-fn do_simple(client: &Arc<Mutex<Client>>, cmd: &str) -> Result<String, String> {
+fn do_simple(client: &Arc<Mutex<Client>>, cmd: &str) -> Result<String, DbError> {
     {
-        let mut guard = lock_client(client)?;
-        let _ = guard.execute(cmd, &[]).map_err(|err| format!("{cmd} error: {err}"))?;
+        let mut guard = lock_client(client).map_err(DbError::fallback)?;
+        let _ = guard.execute(cmd, &[]).map_err(|err| DbError::from_driver(&err))?;
     }
     Ok("{\"ok\":true}".into())
 }
@@ -390,7 +466,7 @@ fn as_tosql_ref(param: &ParamValue) -> &(dyn ToSql + Sync) {
 // -- Metrics ----------------------------------------------------------------
 
 /// Builds a `DbMetric` from the result of an operation.
-fn build_metric(action: &str, result: &Result<String, String>, start: Instant) -> DbMetric {
+fn build_metric(action: &str, result: &Result<String, DbError>, start: Instant) -> DbMetric {
     let (rows_ret, rows_aff, trunc) = result
         .as_ref()
         .map(|json| extract_metric_info(action, json))

@@ -25,6 +25,8 @@ pub(crate) struct JsPool {
     engine_config: EngineConfig,
     /// Local-dev flag: relax the SSRF private-IP block when `true`.
     debug: bool,
+    /// Include `error.debug` (stack traces) in responses when `true`.
+    error_debug: bool,
 }
 
 impl JsPool {
@@ -36,6 +38,7 @@ impl JsPool {
     pub(crate) fn new(
         engine_config: EngineConfig,
         debug: bool,
+        error_debug: bool,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let size = if engine_config.pool_size > 0 {
             engine_config.pool_size
@@ -57,6 +60,7 @@ impl JsPool {
             size,
             engine_config,
             debug,
+            error_debug,
         })
     }
 
@@ -90,6 +94,11 @@ impl JsPool {
     /// Returns whether debug mode (relaxed SSRF guard) is enabled.
     pub(crate) const fn debug(&self) -> bool {
         self.debug
+    }
+
+    /// Returns whether `error.debug` (stack traces) should be included in responses.
+    pub(crate) const fn error_debug(&self) -> bool {
+        self.error_debug
     }
 }
 

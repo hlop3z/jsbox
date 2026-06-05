@@ -30,38 +30,37 @@ pub(crate) fn drain<T: Clone>(collector: Option<&Collector<T>>) -> Vec<T> {
 }
 
 /// Builds a JSON error string: `{"error": "message"}`.
+///
+/// Used by the always-on `$`/Decimal global (`decimal.rs`), whose errors are
+/// script-level usage errors. Capability errors go through `errors::` instead.
 pub(crate) fn error_json(message: &str) -> String {
     let escaped = serde_json::to_string(message)
         .unwrap_or_else(|_err| "\"internal error\"".into());
     format!("{{\"error\":{escaped}}}")
 }
 
-/// Builds an HTTP error JSON: `{"status": 0, "body": "message"}`.
-pub(crate) fn http_error_json(message: &str) -> String {
-    let escaped = serde_json::to_string(message)
-        .unwrap_or_else(|_err| "\"request failed\"".into());
-    format!("{{\"status\":0,\"body\":{escaped}}}")
-}
-
 /// Validates that input sizes are within configured limits.
 ///
 /// # Errors
 ///
-/// Returns an error message if any limit is exceeded.
+/// Returns `(code, message)` if a limit is exceeded — the stable `request`-category
+/// code (`SCRIPT_TOO_LARGE` / `CONTEXT_TOO_LARGE`) plus a human-safe message.
 pub(crate) fn validate_input_sizes(
     script_bytes: usize,
     context_bytes: usize,
     max_script: usize,
     max_context: usize,
-) -> Result<(), String> {
+) -> Result<(), (&'static str, String)> {
     if script_bytes > max_script {
-        return Err(format!(
-            "script too large: {script_bytes} bytes (max {max_script})"
+        return Err((
+            "SCRIPT_TOO_LARGE",
+            format!("script too large: {script_bytes} bytes (max {max_script})"),
         ));
     }
     if context_bytes > max_context {
-        return Err(format!(
-            "context too large: {context_bytes} bytes (max {max_context})"
+        return Err((
+            "CONTEXT_TOO_LARGE",
+            format!("context too large: {context_bytes} bytes (max {max_context})"),
         ));
     }
     Ok(())

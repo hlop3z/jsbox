@@ -19,8 +19,12 @@
     var bodyStr = (body !== undefined && body !== null) ? JSON.stringify(body) : '';
     var raw = __http(method, url, bodyStr, headersJson(headers));
     var res = JSON.parse(raw);
-    res.data = parse(res.body);
-    delete res.body;
+    // Success → { status, body }. Transport failure → { status: 0, error: {...} }
+    // (in-band, never thrown — §13). Only reshape body when present.
+    if (res.body !== undefined) {
+      res.data = parse(res.body);
+      delete res.body;
+    }
     return res;
   }
   globalThis.api = {
