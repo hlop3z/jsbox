@@ -416,6 +416,44 @@ Config: `{ "amq": { "host": "...", "port": 5672, "username": "guest", "password"
 against bundled public CA roots via the shared `aws-lc-rs` provider. For a self-hosted broker
 with a private CA, point `ca_cert` at the CA PEM (mounted into the container).
 
+### $sys — runtime stdlib (crypto, date, env, secrets)
+
+The `$sys` umbrella groups pure, zero-I/O helpers. `$sys.crypto` and `$sys.date` are
+**always on** (no config, like `$`); `$sys.env` / `$sys.secrets` populate only from
+`config.sys`. Nothing here does network I/O or counts against `max_ops`.
+
+```js
+function handler(ctx) {
+  // crypto: one-way hashing/signing, IDs, reversible encoders
+  $sys.crypto.sha256("hello"); // hex
+  $sys.crypto.hmac("sha256", "key", "msg", "base64"); // hex (default) | base64 | base64url
+  $sys.crypto.uuid(); // v4
+  $sys.crypto.base64.encode("hi"); // also .base64url / .hex / .url, each .encode/.decode
+
+  // date: parse (ISO/RFC3339, YYYY-MM-DD, epoch ms → UTC), timedelta math, diff
+  var due = $sys.date.parse(ctx.when).add({ days: 3, hours: 12 });
+  due.iso(); // RFC 3339 "Z"  ·  due.unix() // epoch seconds  ·  json() serializes as ISO
+  $sys.date.parse(b).diff($sys.date.parse(a)); // { total_ms, total_seconds, days, hours, ... }
+
+  return json({ due: due }, null);
+}
+```
+
+**Secrets are use-not-extract** (the multi-tenant guarantee). With
+`config.sys = { "env": { "REGION": "us-east-1" }, "secrets": { "SIGNING_KEY": "sk_live_…" } }`:
+
+```js
+$sys.env.REGION; // "us-east-1"  (plain, returnable)
+var sig = $sys.crypto.hmac("sha256", $sys.secrets.SIGNING_KEY, body); // ✅ handle → one-way sign
+String($sys.secrets.SIGNING_KEY); // "[secret:SIGNING_KEY]"  (never the plaintext)
+$sys.crypto.base64.encode($sys.secrets.SIGNING_KEY); // ❌ throws — secrets can't be encoded
+```
+
+The plaintext never enters JS — it stays Rust-side and is resolved only by the one-way HMAC
+sink, so a script can only ever return the `"[secret:NAME]"` placeholder. There is **no**
+output scrubber and **no** reveal escape hatch (both evadable/transmit-to-observable). Use
+high-entropy secrets. See [`docs/09-sys.md`](docs/09-sys.md).
+
 ## Configuration
 
 Optional `config.json` in the working directory. All fields have defaults:

@@ -31,8 +31,10 @@ Read these in order. Each one is short.
    (cache, counters, sessions). 📝
 8. **[`amq` — send messages to a queue](08-amq.md)** — drop jobs into RabbitMQ for a
    worker to pick up later. 📮
-9. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
-   something fails, and how to read it. 🚦
+9. **[`$sys` — the built-in toolbox](09-sys.md)** — hashing, signing, dates, and
+   use-but-never-see secrets. Always on (no setup) for `crypto` + `date`. 🧰
+10. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
+    something fails, and how to read it. 🚦
 
 ## The super-powers 🦸
 
@@ -47,8 +49,10 @@ little `config` to your message. That keeps things safe.
 | `s3`        | Signed upload links    | `config.s3`            |
 | `redis`     | A super-fast notebook  | `config.redis`         |
 | `amq`       | Send messages to a queue | `config.amq`         |
+| `$sys.env` / `.secrets` | Settings + use-only secrets | `config.sys` |
 
-(`$` — exact decimal math — is the exception: it's **always on**, no config.)
+(`$` — exact decimal math — and **`$sys.crypto` / `$sys.date`** are the exceptions:
+they're **always on**, no config. Only `$sys.env` / `$sys.secrets` need `config.sys`.)
 
 If you don't turn a super-power on, the robot simply doesn't have it. (For example,
 if there's no `config.mail`, then `mail` is `undefined` — it isn't there at all.)

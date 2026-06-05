@@ -105,4 +105,4 @@ sure the worker side has declared the queue.
 Each `amq.send` is listed in `meta.amq_requests` (how many messages, total bytes, how
 long it took).
 
-**Next:** [When Things Go Wrong (Errors) →](99-errors.md)
+**Next:** [`$sys` — the built-in toolbox →](09-sys.md)
