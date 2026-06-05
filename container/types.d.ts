@@ -304,7 +304,7 @@ declare const mail: Mail;
 /** HTTP method a presigned URL is signed for. */
 type S3Method = "PUT" | "GET" | "HEAD" | "DELETE";
 
-/** Options for {@link S3.presignPut} / {@link S3.presignGet}. */
+/** Options for {@link S3.upload_url} / {@link S3.download_url}. */
 interface S3PresignOptions {
   /** Object key (path within the bucket), e.g. `"uploads/photo.jpg"`. */
   key: string;
@@ -312,13 +312,13 @@ interface S3PresignOptions {
   expires?: number;
 }
 
-/** Options for the general {@link S3.presign}. */
+/** Options for the general {@link S3.sign_url}. */
 interface S3PresignGeneralOptions extends S3PresignOptions {
   /** HTTP method to sign for. Defaults to `"PUT"`. */
   method?: S3Method;
 }
 
-/** Result of {@link S3.presign} / {@link S3.presignPut} / {@link S3.presignGet}. */
+/** Result of {@link S3.sign_url} / {@link S3.upload_url} / {@link S3.download_url}. */
 interface S3PresignResult {
   /** The signed URL the browser uses directly. */
   url: string;
@@ -328,7 +328,7 @@ interface S3PresignResult {
   expires: number;
 }
 
-/** Options for {@link S3.presignPost}. */
+/** Options for {@link S3.upload_form}. */
 interface S3PresignPostOptions {
   /** Object key the upload will be stored under. */
   key: string;
@@ -337,7 +337,7 @@ interface S3PresignPostOptions {
 }
 
 /**
- * Result of {@link S3.presignPost} — a browser POST policy whose size limit the
+ * Result of {@link S3.upload_form} — a browser POST policy whose size limit the
  * object store enforces (the cap comes from `config.s3.max_upload_size`).
  */
 interface S3PresignPostResult {
@@ -346,7 +346,7 @@ interface S3PresignPostResult {
   /** Form fields to send before the `file` part. */
   fields: { [field: string]: string };
   /** The enforced maximum object size in bytes. */
-  maxBytes: number;
+  max_bytes: number;
   /** The policy's lifetime in seconds. */
   expires: number;
 }
@@ -383,19 +383,19 @@ interface S3DeleteResult {
 
 /**
  * S3-compatible storage helper for `config.s3` (AWS S3, Cloudflare R2, MinIO,
- * Backblaze B2, …). `presign*` is pure crypto — the server never touches your
+ * Backblaze B2, …). Signing a URL is pure crypto — the server never touches your
  * files; `usage` and `delete` are the calls that connect. The `endpoint` is
- * operator-config and SSRF-guarded. `presign*`/`delete` throw on an empty `key`.
+ * operator-config and SSRF-guarded. The sign helpers / `delete` throw on an empty `key`.
  */
 interface S3 {
-  /** Signs a URL for the given `method` (default `"PUT"`). `DELETE` needs `config.s3.allow_delete`. */
-  presign(opts: S3PresignGeneralOptions): S3PresignResult;
-  /** Signs a `PUT` upload URL. */
-  presignPut(opts: S3PresignOptions): S3PresignResult;
-  /** Signs a `GET` download URL. */
-  presignGet(opts: S3PresignOptions): S3PresignResult;
-  /** Signs a size-limited browser POST upload (cap from `config.s3.max_upload_size`). */
-  presignPost(opts: S3PresignPostOptions): S3PresignPostResult;
+  /** Signs a `PUT` upload link. */
+  upload_url(opts: S3PresignOptions): S3PresignResult;
+  /** Signs a `GET` download link. */
+  download_url(opts: S3PresignOptions): S3PresignResult;
+  /** Signs a size-limited browser POST upload form (cap from `config.s3.max_upload_size`). */
+  upload_form(opts: S3PresignPostOptions): S3PresignPostResult;
+  /** Signs a URL for any `method` (default `"PUT"`). `DELETE` needs `config.s3.allow_delete`. */
+  sign_url(opts: S3PresignGeneralOptions): S3PresignResult;
   /**
    * Totals the bytes and object count under a key prefix by listing the bucket.
    * No native "folder size" exists in S3, so this walks every object under the

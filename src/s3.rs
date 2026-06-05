@@ -1,7 +1,7 @@
 //! S3 object helper for the `QuickJS` sandbox (`s3`).
 //!
-//! JS API: `s3.presignPut/{Get}({ key, expires? })`, `s3.presignPost({ key })`,
-//! `s3.usage({ prefix })`, and `s3.delete({ key })` (also `s3.presign({ method, key })`).
+//! JS API: `s3.upload_url/download_url({ key, expires? })`, `s3.upload_form({ key })`,
+//! `s3.usage({ prefix })`, and `s3.delete({ key })` (also `s3.sign_url({ method, key })`).
 //!
 //! **Presign** ops are pure crypto — the server computes an AWS `SigV4` URL and hands
 //! it to the script for a direct browser upload/download; it never connects. **`usage`**
@@ -144,9 +144,9 @@ pub(crate) struct S3Config {
     /// Hard cap on link lifetime in seconds (`SigV4` max is 604800 = 7 days).
     #[serde(default = "default_max_expires")]
     pub(crate) max_expires: u64,
-    /// Maximum upload size for `presignPost`, human-readable (`"25mb"`, `"50gb"`, or
+    /// Maximum upload size for `upload_form`, human-readable (`"25mb"`, `"50gb"`, or
     /// bytes). Operator-supplied — the script can never raise or set it. Required for
-    /// `presignPost` (0 = unset → `presignPost` errors). Unused by `presignPut`/`Get`.
+    /// `upload_form` (0 = unset → `upload_form` errors). Unused by `upload_url`/`download_url`.
     #[serde(default, deserialize_with = "deserialize_byte_size")]
     pub(crate) max_upload_size: usize,
     /// Allow object deletion (`s3.delete(...)` and presigning a `DELETE` URL).
@@ -333,7 +333,7 @@ fn do_presign(
         ));
     }
     if payload.key.trim().is_empty() {
-        return Err(S3Error::signing("s3 presign requires a non-empty key".to_owned()));
+        return Err(S3Error::signing("s3 sign_url requires a non-empty key".to_owned()));
     }
     let expires = clamp_expires(payload.expires, config);
 
@@ -379,12 +379,12 @@ fn do_presign_post(
         serde_json::from_str(payload_json).map_err(|err| format!("invalid s3 payload: {err}"))?;
 
     if payload.key.trim().is_empty() {
-        return Err(S3Error::signing("s3 presignPost requires a non-empty key".to_owned()));
+        return Err(S3Error::signing("s3 upload_form requires a non-empty key".to_owned()));
     }
     let max_bytes = config.max_upload_size;
     if max_bytes == 0 {
         return Err(S3Error::signing(
-            "config.s3.max_upload_size is required for presignPost".to_owned(),
+            "config.s3.max_upload_size is required for upload_form".to_owned(),
         ));
     }
     let expires = clamp_expires(payload.expires, config);
@@ -423,7 +423,7 @@ fn do_presign_post(
             "Policy": policy_b64,
             "X-Amz-Signature": signature,
         },
-        "maxBytes": max_bytes,
+        "max_bytes": max_bytes,
         "expires": expires,
     });
     let json_out = serde_json::to_string(&response)

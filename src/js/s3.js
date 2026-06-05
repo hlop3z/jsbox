@@ -4,12 +4,12 @@
     var res = JSON.parse(raw);
     if (res && res.error) {
       var err = new Error(res.error);
-      err.__jsbox = res; // { error, code, retryable, source } — engine classifies off this
+      err.__jsbox = res; // { error, code, retryable, owner, source } — engine classifies off this
       throw err;
     }
     return res;
   }
-  function presign(opts) {
+  function sign(opts) {
     opts = opts || {};
     return call('presign', {
       method: opts.method || 'PUT',
@@ -18,32 +18,34 @@
     });
   }
   globalThis.s3 = {
-    presign: presign,
-    presignPut: function(opts) {
+    // Sign a URL for any method (PUT/GET/HEAD/DELETE). Use the helpers below for the
+    // common cases.
+    sign_url: sign,
+    // Sign an upload (PUT) link.
+    upload_url: function(opts) {
       opts = opts || {};
-      return presign({ method: 'PUT', key: opts.key, expires: opts.expires });
+      return sign({ method: 'PUT', key: opts.key, expires: opts.expires });
     },
-    presignGet: function(opts) {
+    // Sign a download (GET) link.
+    download_url: function(opts) {
       opts = opts || {};
-      return presign({ method: 'GET', key: opts.key, expires: opts.expires });
+      return sign({ method: 'GET', key: opts.key, expires: opts.expires });
     },
-    presignPost: function(opts) {
+    // Sign a size-limited browser POST upload form. No size field: the cap comes only
+    // from config.s3.max_upload_size.
+    upload_form: function(opts) {
       opts = opts || {};
-      // No size field: the upload cap comes only from config.s3.max_upload_size.
-      return call('presign_post', {
-        key: opts.key || '',
-        expires: opts.expires || 0
-      });
+      return call('presign_post', { key: opts.key || '', expires: opts.expires || 0 });
     },
+    // Total { prefix, bytes, objects } for a key prefix (e.g. "user-a/").
     usage: function(opts) {
       opts = opts || {};
-      // Totals { prefix, bytes, objects } for a key prefix (e.g. "user-a/").
       return call('usage', { prefix: opts.prefix || '' });
     },
+    // Delete one object -> { key, deleted: true }. Throws unless the operator set
+    // config.s3.allow_delete = true (destructive, so it is opt-in).
     delete: function(opts) {
       opts = opts || {};
-      // Deletes one object -> { key, deleted: true }. Throws unless the operator
-      // set config.s3.allow_delete = true (destructive, so it is opt-in).
       return call('delete', { key: opts.key || '' });
     }
   };

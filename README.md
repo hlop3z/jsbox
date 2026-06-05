@@ -227,20 +227,20 @@ private/internal relays are allowed):
 Addresses, subject, and bodies are assembled with a typed message builder, so caller
 input cannot inject SMTP headers (CRLF injection is rejected at parse time).
 
-### s3.presignPut / s3.presignGet / s3.presignPost / s3.presign
+### s3.upload_url / s3.download_url / s3.upload_form / s3.sign_url
 
 Presigned-URL generator for direct browser uploads/downloads (requires `config.s3`):
 
 ```js
 function handler(ctx) {
   // Sign a URL the browser uses to PUT the file straight to the bucket.
-  var put = s3.presignPut({ key: "uploads/" + ctx.filename, expires: 300 });
+  var put = s3.upload_url({ key: "uploads/" + ctx.filename, expires: 300 });
   // put = { url: "https://...&X-Amz-Signature=...", method: "PUT", expires: 300 }
 
   // Sign a short-lived download link.
-  var get = s3.presignGet({ key: "uploads/" + ctx.filename });
+  var get = s3.download_url({ key: "uploads/" + ctx.filename });
 
-  // s3.presign({ method, key, expires }) is the general form (PUT/GET/HEAD/DELETE).
+  // s3.sign_url({ method, key, expires }) is the general form (PUT/GET/HEAD/DELETE).
   return json({ upload: put.url, download: get.url }, null);
 }
 ```
@@ -289,12 +289,12 @@ SigV4 store — AWS S3, Cloudflare R2, MinIO, Backblaze B2, DigitalOcean Spaces:
 | `path_style`      | `false`    | `true` = `host/bucket/key` (MinIO); `false` = `bucket.host/key` (AWS) |
 | `expires`         | `900`      | Default link lifetime in seconds                                      |
 | `max_expires`     | `604800`   | Hard cap on link lifetime (SigV4 max, 7 days)                         |
-| `max_upload_size` | (unset)    | **`presignPost` only** — max object bytes, human-readable (`"25mb"`)  |
+| `max_upload_size` | (unset)    | **`upload_form` only** — max object bytes, human-readable (`"25mb"`)  |
 | `allow_delete`    | `false`    | Enable `s3.delete` + presigning `DELETE` URLs (destructive — opt-in)  |
 
-#### s3.presignPost — size-enforced browser uploads
+#### s3.upload_form — size-enforced browser uploads
 
-`presignPut` does not cap the body size. `presignPost` returns a **POST policy** whose
+`upload_url` does not cap the body size. `upload_form` returns a **POST policy** whose
 `content-length-range` the object store **enforces** — it rejects an upload larger than
 `config.s3.max_upload_size`. The cap is **operator-config only**; the script supplies just
 the `key` and can never set or raise the size (it cannot read it from `ctx`). This is the
@@ -303,13 +303,13 @@ primitive for storage quotas.
 ```js
 function handler(ctx) {
   // max size comes from config.s3.max_upload_size — NOT from ctx.
-  var up = s3.presignPost({
+  var up = s3.upload_form({
     key: "customers/" + ctx.id + "/" + ctx.filename,
     expires: 300,
   });
   // up = { url, fields: { key, "X-Amz-Algorithm", "X-Amz-Credential",
   //                       "X-Amz-Date", "Policy", "X-Amz-Signature" },
-  //        maxBytes: 26214400, expires: 300 }
+  //        max_bytes: 26214400, expires: 300 }
   return json(up, null);
 }
 ```
@@ -320,11 +320,11 @@ Frontend (`multipart/form-data`, the `file` field MUST be last):
 const form = new FormData();
 Object.entries(up.fields).forEach(([k, v]) => form.append(k, v));
 form.append("file", file);
-await fetch(up.url, { method: "POST", body: form }); // 204 ok · 400 if > maxBytes
+await fetch(up.url, { method: "POST", body: form }); // 204 ok · 400 if > max_bytes
 ```
 
-`config.s3.max_upload_size` is required for `presignPost` (human-readable like
-`"25mb"`/`"50gb"`, or bytes). Without it, `presignPost` errors.
+`config.s3.max_upload_size` is required for `upload_form` (human-readable like
+`"25mb"`/`"50gb"`, or bytes). Without it, `upload_form` errors.
 
 #### s3.usage — total bytes/objects under a prefix
 
@@ -360,7 +360,7 @@ Like `usage`, this **connects to the store** (trusted/operator-config, SSRF-guar
 It signs and sends a short-lived `DELETE /{bucket}/{key}`. S3 delete is **idempotent** — a
 missing key still returns `deleted: true` (HTTP 204). Because deletion is destructive, it
 is **gated behind `config.s3.allow_delete`** (default `false`): even with `s3` otherwise
-configured, `s3.delete(...)` — and presigning a `DELETE` URL via `s3.presign({ method:
+configured, `s3.delete(...)` — and presigning a `DELETE` URL via `s3.sign_url({ method:
 "DELETE" })` — throws unless the operator sets `allow_delete: true`. Counts as one op
 against `max_ops`.
 
