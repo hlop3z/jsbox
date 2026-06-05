@@ -27,10 +27,14 @@ Read these in order. Each one is short.
    decimal math with `$("19.99").mul(3)`. Always on, no setup. 💵
 6. **[`s3` — signed upload/download links](06-s3.md)** — let a browser upload files
    straight to your bucket (S3, R2, MinIO…). 🔗
-7. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
+7. **[`redis` — a super-fast notebook](07-redis.md)** — stash little bits of data by name
+   (cache, counters, sessions). 📝
+8. **[`amq` — send messages to a queue](08-amq.md)** — drop jobs into RabbitMQ for a
+   worker to pick up later. 📮
+9. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
    something fails, and how to read it. 🚦
 
-## The three super-powers 🦸
+## The super-powers 🦸
 
 Your robot starts with **no** super-powers. You turn each one on by adding a
 little `config` to your message. That keeps things safe.
@@ -41,6 +45,10 @@ little `config` to your message. That keeps things safe.
 | `db`        | Talk to a database     | `config.db`            |
 | `mail`      | Send email             | `config.mail`          |
 | `s3`        | Signed upload links    | `config.s3`            |
+| `redis`     | A super-fast notebook  | `config.redis`         |
+| `amq`       | Send messages to a queue | `config.amq`         |
+
+(`$` — exact decimal math — is the exception: it's **always on**, no config.)
 
 If you don't turn a super-power on, the robot simply doesn't have it. (For example,
 if there's no `config.mail`, then `mail` is `undefined` — it isn't there at all.)
