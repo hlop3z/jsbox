@@ -52,6 +52,10 @@ pub(crate) enum ErrorSource {
     S3,
     /// The `api` (HTTP) capability.
     Api,
+    /// The `redis` capability.
+    Redis,
+    /// The `amq` (`RabbitMQ`) capability.
+    Amq,
 }
 
 impl ErrorSource {
@@ -66,6 +70,8 @@ impl ErrorSource {
             "mail" => Some(Self::Mail),
             "s3" => Some(Self::S3),
             "api" => Some(Self::Api),
+            "redis" => Some(Self::Redis),
+            "amq" => Some(Self::Amq),
             _ => None,
         }
     }

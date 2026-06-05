@@ -364,6 +364,58 @@ configured, `s3.delete(...)` — and presigning a `DELETE` URL via `s3.presign({
 "DELETE" })` — throws unless the operator sets `allow_delete: true`. Counts as one op
 against `max_ops`.
 
+### redis.get / set / del / incr / expire
+
+Key/value access against an operator-supplied Redis (`config.redis`, trusted like `db`/`mail`
+— no SSRF guard). **Strings in / strings out**: the script owns (de)serialization. Synchronous
+(no `await`).
+
+```js
+function handler(ctx) {
+  redis.set("user:1", JSON.stringify({ id: 1 }), { ttl: 60 }); // ttl seconds, optional
+  var raw = redis.get("user:1");        // string | null (null if missing)
+  var n = redis.incr("visits");          // number (new value)
+  redis.expire("user:1", 120);           // bool (true if the key existed)
+  redis.del("user:1");                   // number (keys removed)
+  return json({ user: JSON.parse(raw), visits: n }, null);
+}
+```
+
+Config: `{ "redis": { "url": "redis://[user:pass@]host:6379[/db]", "timeout_ms": 5000 } }`.
+Use a **`rediss://`** URL for TLS (managed services) — validated against bundled public
+CA roots, reusing the same `aws-lc-rs` provider as the rest of the stack (no extra crypto
+in the binary). A failure to reach Redis surfaces as a retryable
+`capability/redis/REDIS_CONNECTION` (HTTP 200), not a server fault. Each call is one op
+against `max_ops`.
+
+### amq.send — RabbitMQ producer
+
+Publishes a **batch** of messages to RabbitMQ (`config.amq`, trusted — no SSRF guard).
+**Producer only.** List-always: `amq.send([[routingKey, payload], …])`; Rust opens one
+connection for the whole batch. Synchronous.
+
+```js
+function handler(ctx) {
+  var published = amq.send([
+    ["user.created", { id: 1 }],
+    ["user.created", { id: 2 }],
+  ]);                                     // → 2
+  return json({ published: published }, null);
+}
+```
+
+The message **body is the JSON of each `payload`**; `routingKey` is the queue name for the
+default exchange (override with `config.amq.exchange`). The **whole batch is one op**
+against `max_ops` (a batch ≈ one round trip); a batch over `config.amq.max_batch` (default
+100) is rejected with `AMQ_BATCH_TOO_LARGE`. A broker outage → retryable
+`capability/amq/AMQ_CONNECTION` (HTTP 200).
+
+Config: `{ "amq": { "host": "...", "port": 5672, "username": "guest", "password": "guest",
+"vhost": "/", "exchange": "", "max_batch": 100, "tls": false, "ca_cert": null } }`. Set
+**`"tls": true`** (port usually `5671`) for `amqps://` against managed brokers — validated
+against bundled public CA roots via the shared `aws-lc-rs` provider. For a self-hosted broker
+with a private CA, point `ca_cert` at the CA PEM (mounted into the container).
+
 ## Configuration
 
 Optional `config.json` in the working directory. All fields have defaults:

@@ -20,12 +20,16 @@ use rquickjs::{Context, Ctx, Function, Object, Runtime, Value as JsValue};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::amq;
+use crate::amq::{AmqConfig, AmqMetric};
 use crate::db;
 use crate::db::{DbConfig, DbMetric};
 use crate::decimal;
 use crate::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource, Fault};
 use crate::http;
 use crate::http::HttpMetric;
+use crate::kv;
+use crate::kv::{RedisConfig, RedisMetric};
 use crate::mail;
 use crate::mail::{MailConfig, MailMetric};
 use crate::s3;
@@ -58,6 +62,10 @@ pub(crate) struct ExecParams<'a> {
     pub(crate) mail_config: Option<&'a MailConfig>,
     /// S3 config (None = disabled).
     pub(crate) s3_config: Option<&'a S3Config>,
+    /// Redis config (None = disabled).
+    pub(crate) redis_config: Option<&'a RedisConfig>,
+    /// `RabbitMQ` config (None = disabled).
+    pub(crate) amq_config: Option<&'a AmqConfig>,
     /// Max operations per execution.
     pub(crate) max_ops: usize,
     /// Debug mode: relax the SSRF private-IP block (`api`/`s3`) for local testing.
@@ -76,6 +84,10 @@ pub(crate) struct ExecResult {
     pub(crate) mail_metrics: Vec<MailMetric>,
     /// S3 operations made during execution.
     pub(crate) s3_metrics: Vec<S3Metric>,
+    /// Redis operations made during execution.
+    pub(crate) redis_metrics: Vec<RedisMetric>,
+    /// `RabbitMQ` operations made during execution.
+    pub(crate) amq_metrics: Vec<AmqMetric>,
 }
 
 /// What the handler produced: a success envelope or a system error.
@@ -173,12 +185,16 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
     let mut db_collector: Option<Collector<DbMetric>> = None;
     let mut mail_collector: Option<Collector<MailMetric>> = None;
     let mut s3_collector: Option<Collector<S3Metric>> = None;
+    let mut redis_collector: Option<Collector<RedisMetric>> = None;
+    let mut amq_collector: Option<Collector<AmqMetric>> = None;
 
     let mut collectors = Collectors {
         http: &mut http_collector,
         db: &mut db_collector,
         mail: &mut mail_collector,
         s3: &mut s3_collector,
+        redis: &mut redis_collector,
+        amq: &mut amq_collector,
     };
 
     let js_result = ctx.with(|qctx| -> Result<ExecOutcome, EngineError> {
@@ -203,6 +219,8 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         db_metrics: sandbox::drain(db_collector.as_ref()),
         mail_metrics: sandbox::drain(mail_collector.as_ref()),
         s3_metrics: sandbox::drain(s3_collector.as_ref()),
+        redis_metrics: sandbox::drain(redis_collector.as_ref()),
+        amq_metrics: sandbox::drain(amq_collector.as_ref()),
     })
 }
 
@@ -219,6 +237,10 @@ struct Collectors<'a> {
     mail: &'a mut Option<Collector<MailMetric>>,
     /// S3 metrics collector slot.
     s3: &'a mut Option<Collector<S3Metric>>,
+    /// Redis metrics collector slot.
+    redis: &'a mut Option<Collector<RedisMetric>>,
+    /// `RabbitMQ` metrics collector slot.
+    amq: &'a mut Option<Collector<AmqMetric>>,
 }
 
 // -- Setup helpers ----------------------------------------------------------
@@ -275,6 +297,14 @@ fn inject_apis(
                 .map_err(EngineError::internal)?,
         );
     }
+    if let Some(redis_cfg) = params.redis_config {
+        *collectors.redis =
+            Some(kv::inject_redis(qctx, redis_cfg, params.max_ops).map_err(map_redis_inject_error)?);
+    }
+    if let Some(amq_cfg) = params.amq_config {
+        *collectors.amq =
+            Some(amq::inject_amq(qctx, amq_cfg, params.max_ops).map_err(EngineError::internal)?);
+    }
     Ok(())
 }
 
@@ -283,6 +313,16 @@ fn inject_apis(
 fn map_db_inject_error(err: Box<dyn Error + Send + Sync>) -> EngineError {
     if db::is_connect_error(err.as_ref()) {
         EngineError::capability_inject(ErrorSource::Db, db::DB_CONNECTION_FAULT, err.to_string())
+    } else {
+        EngineError::internal(err)
+    }
+}
+
+/// Maps a `redis` inject failure: a connection failure → retryable capability error;
+/// an engine-setup failure → internal.
+fn map_redis_inject_error(err: Box<dyn Error + Send + Sync>) -> EngineError {
+    if kv::is_connect_error(err.as_ref()) {
+        EngineError::capability_inject(ErrorSource::Redis, kv::REDIS_CONNECTION_FAULT, err.to_string())
     } else {
         EngineError::internal(err)
     }
@@ -466,6 +506,8 @@ const fn capability_message(source: ErrorSource) -> &'static str {
         ErrorSource::Mail => "mail delivery failed",
         ErrorSource::S3 => "object storage request failed",
         ErrorSource::Api => "upstream request failed",
+        ErrorSource::Redis => "redis request failed",
+        ErrorSource::Amq => "message broker request failed",
         ErrorSource::Request | ErrorSource::Engine | ErrorSource::Handler => {
             "capability request failed"
         }

@@ -13,10 +13,12 @@ use tokio::task;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::amq::{AmqConfig, AmqMetric};
 use crate::db::{DbConfig, DbMetric};
 use crate::engine::{self, EngineError, ExecOutcome, ExecParams, ExecResult};
 use crate::errors::{ErrorCategory, ErrorEnvelope, ErrorOwner, ErrorSource};
 use crate::http::HttpMetric;
+use crate::kv::{RedisConfig, RedisMetric};
 use crate::mail::{MailConfig, MailMetric};
 use crate::pool::JsPool;
 use crate::s3::{S3Config, S3Metric};
@@ -58,6 +60,12 @@ pub(crate) struct RequestConfig {
     /// S3 presigning config (omit to disable `s3` in JS).
     #[serde(default)]
     pub(crate) s3: Option<S3Config>,
+    /// Redis config (omit to disable `redis` in JS).
+    #[serde(default)]
+    pub(crate) redis: Option<RedisConfig>,
+    /// `RabbitMQ` config (omit to disable `amq` in JS).
+    #[serde(default)]
+    pub(crate) amq: Option<AmqConfig>,
 }
 
 /// Returns a clone of the pre-allocated default context.
@@ -76,6 +84,10 @@ struct ExecMetrics {
     mail: Vec<MailMetric>,
     /// S3 presign metrics.
     s3: Vec<S3Metric>,
+    /// Redis operation metrics.
+    redis: Vec<RedisMetric>,
+    /// `RabbitMQ` operation metrics.
+    amq: Vec<AmqMetric>,
 }
 
 /// Metadata computed by Rust.
@@ -100,6 +112,10 @@ struct Meta {
     mail_requests: Vec<MailMetric>,
     /// S3 presign operations made by the script.
     s3_requests: Vec<S3Metric>,
+    /// Redis operations made by the script.
+    redis_requests: Vec<RedisMetric>,
+    /// `RabbitMQ` operations made by the script.
+    amq_requests: Vec<AmqMetric>,
 }
 
 impl Meta {
@@ -115,15 +131,19 @@ impl Meta {
             db_requests: Vec::new(),
             mail_requests: Vec::new(),
             s3_requests: Vec::new(),
+            redis_requests: Vec::new(),
+            amq_requests: Vec::new(),
         }
     }
 
-    /// Attaches HTTP, DB, mail, and S3 metrics to this metadata.
+    /// Attaches HTTP, DB, mail, S3, Redis, and `RabbitMQ` metrics to this metadata.
     fn with_metrics(mut self, metrics: ExecMetrics) -> Self {
         self.http_requests = metrics.http;
         self.db_requests = metrics.db;
         self.mail_requests = metrics.mail;
         self.s3_requests = metrics.s3;
+        self.redis_requests = metrics.redis;
+        self.amq_requests = metrics.amq;
         self
     }
 }
@@ -200,6 +220,8 @@ pub(crate) async fn execute(
     let db_config = req.config.db;
     let mail_config = req.config.mail;
     let s3_config = req.config.s3;
+    let redis_config = req.config.redis;
+    let amq_config = req.config.amq;
 
     let start = Instant::now();
     let allow_private_targets = js_pool.debug();
@@ -215,6 +237,8 @@ pub(crate) async fn execute(
             db_config: db_config.as_ref(),
             mail_config: mail_config.as_ref(),
             s3_config: s3_config.as_ref(),
+            redis_config: redis_config.as_ref(),
+            amq_config: amq_config.as_ref(),
             max_ops: engine_cfg.max_ops,
             allow_private_targets,
         });
@@ -233,6 +257,8 @@ pub(crate) async fn execute(
                 db: exec.db_metrics,
                 mail: exec.mail_metrics,
                 s3: exec.s3_metrics,
+                redis: exec.redis_metrics,
+                amq: exec.amq_metrics,
             };
             let meta = base_meta().with_metrics(metrics);
             match exec.outcome {

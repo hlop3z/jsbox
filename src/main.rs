@@ -1,5 +1,6 @@
 //! jsbox: A sandboxed JS execution service powered by `QuickJS`.
 
+mod amq;
 mod bytesize;
 mod config;
 mod db;
@@ -8,6 +9,7 @@ mod engine;
 mod errors;
 mod handler;
 mod http;
+mod kv;
 mod mail;
 mod pool;
 mod s3;
@@ -21,6 +23,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::serve::ListenerExt as _;
 use axum::Router;
+use rustls::crypto::aws_lc_rs;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::info;
@@ -42,6 +45,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_tracing();
+
+    // Install `aws-lc-rs` as the single process-wide rustls provider — reused by every TLS
+    // path (`db` SSL, `redis` rediss://, `amq` amqps://) so the binary links one crypto
+    // stack. `Err` just means a default was already installed; either way we're set.
+    if aws_lc_rs::default_provider().install_default().is_err() {
+        tracing::warn!("rustls crypto provider was already installed");
+    }
 
     let config_path = PathBuf::from("config.json");
     let config = Config::load(&config_path)?;
