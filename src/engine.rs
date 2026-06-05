@@ -35,6 +35,7 @@ use crate::mail::{MailConfig, MailMetric};
 use crate::s3;
 use crate::s3::{S3Config, S3Metric};
 use crate::sandbox::{self, Collector};
+use crate::sys::{self, SysConfig};
 
 /// The `json()` bridge — loaded from `src/js/bridge.js` at compile time.
 const JSON_BRIDGE: &str = include_str!("js/bridge.js");
@@ -66,6 +67,8 @@ pub(crate) struct ExecParams<'a> {
     pub(crate) redis_config: Option<&'a RedisConfig>,
     /// `RabbitMQ` config (None = disabled).
     pub(crate) amq_config: Option<&'a AmqConfig>,
+    /// `$sys` env/secrets context (None = no env/secrets injected).
+    pub(crate) sys_config: Option<&'a SysConfig>,
     /// Max operations per execution.
     pub(crate) max_ops: usize,
     /// Debug mode: relax the SSRF private-IP block (`api`/`s3`) for local testing.
@@ -200,6 +203,7 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
     let js_result = ctx.with(|qctx| -> Result<ExecOutcome, EngineError> {
         inject_bridge(&qctx).map_err(EngineError::internal)?;
         decimal::inject_decimal(&qctx).map_err(EngineError::internal)?;
+        sys::inject_sys(&qctx, params.sys_config).map_err(EngineError::internal)?;
         inject_apis(&qctx, params, &mut collectors)?;
         if eval_script(&qctx, params.script).is_err() {
             return Ok(ExecOutcome::Error(classify_eval_error(&qctx)));

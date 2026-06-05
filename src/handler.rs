@@ -23,6 +23,7 @@ use crate::mail::{MailConfig, MailMetric};
 use crate::pool::JsPool;
 use crate::s3::{S3Config, S3Metric};
 use crate::sandbox;
+use crate::sys::SysConfig;
 
 /// Pre-allocated `Box<RawValue>` for `{}` — used as default context.
 static DEFAULT_CONTEXT: LazyLock<Box<RawValue>> =
@@ -66,6 +67,9 @@ pub(crate) struct RequestConfig {
     /// `RabbitMQ` config (omit to disable `amq` in JS).
     #[serde(default)]
     pub(crate) amq: Option<AmqConfig>,
+    /// `$sys` env/secrets context (omit to leave `$sys.env`/`$sys.secrets` empty).
+    #[serde(default)]
+    pub(crate) sys: Option<SysConfig>,
 }
 
 /// Returns a clone of the pre-allocated default context.
@@ -222,6 +226,7 @@ pub(crate) async fn execute(
     let s3_config = req.config.s3;
     let redis_config = req.config.redis;
     let amq_config = req.config.amq;
+    let sys_config = req.config.sys;
 
     let start = Instant::now();
     let allow_private_targets = js_pool.debug();
@@ -239,6 +244,7 @@ pub(crate) async fn execute(
             s3_config: s3_config.as_ref(),
             redis_config: redis_config.as_ref(),
             amq_config: amq_config.as_ref(),
+            sys_config: sys_config.as_ref(),
             max_ops: engine_cfg.max_ops,
             allow_private_targets,
         });
@@ -262,7 +268,9 @@ pub(crate) async fn execute(
             };
             let meta = base_meta().with_metrics(metrics);
             match exec.outcome {
-                ExecOutcome::Success(js_json) => success_response(&js_json, meta, error_debug),
+                ExecOutcome::Success(js_json) => {
+                    success_response(&js_json, meta, error_debug)
+                }
                 ExecOutcome::Error(engine_err) => {
                     engine_error_response(engine_err, meta, error_debug)
                 }
@@ -279,6 +287,11 @@ pub(crate) async fn execute(
 
 /// Builds the success response, or a `MALFORMED_RESPONSE` error if the JS envelope
 /// can't be parsed.
+///
+/// Secrets need no output scrubbing: their plaintext never enters JS — it stays
+/// Rust-side as opaque handles (see `sys.rs`), so a script can only ever return the
+/// `"[secret:NAME]"` placeholder, never the value. The `{data,error}` borrow stays
+/// zero-copy.
 fn success_response(js_json: &str, meta: Meta, error_debug: bool) -> AxumResponse {
     match serde_json::from_str::<Envelope<'_>>(js_json) {
         Ok(env) => (
