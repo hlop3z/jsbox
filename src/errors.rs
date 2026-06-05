@@ -1,7 +1,7 @@
 //! Centralized structured-error vocabulary for the `/execute` response contract.
 //!
 //! One definition of the error shape, reused by every layer instead of each
-//! hand-rolling its own (see `docs/error-envelope.md`). Separation of concerns:
+//! hand-rolling its own (see `docs/99-errors.md`). Separation of concerns:
 //!
 //! - **classify** — each capability derives a [`Fault`] (stable `code` + `retryable` +
 //!   `owner`) from its *typed* error, above the "stringify cliff". This module owns the
@@ -126,7 +126,7 @@ impl Fault {
 ///
 /// Serializes to `{ error, code, retryable, owner, source, details? }`. The JS wrapper
 /// throws `new Error(error)` and tags it (`e.__jsbox = res`) so the engine classifies
-/// the throw structurally (docs/error-envelope.md §6).
+/// the throw structurally (docs/99-errors.md).
 #[derive(Debug, Serialize)]
 struct CapabilityFault {
     /// Raw driver message (the human-readable cause — surfaced gated, in `debug.raw`).

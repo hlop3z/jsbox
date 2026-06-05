@@ -50,7 +50,7 @@ impl MailError {
     }
 }
 
-/// Maps an SMTP error to a [`Fault`] (docs/error-envelope.md §5). A 4xx reply is
+/// Maps an SMTP error to a [`Fault`] (docs/99-errors.md). A 4xx reply is
 /// transient (retry); a 5xx reply is permanent; anything else (connect/TLS/IO) falls
 /// back to the retryable `MAIL_ERROR`.
 fn classify(err: &SmtpError) -> Fault {

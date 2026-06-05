@@ -88,7 +88,7 @@ Always `{data, error, meta}`. The handler controls `data` and `error` via the `j
 bridge. On a **system-generated** failure, `error` is a structured envelope —
 `{ type, source, code, message, retryable, owner, details?, debug? }` — that a client can
 branch on without parsing strings; `meta.trace_id` correlates it with server logs. See
-[`docs/error-envelope.md`](docs/error-envelope.md) for the full contract.
+[`docs/99-errors.md`](docs/99-errors.md) for the full contract.
 
 ## JS API
 

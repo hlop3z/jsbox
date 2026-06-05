@@ -27,6 +27,8 @@ Read these in order. Each one is short.
    decimal math with `$("19.99").mul(3)`. Always on, no setup. 💵
 6. **[`s3` — signed upload/download links](06-s3.md)** — let a browser upload files
    straight to your bucket (S3, R2, MinIO…). 🔗
+7. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
+   something fails, and how to read it. 🚦
 
 ## The three super-powers 🦸
 

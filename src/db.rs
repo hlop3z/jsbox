@@ -67,7 +67,7 @@ pub(crate) fn is_connect_error(err: &(dyn Error + Send + Sync + 'static)) -> boo
     err.downcast_ref::<postgres::Error>().is_some()
 }
 
-/// Maps a `postgres::Error` to a [`Fault`] by `SqlState` (docs/error-envelope.md §4).
+/// Maps a `postgres::Error` to a [`Fault`] by `SqlState` (docs/99-errors.md).
 ///
 /// The `SqlState` exists only here, above the "stringify cliff" — once the error is
 /// `format!`'d into a message the class is gone, so classification must happen now.

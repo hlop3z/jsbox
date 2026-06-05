@@ -6,7 +6,7 @@
 //! fresh context per request.
 //!
 //! On failure the engine **classifies** the outcome into a typed [`EngineError`]
-//! (see `docs/error-envelope.md`): a handler throw is inspected *structurally* via
+//! (see `docs/99-errors.md`): a handler throw is inspected *structurally* via
 //! `ctx.catch()` — a `__jsbox` tag ⇒ a capability error, otherwise a script error —
 //! and the timeout / memory signals (which JS cannot see) are folded in here.
 
@@ -533,7 +533,7 @@ impl EngineError {
         })
     }
 
-    /// HTTP status for this error per `docs/error-envelope.md` §6.
+    /// HTTP status for this error per `docs/99-errors.md`.
     pub(crate) const fn http_status(&self) -> u16 {
         match self {
             Self::Internal(_) => 500,

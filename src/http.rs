@@ -66,7 +66,7 @@ impl HttpError {
     }
 }
 
-/// Maps a `reqwest::Error` to a [`Fault`] (docs/error-envelope.md §5).
+/// Maps a `reqwest::Error` to a [`Fault`] (docs/99-errors.md).
 fn classify(err: &reqwest::Error) -> Fault {
     if err.is_timeout() {
         Fault::new("HTTP_TIMEOUT", true, ErrorOwner::Operator)
