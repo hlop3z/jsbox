@@ -21,7 +21,8 @@
  * `config.s3`) is present in the request — otherwise the global is `undefined`
  * (e.g. `typeof mail === "undefined"`). They are declared here as always-present
  * for convenient autocomplete; guard with `typeof` if a capability is optional.
- * `json`, `$`, and `Decimal` are pure and **always** available.
+ * `json`, `$`, `Decimal`, and `$sys.crypto` / `$sys.date` are pure and **always**
+ * available; `$sys.env` / `$sys.secrets` populate only when `config.sys` is set.
  *
  * `eval` and `Proxy` are removed before your `handler` runs.
  */
@@ -470,3 +471,153 @@ interface Amq {
 
 /** RabbitMQ producer. Present only when `config.amq` is supplied. */
 declare const amq: Amq;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `$sys` — runtime stdlib: crypto + date (always on); env/secrets when config.sys set
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** HMAC hash algorithm. */
+type SysHmacAlgo = "sha256" | "sha512";
+
+/** Output encoding for an HMAC digest. */
+type SysEncoding = "hex" | "base64" | "base64url";
+
+/** A reversible encode/decode pair (UTF-8 string ⇄ encoded string). */
+interface SysCodec {
+  /** Encodes a UTF-8 string. */
+  encode(input: string): string;
+  /** Decodes back to a UTF-8 string (throws on invalid input). */
+  decode(input: string): string;
+}
+
+/**
+ * Pure crypto + encoding helpers (always available). Hashing/HMAC are one-way;
+ * the codecs are reversible. A {@link SysSecret} handle may be passed **only** as the
+ * `key` of {@link hmac} — every other helper takes a plain `string` and so rejects it.
+ */
+interface SysCrypto {
+  /** SHA-256 of `data`, hex-encoded. */
+  sha256(data: string): string;
+  /** SHA-512 of `data`, hex-encoded. */
+  sha512(data: string): string;
+  /**
+   * HMAC of `msg` under `key`, `encoding`-encoded (default `"hex"`). `key` may be a
+   * {@link SysSecret} handle — it is resolved server-side; the plaintext never enters JS.
+   * @example $sys.crypto.hmac("sha256", $sys.secrets.SIGNING_KEY, body);
+   */
+  hmac(algo: SysHmacAlgo, key: string | SysSecret, msg: string, encoding?: SysEncoding): string;
+  /** A random v4 UUID. */
+  uuid(): string;
+  /** Standard base64 codec. */
+  base64: SysCodec;
+  /** URL-safe base64 (no padding) codec. */
+  base64url: SysCodec;
+  /** Hex codec. */
+  hex: SysCodec;
+  /** Percent-encoding (URL escape) codec. */
+  url: SysCodec;
+}
+
+/**
+ * A fixed-length duration for {@link SysDate.add} / {@link SysDate.sub}, like Python's
+ * `timedelta`. Only constant-length units — no months/years (ambiguous length).
+ */
+interface SysDuration {
+  weeks?: number;
+  days?: number;
+  hours?: number;
+  minutes?: number;
+  seconds?: number;
+  ms?: number;
+}
+
+/** The gap between two dates, from {@link SysDate.diff}. */
+interface SysDateDiff {
+  /** Signed total milliseconds (`this - other`). */
+  total_ms: number;
+  /** Signed total seconds. */
+  total_seconds: number;
+  /** Whole days in the absolute gap. */
+  days: number;
+  /** Remaining whole hours (0–23). */
+  hours: number;
+  /** Remaining whole minutes (0–59). */
+  minutes: number;
+  /** Remaining whole seconds (0–59). */
+  seconds: number;
+}
+
+/**
+ * An immutable UTC instant. Arithmetic is method-based and returns a new instance;
+ * serializes as its RFC 3339 string inside {@link json} / `JSON.stringify`.
+ */
+interface SysDate {
+  /** A new instant shifted forward by `delta`. */
+  add(delta: SysDuration): SysDate;
+  /** A new instant shifted backward by `delta`. */
+  sub(delta: SysDuration): SysDate;
+  /** Breakdown of `this - other` (accepts another instant or epoch millis). */
+  diff(other: SysDate | number): SysDateDiff;
+  /** RFC 3339 string in UTC, e.g. `"2026-06-08T00:00:00Z"`. */
+  iso(): string;
+  /** Epoch seconds. */
+  unix(): number;
+  /** Epoch milliseconds (the canonical value). */
+  epochMs(): number;
+  /** Serializes as {@link iso}. */
+  toJSON(): string;
+  /** Serializes as {@link iso}. */
+  toString(): string;
+}
+
+/** Date helpers (always available). Parsing normalizes everything to UTC. */
+interface SysDateFactory {
+  /** The current instant (UTC). */
+  now(): SysDate;
+  /**
+   * Parses an ISO 8601 / RFC 3339 string (offset-aware), a `YYYY-MM-DD` date, or epoch
+   * millis → a UTC {@link SysDate}. Throws on unparseable input.
+   * @example $sys.date.parse(ctx.when).add({ days: 3 }).iso();
+   */
+  parse(input: string | number | SysDate): SysDate;
+}
+
+/**
+ * An opaque secret handle from {@link Sys.secrets}. The plaintext **never enters JS** —
+ * pass it as the `key` of {@link SysCrypto.hmac}; any coercion (`String(x)`, a template
+ * literal, `JSON.stringify`) yields `"[secret:NAME]"`, never the value.
+ */
+interface SysSecret {
+  /** Yields `"[secret:NAME]"` — never the plaintext. */
+  toString(): string;
+  /** Yields `"[secret:NAME]"` — never the plaintext. */
+  toJSON(): string;
+}
+
+/**
+ * The `$sys` runtime standard library. `crypto` and `date` are pure and **always**
+ * available; `env` and `secrets` are populated only when `config.sys` is supplied
+ * (otherwise they are empty objects).
+ */
+interface Sys {
+  /** Pure crypto + encoding (always available). */
+  crypto: SysCrypto;
+  /** Date parse + timedelta math (always available). */
+  date: SysDateFactory;
+  /**
+   * Plain, returnable operator config values from `config.sys.env`. Typed as possibly
+   * `undefined` so you can probe optional keys (`$sys.env.FLAG === undefined`); a key
+   * you know is set can be used directly.
+   */
+  env: { readonly [key: string]: string | undefined };
+  /**
+   * Opaque secret handles from `config.sys.secrets` (see {@link SysSecret}). Typed as
+   * always-present (you reference the keys you provisioned) so a handle drops straight
+   * into {@link SysCrypto.hmac} without a null check; an unprovisioned key is `undefined`
+   * at runtime.
+   */
+  secrets: { readonly [key: string]: SysSecret };
+}
+
+/** Runtime stdlib. `$sys.crypto` / `$sys.date` always available; `env` / `secrets` need `config.sys`. */
+declare const $sys: Sys;
