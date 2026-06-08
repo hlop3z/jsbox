@@ -56,3 +56,66 @@ services:
         CREATE USER IF NOT EXISTS test;
         GRANT ALL ON DATABASE testdb TO test;
       "
+
+  # -- Identity providers for the `auth` capability tests --------------------
+  # Keycloak (dev mode): the master realm + `admin-cli` direct-grant client let the
+  # test harness mint a real user token via the password grant. Reachable in-network
+  # as http://keycloak:8080, on the host as http://localhost:8081.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: start-dev
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    ports:
+      - "8081:8080"
+
+  # ZITADEL needs its own Postgres (kept separate from the `db` test database so the
+  # two capabilities never interfere).
+  zitadel-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: zitadel
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d zitadel"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  # ZITADEL (insecure/dev): `start-from-init` bootstraps the instance and a service
+  # account whose Personal Access Token is written to ./.zitadel/zitadel-admin-sa.pat
+  # on the host (the image is scratch-based, so we bind-mount a writable dir). Run the
+  # suite with ZITADEL_PAT_FILE=./.zitadel/zitadel-admin-sa.pat (see test_simple.py).
+  # Reachable in-network as http://zitadel:8080, on the host as http://localhost:8082.
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:latest
+    command: 'start-from-init --masterkeyFromEnv --tlsMode disabled'
+    volumes:
+      - ./.zitadel:/pat
+    environment:
+      ZITADEL_MASTERKEY: "MasterkeyNeedsToHave32Characters"
+      ZITADEL_EXTERNALSECURE: "false"
+      ZITADEL_TLS_ENABLED: "false"
+      ZITADEL_EXTERNALDOMAIN: "${ZITADEL_EXTERNALDOMAIN:-localhost}"
+      ZITADEL_EXTERNALPORT: "${ZITADEL_EXTERNALPORT:-8082}"
+      ZITADEL_DATABASE_POSTGRES_HOST: zitadel-db
+      ZITADEL_DATABASE_POSTGRES_PORT: "5432"
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+      # First-instance bootstrap: a machine user + a long-lived PAT written to a file.
+      ZITADEL_FIRSTINSTANCE_PATPATH: /pat/zitadel-admin-sa.pat
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: jsbox-sa
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: jsbox-sa
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "2099-01-01T00:00:00Z"
+    depends_on:
+      zitadel-db:
+        condition: service_healthy
+    ports:
+      - "8082:8080"

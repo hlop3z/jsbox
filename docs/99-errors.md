@@ -44,7 +44,7 @@ so a **program** can decide what to do:
 | Field       | What it tells you                                                                  |
 | ----------- | ---------------------------------------------------------------------------------- |
 | `type`      | the big bucket: `request`, `runtime`, `script`, or `capability` (see below)        |
-| `source`    | who it came from: `engine`, `handler`, or a tool (`db`/`mail`/`s3`/`api`/`redis`/`amq`) |
+| `source`    | who it came from: `engine`, `handler`, or a tool (`db`/`mail`/`s3`/`api`/`redis`/`amq`/`auth`) |
 | `code`      | a stable label you can switch on, like `DB_CONSTRAINT`. Never changes meaning.     |
 | `message`   | a short, safe sentence for humans. (Secrets/PII never go here.)                    |
 | `retryable` | `true` = trying again might help; `false` = it won't, don't bother                  |
@@ -200,6 +200,16 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `AMQ_BATCH_TOO_LARGE` | no    | developer | Batch bigger than `config.amq.max_batch`.  |
 | `AMQ_OP_LIMIT`        | no    | developer | Hit `max_ops`.                             |
 | `AMQ_ERROR`           | yes   | operator  | Publish/protocol error (fallback).         |
+
+**`auth`** (OIDC/IAM identity). An invalid token is **not** an error — it comes back
+**in-band** as `{ ok: false, status, code: "AUTH_INVALID_TOKEN" }` (like `api`, never
+thrown). These codes are only for the failures `auth` **throws**:
+
+| `code`            | retry | owner     | When                                                         |
+| ----------------- | ----- | --------- | ----------------------------------------------------------- |
+| `AUTH_UNAVAILABLE`| yes   | operator  | Identity server unreachable / 5xx / timeout. `details.http_status`. |
+| `AUTH_REQUEST`    | no    | operator  | Misconfig: bad endpoint, discovery failed, `introspect` without client creds. |
+| `AUTH_OP_LIMIT`   | no    | developer | Hit `max_ops`.                                              |
 
 > New codes can show up over time, but they **never change meaning** and never move to a
 > different `type` — so it's always safe to switch on `code`.

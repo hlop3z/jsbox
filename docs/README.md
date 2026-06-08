@@ -33,7 +33,9 @@ Read these in order. Each one is short.
    worker to pick up later. 📮
 9. **[`$sys` — the built-in toolbox](09-sys.md)** — hashing, signing, dates, and
    use-but-never-see secrets. Always on (no setup) for `crypto` + `date`. 🧰
-10. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
+10. **[`auth` — who is this person?](10-auth.md)** — check a login token and get the
+    user's details from your identity server (Zitadel, Keycloak, Auth0…). 🪪
+11. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
     something fails, and how to read it. 🚦
 
 ## The super-powers 🦸
@@ -49,6 +51,7 @@ little `config` to your message. That keeps things safe.
 | `s3`        | Signed upload links    | `config.s3`            |
 | `redis`     | A super-fast notebook  | `config.redis`         |
 | `amq`       | Send messages to a queue | `config.amq`         |
+| `auth`      | Check a login token    | `config.auth`          |
 | `$sys.env` / `.secrets` | Settings + use-only secrets | `config.sys` |
 
 (`$` — exact decimal math — and **`$sys.crypto` / `$sys.date`** are the exceptions:

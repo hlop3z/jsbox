@@ -1,6 +1,7 @@
 //! jsbox: A sandboxed JS execution service powered by `QuickJS`.
 
 mod amq;
+mod auth;
 mod bytesize;
 mod config;
 mod db;

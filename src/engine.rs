@@ -22,6 +22,8 @@ use serde_json::Value;
 
 use crate::amq;
 use crate::amq::{AmqConfig, AmqMetric};
+use crate::auth;
+use crate::auth::{AuthConfig, AuthMetric};
 use crate::db;
 use crate::db::{DbConfig, DbMetric};
 use crate::decimal;
@@ -67,6 +69,8 @@ pub(crate) struct ExecParams<'a> {
     pub(crate) redis_config: Option<&'a RedisConfig>,
     /// `RabbitMQ` config (None = disabled).
     pub(crate) amq_config: Option<&'a AmqConfig>,
+    /// Auth (OIDC/IAM) config (None = disabled).
+    pub(crate) auth_config: Option<&'a AuthConfig>,
     /// `$sys` env/secrets context (None = no env/secrets injected).
     pub(crate) sys_config: Option<&'a SysConfig>,
     /// Max operations per execution.
@@ -91,6 +95,8 @@ pub(crate) struct ExecResult {
     pub(crate) redis_metrics: Vec<RedisMetric>,
     /// `RabbitMQ` operations made during execution.
     pub(crate) amq_metrics: Vec<AmqMetric>,
+    /// Auth operations made during execution.
+    pub(crate) auth_metrics: Vec<AuthMetric>,
 }
 
 /// What the handler produced: a success envelope or a system error.
@@ -190,6 +196,7 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
     let mut s3_collector: Option<Collector<S3Metric>> = None;
     let mut redis_collector: Option<Collector<RedisMetric>> = None;
     let mut amq_collector: Option<Collector<AmqMetric>> = None;
+    let mut auth_collector: Option<Collector<AuthMetric>> = None;
 
     let mut collectors = Collectors {
         http: &mut http_collector,
@@ -198,6 +205,7 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         s3: &mut s3_collector,
         redis: &mut redis_collector,
         amq: &mut amq_collector,
+        auth: &mut auth_collector,
     };
 
     let js_result = ctx.with(|qctx| -> Result<ExecOutcome, EngineError> {
@@ -225,6 +233,7 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         s3_metrics: sandbox::drain(s3_collector.as_ref()),
         redis_metrics: sandbox::drain(redis_collector.as_ref()),
         amq_metrics: sandbox::drain(amq_collector.as_ref()),
+        auth_metrics: sandbox::drain(auth_collector.as_ref()),
     })
 }
 
@@ -245,6 +254,8 @@ struct Collectors<'a> {
     redis: &'a mut Option<Collector<RedisMetric>>,
     /// `RabbitMQ` metrics collector slot.
     amq: &'a mut Option<Collector<AmqMetric>>,
+    /// Auth metrics collector slot.
+    auth: &'a mut Option<Collector<AuthMetric>>,
 }
 
 // -- Setup helpers ----------------------------------------------------------
@@ -308,6 +319,10 @@ fn inject_apis(
     if let Some(amq_cfg) = params.amq_config {
         *collectors.amq =
             Some(amq::inject_amq(qctx, amq_cfg, params.max_ops).map_err(EngineError::internal)?);
+    }
+    if let Some(auth_cfg) = params.auth_config {
+        *collectors.auth =
+            Some(auth::inject_auth(qctx, auth_cfg, params.max_ops).map_err(EngineError::internal)?);
     }
     Ok(())
 }
@@ -512,6 +527,7 @@ const fn capability_message(source: ErrorSource) -> &'static str {
         ErrorSource::Api => "upstream request failed",
         ErrorSource::Redis => "redis request failed",
         ErrorSource::Amq => "message broker request failed",
+        ErrorSource::Auth => "identity request failed",
         ErrorSource::Request | ErrorSource::Engine | ErrorSource::Handler => {
             "capability request failed"
         }

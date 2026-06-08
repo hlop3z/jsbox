@@ -220,6 +220,6 @@ $sys.crypto.base64.encode($sys.secrets.SIGNING_KEY); // ❌ throws: secrets can'
 - `.iso()` / `.unix()` to get it out; `json(...)` makes it an ISO string for free.
 - `$sys.env.KEY` → operator settings. `$sys.secrets.KEY` → use (HMAC), never read.
 
-**Next:** [When Things Go Wrong (Errors) →](99-errors.md)
+**Next:** [`auth` — Who Is This Person? →](10-auth.md)
 
 [← Back to the guide](README.md)

@@ -2,13 +2,27 @@
 """Integration tests for jsbox."""
 
 import json
+import os
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BASE_URL = "http://127.0.0.1:3000"
+
+# -- Identity providers for the `auth` capability (override via env for CI/in-network) --
+# Defaults match `docker compose up` on the host (Keycloak :8081, ZITADEL :8082).
+KEYCLOAK_ISSUER = os.environ.get("KEYCLOAK_ISSUER", "http://localhost:8081/realms/master")
+KEYCLOAK_ADMIN_USER = os.environ.get("KEYCLOAK_ADMIN", "admin")
+KEYCLOAK_ADMIN_PASS = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin")
+ZITADEL_ISSUER = os.environ.get("ZITADEL_ISSUER", "http://localhost:8082")
+# ZITADEL needs a service-account PAT. Provide it directly (ZITADEL_PAT) or via a file
+# (ZITADEL_PAT_FILE). Extract it after `docker compose up`:
+#   docker compose exec zitadel cat /tmp/zitadel-admin-sa.pat
+ZITADEL_PAT = os.environ.get("ZITADEL_PAT", "")
+ZITADEL_PAT_FILE = os.environ.get("ZITADEL_PAT_FILE", "")
 
 
 # -- Test runner -------------------------------------------------------------
@@ -396,6 +410,166 @@ def test_db_engine(t: Runner, label: str, db: dict):
     _post(h("db.execute('DROP TABLE IF EXISTS test_types'); db.execute('DROP TABLE IF EXISTS test_txn'); return json('ok', null);", config={"db": db}))
 
 
+# -- Auth (OIDC/IAM) tests ---------------------------------------------------
+
+def _provider_req(url: str, method: str = "GET", form=None, payload=None, headers=None):
+    """Talk directly to an identity provider. Returns (status, parsed_json|None)."""
+    data = None
+    hdrs = dict(headers or {})
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        hdrs.setdefault("Content-Type", "application/x-www-form-urlencoded")
+    elif payload is not None:
+        data = json.dumps(payload).encode()
+        hdrs.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as err:
+        try:
+            return err.code, json.loads(err.read())
+        except Exception:
+            return err.code, None
+    except Exception:
+        return None, None
+
+
+def _discovery_ok(issuer: str) -> bool:
+    """True if the issuer publishes a usable OIDC discovery document."""
+    status, body = _provider_req(f"{issuer}/.well-known/openid-configuration")
+    return status == 200 and bool(body) and "userinfo_endpoint" in body
+
+
+def _keycloak_token() -> str | None:
+    """Mint a real user access token via the admin-cli password grant (openid scope)."""
+    status, body = _provider_req(
+        f"{KEYCLOAK_ISSUER}/protocol/openid-connect/token",
+        method="POST",
+        form={
+            "grant_type": "password",
+            "client_id": "admin-cli",
+            "scope": "openid",
+            "username": KEYCLOAK_ADMIN_USER,
+            "password": KEYCLOAK_ADMIN_PASS,
+        },
+    )
+    return body.get("access_token") if status == 200 and body else None
+
+
+def _keycloak_introspect_creds(admin_token: str) -> dict | None:
+    """Ensure a confidential client exists and return its client_id/secret for RFC 7662."""
+    base, _, realm = KEYCLOAK_ISSUER.rpartition("/realms/")
+    auth = {"Authorization": f"Bearer {admin_token}"}
+    cid = "jsbox-introspect"
+    # Create it (ignore an "already exists" 409 from a previous run).
+    _provider_req(
+        f"{base}/admin/realms/{realm}/clients",
+        method="POST",
+        payload={
+            "clientId": cid,
+            "publicClient": False,
+            "serviceAccountsEnabled": True,
+            "standardFlowEnabled": False,
+            "directAccessGrantsEnabled": False,
+        },
+        headers=auth,
+    )
+    status, arr = _provider_req(f"{base}/admin/realms/{realm}/clients?clientId={cid}", headers=auth)
+    if status != 200 or not arr:
+        return None
+    internal_id = arr[0]["id"]
+    status, sec = _provider_req(
+        f"{base}/admin/realms/{realm}/clients/{internal_id}/client-secret", headers=auth
+    )
+    if status != 200 or not sec or not sec.get("value"):
+        return None
+    return {"client_id": cid, "client_secret": sec["value"]}
+
+
+def _zitadel_token() -> str | None:
+    """Read the ZITADEL service-account PAT from env or a file."""
+    if ZITADEL_PAT.strip():
+        return ZITADEL_PAT.strip()
+    if ZITADEL_PAT_FILE and os.path.exists(ZITADEL_PAT_FILE):
+        with open(ZITADEL_PAT_FILE, encoding="utf-8") as handle:
+            return handle.read().strip()
+    return None
+
+
+def test_auth_provider(t: Runner, label: str, issuer: str, token: str, introspect: dict | None):
+    """Drive the `auth` capability against a real OIDC/IAM (provider-agnostic)."""
+    t.section(f"Auth ({label})")
+    cfg = {"auth": {"issuer": issuer}}
+    ctx = {"token": token}
+
+    t.test(f"{label}: disabled without config",
+           h("return json(typeof auth, null);"),
+           data_eq("undefined"))
+
+    # Valid token: OIDC discovery + bearer userinfo → claims.
+    t.test(f"{label}: user_info(valid) -> ok:true",
+           h("return json(auth.user_info(ctx.token).ok, null);", ctx, cfg),
+           data_eq(True))
+    t.test(f"{label}: user_info resolves claims.sub",
+           h("var u = auth.user_info(ctx.token); return json(u.ok && typeof u.claims.sub === 'string', null);", ctx, cfg),
+           data_eq(True))
+
+    # Bad token is the caller's business flow → in-band, never thrown.
+    t.test(f"{label}: user_info(bad) -> in-band, no throw",
+           h("return json(auth.user_info('garbage-token-value'), null);", config=cfg),
+           lambda r: r["data"]["ok"] is False
+                     and r["data"]["code"] == "AUTH_INVALID_TOKEN"
+                     and r["error"] is None)
+
+    # Metered + per-request cache (two calls for one token = one round trip).
+    t.test(f"{label}: metered in auth_requests",
+           h("auth.user_info(ctx.token); return json(1, null);", ctx, cfg),
+           lambda r: len(r["meta"]["auth_requests"]) == 1
+                     and r["meta"]["auth_requests"][0]["action"] == "user_info")
+    t.test(f"{label}: per-token cache (2 calls, 1 op)",
+           h("auth.user_info(ctx.token); auth.user_info(ctx.token); return json(1, null);", ctx, cfg),
+           lambda r: len(r["meta"]["auth_requests"]) == 1)
+
+    # Infra/misconfig throws a tagged capability error (here: introspect w/o creds).
+    t.test(f"{label}: introspect without creds throws",
+           h("try { auth.introspect('x'); return json('no-throw', null); } catch (e) { return json('threw', null); }", config=cfg),
+           data_eq("threw"))
+
+    if introspect:
+        icfg = {"auth": {"issuer": issuer, "client_id": introspect["client_id"], "client_secret": introspect["client_secret"]}}
+        t.test(f"{label}: introspect(valid) -> active:true",
+               h("return json(auth.introspect(ctx.token).claims.active, null);", ctx, icfg),
+               data_eq(True))
+        t.test(f"{label}: introspect(bogus) -> active:false",
+               h("return json(auth.introspect('bogus').claims.active, null);", config=icfg),
+               data_eq(False))
+
+
+def run_auth_tests(t: Runner):
+    """Run the auth suite against whichever providers are reachable."""
+    # Keycloak — mint a token + a confidential client live.
+    if _discovery_ok(KEYCLOAK_ISSUER):
+        kc_token = _keycloak_token()
+        if kc_token:
+            test_auth_provider(t, "Keycloak", KEYCLOAK_ISSUER, kc_token, _keycloak_introspect_creds(kc_token))
+        else:
+            print("\n  \033[33mSKIP\033[0m Keycloak auth tests (reachable but token mint failed)\n")
+    else:
+        print("\n  \033[33mSKIP\033[0m Keycloak auth tests (not running — use: docker compose up -d keycloak)\n")
+
+    # ZITADEL — needs a service-account PAT (introspection needs an API app, so it is
+    # exercised on Keycloak; ZITADEL covers discovery + userinfo + the throw path).
+    zt_token = _zitadel_token()
+    if zt_token and _discovery_ok(ZITADEL_ISSUER):
+        test_auth_provider(t, "Zitadel", ZITADEL_ISSUER, zt_token, None)
+    elif zt_token:
+        print("\n  \033[33mSKIP\033[0m Zitadel auth tests (PAT set but issuer unreachable)\n")
+    else:
+        print("\n  \033[33mSKIP\033[0m Zitadel auth tests (no ZITADEL_PAT — see docker-compose.yml)\n")
+
+
 # -- Main --------------------------------------------------------------------
 
 def _wait_for_server() -> bool:
@@ -438,6 +612,9 @@ def main():
         test_db_engine(t, "CockroachDB", CR_CONFIG)
     else:
         print("\n  \033[33mSKIP\033[0m CockroachDB tests (not running — use: docker compose up -d)\n")
+
+    # Auth tests — only against identity providers that are reachable
+    run_auth_tests(t)
 
     t.summary()
 

@@ -63,6 +63,7 @@ POST /execute
 | `config.db`            | no       | PostgreSQL/CockroachDB connection (omit to disable `db.*`)              |
 | `config.mail`          | no       | SMTP relay connection (omit to disable `mail.*`)                        |
 | `config.s3`            | no       | S3/R2/MinIO connection for presigned URLs (omit to disable `s3.*`)      |
+| `config.auth`          | no       | OIDC/IAM issuer for `auth.*` token validation (omit to disable `auth.*`) |
 
 ### Response
 
@@ -453,6 +454,35 @@ The plaintext never enters JS — it stays Rust-side and is resolved only by the
 sink, so a script can only ever return the `"[secret:NAME]"` placeholder. There is **no**
 output scrubber and **no** reveal escape hatch (both evadable/transmit-to-observable). Use
 high-entropy secrets. See [`docs/09-sys.md`](docs/09-sys.md).
+
+### auth — OIDC/IAM identity
+
+Resolves a caller's bearer token to its claims (`config.auth`, trusted — the issuer is
+operator-supplied, so no SSRF guard). Validation is **delegated to the IAM** (a `userinfo`
+round-trip), so there is no local JWT/JWKS crypto stack. Endpoints are auto-discovered from
+`{issuer}/.well-known/openid-configuration` unless overridden.
+
+```js
+function handler(ctx) {
+  var u = auth.user_info(ctx.token); // { ok:true, claims:{sub,email,…} } | { ok:false, status, code }
+  if (!u.ok) return json(null, { code: "unauthorized" });
+  // RFC 7662 introspection (needs config.auth.client_id/secret) — see token liveness:
+  // var r = auth.introspect(ctx.token); if (!r.claims.active) { ... }
+  return json({ id: u.claims.sub }, null);
+}
+```
+
+**Hybrid error surface:** an invalid/expired/under-scoped token is the *caller's* business
+flow, so it returns **in-band** (`{ ok:false, status, code:"AUTH_INVALID_TOKEN" }`, never
+thrown — like `api`). Infra failures the handler can't act on (issuer down → retryable
+`AUTH_UNAVAILABLE`; misconfig → `AUTH_REQUEST`) **throw** a tagged capability error (like
+`db`/`mail`). Per-token results are cached within a request (a repeat lookup makes no round
+trip and costs no op). Each call is metered in `meta.auth_requests`.
+
+Config: `{ "auth": { "issuer": "https://login.example.com", "userinfo_url": null,
+"introspect_url": null, "client_id": "", "client_secret": "", "timeout_ms": 10000 } }`. Only
+`issuer` is required (the rest are discovered / introspection-only). See
+[`docs/10-auth.md`](docs/10-auth.md).
 
 ## Configuration
 

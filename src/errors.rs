@@ -56,6 +56,8 @@ pub(crate) enum ErrorSource {
     Redis,
     /// The `amq` (`RabbitMQ`) capability.
     Amq,
+    /// The `auth` (OIDC/IAM) capability.
+    Auth,
 }
 
 impl ErrorSource {
@@ -72,6 +74,7 @@ impl ErrorSource {
             "api" => Some(Self::Api),
             "redis" => Some(Self::Redis),
             "amq" => Some(Self::Amq),
+            "auth" => Some(Self::Auth),
             _ => None,
         }
     }

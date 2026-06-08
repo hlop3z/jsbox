@@ -14,6 +14,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::amq::{AmqConfig, AmqMetric};
+use crate::auth::{AuthConfig, AuthMetric};
 use crate::db::{DbConfig, DbMetric};
 use crate::engine::{self, EngineError, ExecOutcome, ExecParams, ExecResult};
 use crate::errors::{ErrorCategory, ErrorEnvelope, ErrorOwner, ErrorSource};
@@ -67,6 +68,9 @@ pub(crate) struct RequestConfig {
     /// `RabbitMQ` config (omit to disable `amq` in JS).
     #[serde(default)]
     pub(crate) amq: Option<AmqConfig>,
+    /// Auth (OIDC/IAM) config (omit to disable `auth` in JS).
+    #[serde(default)]
+    pub(crate) auth: Option<AuthConfig>,
     /// `$sys` env/secrets context (omit to leave `$sys.env`/`$sys.secrets` empty).
     #[serde(default)]
     pub(crate) sys: Option<SysConfig>,
@@ -92,6 +96,8 @@ struct ExecMetrics {
     redis: Vec<RedisMetric>,
     /// `RabbitMQ` operation metrics.
     amq: Vec<AmqMetric>,
+    /// Auth operation metrics.
+    auth: Vec<AuthMetric>,
 }
 
 /// Metadata computed by Rust.
@@ -120,6 +126,8 @@ struct Meta {
     redis_requests: Vec<RedisMetric>,
     /// `RabbitMQ` operations made by the script.
     amq_requests: Vec<AmqMetric>,
+    /// Auth operations made by the script.
+    auth_requests: Vec<AuthMetric>,
 }
 
 impl Meta {
@@ -137,6 +145,7 @@ impl Meta {
             s3_requests: Vec::new(),
             redis_requests: Vec::new(),
             amq_requests: Vec::new(),
+            auth_requests: Vec::new(),
         }
     }
 
@@ -148,6 +157,7 @@ impl Meta {
         self.s3_requests = metrics.s3;
         self.redis_requests = metrics.redis;
         self.amq_requests = metrics.amq;
+        self.auth_requests = metrics.auth;
         self
     }
 }
@@ -226,6 +236,7 @@ pub(crate) async fn execute(
     let s3_config = req.config.s3;
     let redis_config = req.config.redis;
     let amq_config = req.config.amq;
+    let auth_config = req.config.auth;
     let sys_config = req.config.sys;
 
     let start = Instant::now();
@@ -244,6 +255,7 @@ pub(crate) async fn execute(
             s3_config: s3_config.as_ref(),
             redis_config: redis_config.as_ref(),
             amq_config: amq_config.as_ref(),
+            auth_config: auth_config.as_ref(),
             sys_config: sys_config.as_ref(),
             max_ops: engine_cfg.max_ops,
             allow_private_targets,
@@ -265,6 +277,7 @@ pub(crate) async fn execute(
                 s3: exec.s3_metrics,
                 redis: exec.redis_metrics,
                 amq: exec.amq_metrics,
+                auth: exec.auth_metrics,
             };
             let meta = base_meta().with_metrics(metrics);
             match exec.outcome {
