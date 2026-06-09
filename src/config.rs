@@ -16,6 +16,18 @@ use serde::Deserialize;
 
 use crate::bytesize::deserialize_byte_size;
 
+/// Empirically-measured heap cost of parsing a JSON context into `QuickJS` objects, as
+/// a multiple of the JSON text size (~4×, stable across 16/32/64 MB memory limits). A
+/// context larger than `memory_limit / PARSE_HEAP_FACTOR` cannot be parsed at all, so
+/// this is the hard ceiling the load-time invariant enforces — keeping an oversized
+/// context a clean `CONTEXT_TOO_LARGE` (400) instead of a runtime out-of-memory.
+const PARSE_HEAP_FACTOR: usize = 4;
+
+/// Divisor for the auto-derived `max_context_size` (used when it is left at `0`).
+/// Parsing costs ~4× and a typical transform needs ~6× the text size, so dividing the
+/// memory limit by 8 leaves headroom for real handler work, not just loading the input.
+const CONTEXT_LIMIT_DIVISOR: usize = 8;
+
 /// Top-level configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -72,7 +84,10 @@ pub(crate) struct EngineConfig {
     /// Maximum script size (e.g. `"1mb"`, default 1 MB).
     #[serde(deserialize_with = "deserialize_byte_size")]
     pub(crate) max_script_size: usize,
-    /// Maximum context payload size (e.g. `"5mb"`, default 5 MB).
+    /// Maximum context payload size. Leave at `0` (the default) to auto-derive
+    /// `memory_limit / CONTEXT_LIMIT_DIVISOR` — change `memory_limit` alone and this
+    /// tracks it. An explicit value is capped at `memory_limit / PARSE_HEAP_FACTOR`
+    /// (the parse ceiling) at load; exceeding it is a startup error.
     #[serde(deserialize_with = "deserialize_byte_size")]
     pub(crate) max_context_size: usize,
     /// Maximum HTTP/DB operations per execution (default 50).
@@ -125,7 +140,7 @@ impl Default for EngineConfig {
             timeout_ms: 4000,                    // 4s balanced default
             pool_size: 0,                        // Auto
             max_script_size: 1024 * 1024,        // 1mb
-            max_context_size: 10 * 1024 * 1024,  // 10mb
+            max_context_size: 0,                 // 0 = auto: memory_limit / CONTEXT_LIMIT_DIVISOR
             max_ops: 1500,                       // safe cap for API workloads
         }
     }
@@ -150,6 +165,41 @@ impl EngineConfig {
             .saturating_add(self.max_context_size)
             .saturating_add(64 * 1024)
     }
+
+    /// Resolves the auto-derived context limit and enforces the parse-headroom
+    /// invariant. Run once at load so the live config can never sit in a state where a
+    /// byte-legal context is too large to parse — which would surface as a runtime
+    /// out-of-memory instead of an up-front `CONTEXT_TOO_LARGE`.
+    ///
+    /// `max_context_size == 0` means "auto": derive `memory_limit / CONTEXT_LIMIT_DIVISOR`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an explicit `max_context_size` exceeds the parse ceiling
+    /// `memory_limit / PARSE_HEAP_FACTOR`.
+    fn resolve_limits(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if self.max_context_size == 0 {
+            self.max_context_size =
+                self.memory_limit.checked_div(CONTEXT_LIMIT_DIVISOR).unwrap_or(0);
+        }
+        let parse_ceiling = self.memory_limit.checked_div(PARSE_HEAP_FACTOR).unwrap_or(0);
+        if self.max_context_size > parse_ceiling {
+            return Err(format!(
+                "max_context_size ({} bytes) exceeds the parse ceiling memory_limit/{} ({} bytes): \
+                 a context that large cannot be parsed within the {}-byte memory limit and would \
+                 fail at runtime. Lower it to <= {} bytes, omit it to auto-derive memory_limit/{}, \
+                 or raise memory_limit.",
+                self.max_context_size,
+                PARSE_HEAP_FACTOR,
+                parse_ceiling,
+                self.memory_limit,
+                parse_ceiling,
+                CONTEXT_LIMIT_DIVISOR,
+            )
+            .into());
+        }
+        Ok(())
+    }
 }
 
 impl Config {
@@ -157,14 +207,16 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file exists but cannot be read or parsed.
+    /// Returns an error if the file exists but cannot be read or parsed, or if the
+    /// resolved limits violate the parse-headroom invariant (see [`EngineConfig::resolve_limits`]).
     pub(crate) fn load(path: &Path) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-
-        let contents = fs::read_to_string(path)?;
-        let config: Self = serde_json::from_str(&contents)?;
+        let mut config = if path.exists() {
+            let contents = fs::read_to_string(path)?;
+            serde_json::from_str::<Self>(&contents)?
+        } else {
+            Self::default()
+        };
+        config.engine.resolve_limits()?;
         Ok(config)
     }
 }

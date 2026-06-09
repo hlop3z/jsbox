@@ -8,7 +8,8 @@
 //! On failure the engine **classifies** the outcome into a typed [`EngineError`]
 //! (see `docs/99-errors.md`): a handler throw is inspected *structurally* via
 //! `ctx.catch()` — a `__jsbox` tag ⇒ a capability error, otherwise a script error —
-//! and the timeout / memory signals (which JS cannot see) are folded in here.
+//! and the timeout signal (which JS cannot see) is folded in here. Out-of-memory is
+//! caught earlier, when an oversized context fails to parse.
 
 use std::error::Error;
 use std::fmt::Display;
@@ -371,7 +372,18 @@ fn call_handler(
     timed_out: &AtomicBool,
     timeout: Duration,
 ) -> Result<ExecOutcome, EngineError> {
-    let parsed_ctx: JsValue<'_> = qctx.json_parse(context_json).map_err(EngineError::internal)?;
+    // The context is already syntactically valid JSON (validated as `RawValue` at the
+    // HTTP layer), so the only realistic `json_parse` failure is the object graph
+    // exceeding the sandbox memory limit. Surface it as a clean `MemoryLimit` (422)
+    // rather than an `Internal` (500) server fault. The config invariant
+    // (`max_context_size <= memory_limit / 4`) keeps this path unreachable in practice.
+    let parsed_ctx: JsValue<'_> = match qctx.json_parse(context_json) {
+        Ok(value) => value,
+        Err(_parse_err) => {
+            drop(qctx.catch()); // consume the pending exception before returning
+            return Ok(ExecOutcome::Error(EngineError::MemoryLimit));
+        }
+    };
 
     let handler = match qctx.globals().get::<_, Function<'_>>("handler") {
         Ok(func) => func,
@@ -397,8 +409,10 @@ fn classify_eval_error(qctx: &Ctx<'_>) -> EngineError {
     EngineError::Syntax(message)
 }
 
-/// Classifies a handler throw structurally (timeout flag → `__jsbox` tag → memory →
-/// script), without parsing message text.
+/// Classifies a handler throw structurally (timeout flag → `__jsbox` tag → script),
+/// without parsing message text. Out-of-memory is handled earlier, at context parse
+/// (see [`call_handler`]) — a handler that over-allocates instead surfaces as a script
+/// error, which correctly attributes it to the developer's code.
 fn classify_throw(qctx: &Ctx<'_>, timed_out: &AtomicBool, timeout: Duration) -> EngineError {
     if timed_out.load(Ordering::Relaxed) {
         return EngineError::Timeout { limit_ms: timeout.as_millis() };
@@ -413,9 +427,6 @@ fn classify_throw(qctx: &Ctx<'_>, timed_out: &AtomicBool, timeout: Duration) -> 
 
     if let Some(cap) = read_capability_tag(qctx, obj, stack.clone()) {
         return EngineError::Capability(cap);
-    }
-    if read_str_prop(obj, "name").as_deref() == Some("InternalError") {
-        return EngineError::MemoryLimit;
     }
     let message = read_str_prop(obj, "message").unwrap_or_default();
     EngineError::Script { message, stack }

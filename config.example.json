@@ -10,7 +10,7 @@
     "timeout_ms": 4000,
     "pool_size": 0,
     "max_script_size": "1mb",
-    "max_context_size": "10mb",
+    "max_context_size": 0,
     "max_ops": 1500
   }
 }

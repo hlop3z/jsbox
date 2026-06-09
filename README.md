@@ -501,7 +501,7 @@ Optional `config.json` in the working directory. All fields have defaults:
     "timeout_ms": 4000,
     "pool_size": 0,
     "max_script_size": "1mb",
-    "max_context_size": "10mb",
+    "max_context_size": 0,
     "max_ops": 1500
   }
 }
@@ -516,10 +516,12 @@ Optional `config.json` in the working directory. All fields have defaults:
 | `timeout_ms`       | `4000`     | Max wall-clock execution time                                                                                                          |
 | `pool_size`        | `0` (auto) | QuickJS runtime pool size (0 = CPU cores)                                                                                              |
 | `max_script_size`  | `"1mb"`    | Max script source size                                                                                                                 |
-| `max_context_size` | `"10mb"`   | Max context JSON size                                                                                                                  |
+| `max_context_size` | `0` (auto) | Max context JSON size. `0` auto-derives `memory_limit / 8`; explicit values are capped at `memory_limit / 4` (boot fails if exceeded).                                                                                                                  |
 | `max_ops`          | `1500`     | Max HTTP + DB operations per execution                                                                                                 |
 
 Size fields accept `"8mb"`, `"256kb"`, `"1gb"`, or plain numbers in bytes.
+
+**Context vs. memory.** Parsing a JSON context into JS objects costs ~4× its text size in heap, and a typical transform needs ~6×. So `max_context_size` is tied to `memory_limit`: leave it `0` and it auto-derives `memory_limit / 8` (room to parse *and* process the input), while any explicit value is hard-capped at `memory_limit / 4` — the point past which a context can't even be parsed. Change `memory_limit` and the context limit follows; to handle larger contexts, raise `memory_limit` rather than lifting the context cap alone.
 
 ## Sandbox
 

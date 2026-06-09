@@ -129,7 +129,7 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `SYNTAX_ERROR`        | no    | developer | The script didn't parse.                                       |
 | `HANDLER_NOT_DEFINED` | no    | developer | No `handler(ctx)` function.                                    |
 | `TIMEOUT`             | no    | developer | Ran past the time limit.                                       |
-| `MEMORY_LIMIT`        | no    | developer | Used too much memory.                                          |
+| `MEMORY_LIMIT`        | no    | developer | The context was too big to load into the memory limit.         |
 | `MALFORMED_RESPONSE`  | no    | developer | Returned something that isn't a `json(...)` answer.            |
 | `INTERNAL`            | yes   | operator  | The robot's own fault (rare) — a 500.                          |
 
