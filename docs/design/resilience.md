@@ -136,9 +136,34 @@ The Tier 2 refactor is where teams get hurt. Rules we adopt up front:
    execution is isolated to a blocking task — any async refactor must respect this and
    keep the JS context off the async boundary.
 
-## Validation: A/B stress testing (planned — the next step)
+## Validation: A/B stress testing (`stress_test.py`)
 
-We do not trust the model on reasoning alone; we measure it. The plan:
+We do not trust the model on reasoning alone; we measure it. `stress_test.py` manages
+the server lifecycle itself (one variant at a time, so config is the only variable),
+floods `/execute` with concurrent slow queries through PgBouncer, and interleaves a
+"victim" — a well-behaved tenant's normal fast query — to measure noisy-neighbor impact.
+
+### Measured (2026-06; 40 concurrent, `pg_sleep(2)` via PgBouncer, ~8 s)
+
+| | A (baseline) | B (Tier 0+1) |
+| --- | --- | --- |
+| flood latency p99 | **8.01 s** | **0.04 s** (228× lower) |
+| shed as 429 | 0% (queues into the pool) | 100% (fails fast) |
+| flood outcomes | 28 OK, 48 `DB_TIMEOUT`, 9 `DB_CANCELED` | 5 OK, 54 `DB_CANCELED`, rest `OVERLOADED` |
+| victim (good tenant) p99 | 5.56 s | 0.03 s |
+| victim succeeded / shed | 0 / 0 (dragged into the queue) | 0 / 28 (shed by the global bulkhead) |
+
+Reading it: under overload A piles every request into the saturated PgBouncer pool —
+tail latency climbs to 8 s (worse than the 4 s engine timeout, because even *connecting*
+queues) and most requests time out. B sheds the excess as instant 429s and holds p99 at
+40 ms. **But** the victim result exposes a real gap: B's bulkhead is *global*, so it
+rejects the good tenant alongside the flood (0 succeeded, 28 shed) — it bounds the
+victim's latency but doesn't let it through. **This is the concrete motivation for Tier 5
+(per-tenant fairness):** a global bulkhead protects the system but can't give a healthy
+tenant priority over a noisy one. The harness turning this into a number is exactly its
+job.
+
+### The plan (variants, knobs, hypotheses)
 
 - **Variants.** A = baseline (bulkhead disabled, `max_concurrent_executions` very high,
   no clamp) vs B = Tier 0+1 enabled. Same build, config-flagged, so the only variable
