@@ -5,6 +5,10 @@ Status: **proposal — not implemented, planning only.** Companion to
 [pooled-capabilities.md](pooled-capabilities.md).
 Revision 2: the loader-function shape (`use("name")`) replaced auto-injected
 globals as the proposed Phase A — see "Loader API" below for why.
+Revision 3 (explored 2026-06): **native ES modules are feasible** — this reverses
+the earlier "ESM out of scope" call. rquickjs ships the full module loader, and a
+spike proved synchronous `import`/`export` in jsbox's pooled `spawn_blocking` model.
+See "Native ESM" below; the `use()`-vs-ESM decision is now a live design choice.
 
 ## Idea
 
@@ -69,6 +73,99 @@ The meta-lesson across all seven: platforms get into trouble when shared code
 acquires **its own lifecycle** (versioning, resolution, mutation, trust) separate
 from the deployment lifecycle. Phase A of the script registry deliberately has no
 such lifecycle — modules must inherit that property, not erode it.
+
+## Native ESM: what rquickjs gives us (Revision 3 — explored 2026-06)
+
+The original doc deferred real ES modules ("would change jsbox's whole eval model").
+That call was wrong, and exploring the dependency proved it. **QuickJS is a native ES
+module engine, and rquickjs 0.12 exposes the whole surface** — we already depend on it.
+
+### What's in the box (verified against `rquickjs-core-0.12.0`)
+
+- **`Module::declare(ctx, name, src)` / `.eval()`** — compile an ESM source (with
+  `import`/`export`) to a `Module`, then evaluate it. `Module::namespace()` → an `Object`
+  of its exports; `module.get("quote")` reads one.
+- **Pluggable in-memory loader.** `Runtime::set_loader(resolver, loader)` (behind the
+  `loader` feature) takes a `Resolver` + `Loader`. The built-in `BuiltinResolver` (a set of
+  known names) + `BuiltinLoader` (a `name → source` map) **are the module registry** — no
+  filesystem, no network, populated once at startup. Custom impls holding an
+  `Arc<ModuleRegistry>` are trivial if we want lazy source lookup.
+- **Synchronous settle.** Module evaluation returns a `Promise` (QuickJS allows top-level
+  await), but `Promise::finish()` pumps the job queue to completion **synchronously** and
+  returns the value. Since every jsbox capability is sync FFI, a module never genuinely
+  suspends — it settles on the first pump. **No async runtime is introduced**; this fits the
+  `spawn_blocking` model exactly. The existing wall-clock interrupt still bounds it (the
+  interrupt fires during job execution).
+- **Bytecode for free.** `Module::write(WriteOptions)` → bytecode; `unsafe Module::load(bytes)`
+  reads it back. The earlier "bytecode caching" Phase-B+ idea is native for modules — precompile
+  at startup, skip per-request parse.
+
+### The spike (proof, since reverted)
+
+A throwaway test under the `loader` feature passed on the first real run:
+
+```rust
+// registry: "acme/pricing" -> `export function quote(items){ return items*10; }`
+let resolver = BuiltinResolver::default().with_module("acme/pricing");
+let loader = BuiltinLoader::default().with_module("acme/pricing", PRICING_SRC);
+rt.set_loader(resolver, loader);
+// consumer module imports it and re-exports a computed value:
+//   import { quote } from "acme/pricing"; export const total = quote(5);
+let (module, promise) = Module::declare(ctx, "main", SRC)?.eval()?;
+promise.finish::<()>()?;                       // ← synchronous, no executor
+let total: i32 = module.namespace()?.get("total")?;   // == 50
+```
+
+A second assertion proved the **security property**: an `import` of an unregistered
+specifier (`"/etc/passwd"`) fails to resolve — because we wire only the in-memory
+`BuiltinResolver`, never `FileResolver`. Scripts can reach **only** registered modules.
+
+### Two integration shapes (the real decision)
+
+QuickJS has two eval modes that do **not** share scope: **script** (what jsbox uses now —
+the user's `function handler(ctx)` becomes a global) and **module** (own scope, strict,
+`import`/`export`, evaluates to a namespace). That split is what forces a choice:
+
+**Shape A — ESM modules, script handler (smallest change).** Module *files* are native ESM
+(`export function quote(){}`), authored with npm/esbuild and dropped in. The handler stays a
+plain script and pulls them via `use("acme/pricing")`, where `use` is a native function that
+calls `Module::import(ctx, name).finish()` and returns the namespace (memoized per request).
+The handler contract, `sanitize_globals`, and the whole request path are untouched; only the
+module-loading seam is new. This is the natural evolution of the Revision 2 `use()` design —
+the difference is the *module format* becomes real ESM instead of a completion-value file.
+
+**Shape B — handler-as-module (the full "1:1 ESM" experience).** The user script is itself
+compiled as a module and `export`s its handler; the handler then uses native
+`import { quote } from "acme/pricing"` directly. Cost: the request path changes
+(`eval_script` → `Module::evaluate` + read `handler` from the namespace), the
+"handler not defined" classification moves, and it's a **breaking change** to how handlers
+are authored (`function handler` → `export function handler` / `export default`).
+Backward-compat is possible by sniffing the source (`import`/`export` present → module, else
+script — QuickJS even has `JS_DetectModule`), at the price of a dual-mode eval path.
+
+### "ESM or IIFE" — the npm-authoring goal
+
+The stated goal ("author with npm, drop in as ESM or IIFE") is satisfied by **standardizing
+on ESM** and letting the bundler do its job: `esbuild --bundle --format=esm --packages=bundle`
+turns a TS/npm module into one self-contained `.mjs` with no bare specifiers left to resolve
+at runtime (any remaining `import` is of *another jsbox module*, which the registry loader
+resolves). IIFE/CJS bundles still work too — but via the *old* completion-value `use()` path,
+a different code branch; supporting both means `use()` sniffs the format. Recommendation: make
+**ESM the canonical format** (it is the 2026 default, every bundler emits it, and it maps 1:1
+to a future where handlers are modules), and treat legacy-IIFE as an optional convenience, not
+a parallel contract.
+
+### Cost and the revised recommendation
+
+Build cost is one feature flag (`loader`) — a small amount of resolver/loader machinery, no
+new crypto/native deps, musl-clean. Runtime cost is one module instantiation per requested
+module (same class as the capability-wrapper evals today; bytecode caching erases it later).
+
+Recommendation: **adopt native ESM as the module format (Shape A first).** It directly answers
+"make modules use `export`," keeps the blast radius tiny, and leaves Shape B (handler-as-module)
+as a clean later escalation if the `import { x } from` ergonomics in handlers prove worth the
+breaking change. None of this changes the trigger question (Q1 below): build it when 2–3 real
+helpers exist, not before — the difference is that *when* we build it, the format is ESM.
 
 ## Loader API: `use("name")` — the proposed shape (Phase A, when/if implemented)
 
@@ -145,8 +242,11 @@ cycle-detection logic (~20 lines).
 - Runtime module registration/mutation (same reasoning as script-registry Phase B).
 - Version ranges or any resolution algorithm (transitive `use` is allowed, but a
   name maps to exactly one file — no versions, no fallbacks, no search paths).
-- ES modules / `import` syntax — `use()` is the only loader; ESM would change the
-  whole eval model and is deferred until something forces it.
+- ~~ES modules / `import` syntax — `use()` is the only loader; ESM would change the
+  whole eval model and is deferred until something forces it.~~ **Superseded by
+  Revision 3** (see "Native ESM" above): rquickjs makes synchronous ESM feasible, and it
+  is now the recommended module format. `use()` survives as the sync bridge for a
+  script-mode handler (Shape A); native `import` in the handler is the Shape-B escalation.
 - `Object.freeze` on module globals: considered and **deferred** — it adds a false
   sense of integrity (deep-freeze is leaky: prototypes, closures) while breaking
   legitimate test-stubbing patterns. Revisit only with a concrete threat it solves.
