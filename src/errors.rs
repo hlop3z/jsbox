@@ -121,7 +121,11 @@ pub(crate) struct Fault {
 impl Fault {
     /// Builds a fault from a `code`, retry hint, and responsible owner.
     pub(crate) const fn new(code: &'static str, retryable: bool, owner: ErrorOwner) -> Self {
-        Self { code, retryable, owner }
+        Self {
+            code,
+            retryable,
+            owner,
+        }
     }
 }
 
@@ -174,12 +178,10 @@ struct InbandFault {
 }
 
 /// Last-resort JSON if a [`CapabilityFault`] ever fails to serialize.
-const FALLBACK_FAULT_JSON: &str =
-    r#"{"error":"internal error","code":"INTERNAL","retryable":true,"owner":"operator","source":"engine"}"#;
+const FALLBACK_FAULT_JSON: &str = r#"{"error":"internal error","code":"INTERNAL","retryable":true,"owner":"operator","source":"engine"}"#;
 
 /// Last-resort JSON if an [`ApiInbandError`] ever fails to serialize.
-const FALLBACK_API_JSON: &str =
-    r#"{"status":0,"error":{"code":"HTTP_ERROR","retryable":true,"owner":"operator","source":"api"}}"#;
+const FALLBACK_API_JSON: &str = r#"{"status":0,"error":{"code":"HTTP_ERROR","retryable":true,"owner":"operator","source":"api"}}"#;
 
 /// Builds the FFI failure JSON a *throwing* capability returns (`db`/`mail`/`s3`).
 ///

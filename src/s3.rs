@@ -21,16 +21,16 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::blocking::Client;
 use reqwest::redirect;
 use rquickjs::{Ctx, Function, Value as JsValue};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::bytesize::deserialize_byte_size;
@@ -65,11 +65,19 @@ struct S3Error {
 impl S3Error {
     /// Signing / payload / validation failure (`S3_ERROR`, deterministic).
     const fn signing(message: String) -> Self {
-        Self { fault: S3_FALLBACK, message, details: None }
+        Self {
+            fault: S3_FALLBACK,
+            message,
+            details: None,
+        }
     }
     /// Object store unreachable or non-2xx (`S3_UPSTREAM`, retryable).
     const fn upstream(message: String) -> Self {
-        Self { fault: S3_UPSTREAM, message, details: None }
+        Self {
+            fault: S3_UPSTREAM,
+            message,
+            details: None,
+        }
     }
     /// Object store returned a non-2xx status, captured as `{http_status}` detail.
     fn upstream_status(message: String, status: u16) -> Self {
@@ -81,7 +89,11 @@ impl S3Error {
     }
     /// Deletion attempted without `allow_delete` (`S3_FORBIDDEN`).
     const fn forbidden(message: String) -> Self {
-        Self { fault: S3_FORBIDDEN, message, details: None }
+        Self {
+            fault: S3_FORBIDDEN,
+            message,
+            details: None,
+        }
     }
 }
 
@@ -157,9 +169,13 @@ pub(crate) struct S3Config {
 }
 
 /// Default presigned-link lifetime in seconds (15 minutes).
-const fn default_expires() -> u64 { 900 }
+const fn default_expires() -> u64 {
+    900
+}
 /// Default lifetime cap in seconds (`SigV4` maximum, 7 days).
-const fn default_max_expires() -> u64 { 604_800 }
+const fn default_max_expires() -> u64 {
+    604_800
+}
 
 /// Metric recorded for each S3 operation.
 #[derive(Debug, Clone, Serialize)]
@@ -263,8 +279,13 @@ pub(crate) fn inject_s3(
             // `usage` paginates and meters each list request itself, so it is
             // handled here rather than through the single-metric `dispatch` path.
             if action == "usage" {
-                return match do_usage(&owned, &payload_json, allow_private, &metrics_clone, max_ops)
-                {
+                return match do_usage(
+                    &owned,
+                    &payload_json,
+                    allow_private,
+                    &metrics_clone,
+                    max_ops,
+                ) {
                     Ok(json) => json,
                     Err(err) => s3_error_json(err),
                 };
@@ -333,7 +354,9 @@ fn do_presign(
         ));
     }
     if payload.key.trim().is_empty() {
-        return Err(S3Error::signing("s3 sign_url requires a non-empty key".to_owned()));
+        return Err(S3Error::signing(
+            "s3 sign_url requires a non-empty key".to_owned(),
+        ));
     }
     let expires = clamp_expires(payload.expires, config);
 
@@ -360,7 +383,11 @@ fn do_presign(
         serde_json::to_string(&url).map_err(|err| format!("failed to encode url: {err}"))?;
     let json = format!("{{\"url\":{escaped_url},\"method\":\"{method}\",\"expires\":{expires}}}");
 
-    Ok(PresignOutcome { json, method: method.to_owned(), expires })
+    Ok(PresignOutcome {
+        json,
+        method: method.to_owned(),
+        expires,
+    })
 }
 
 // -- Presign POST (browser form upload with size policy) --------------------
@@ -379,7 +406,9 @@ fn do_presign_post(
         serde_json::from_str(payload_json).map_err(|err| format!("invalid s3 payload: {err}"))?;
 
     if payload.key.trim().is_empty() {
-        return Err(S3Error::signing("s3 upload_form requires a non-empty key".to_owned()));
+        return Err(S3Error::signing(
+            "s3 upload_form requires a non-empty key".to_owned(),
+        ));
     }
     let max_bytes = config.max_upload_size;
     if max_bytes == 0 {
@@ -392,8 +421,10 @@ fn do_presign_post(
     let (amz_date, datestamp, now_secs) = current_timestamps()?;
     let (scheme, host) = resolve_host(config, allow_private)?;
     let expiration = iso8601_expiration(now_secs, expires)?;
-    let credential =
-        format!("{}/{datestamp}/{}/{SERVICE}/aws4_request", config.access_key, config.region);
+    let credential = format!(
+        "{}/{datestamp}/{}/{SERVICE}/aws4_request",
+        config.access_key, config.region
+    );
 
     let policy = json!({
         "expiration": expiration,
@@ -429,7 +460,11 @@ fn do_presign_post(
     let json_out = serde_json::to_string(&response)
         .map_err(|err| format!("failed to encode response: {err}"))?;
 
-    Ok(PresignOutcome { json: json_out, method: "POST".to_owned(), expires })
+    Ok(PresignOutcome {
+        json: json_out,
+        method: "POST".to_owned(),
+        expires,
+    })
 }
 
 /// Builds the POST target URL for the configured addressing mode.
@@ -467,15 +502,23 @@ fn do_usage(
 
     let (scheme, host) = resolve_host(config, allow_private)?;
     let client = build_blocking_client()?;
-    let target = ListTarget { config, scheme: &scheme, host: &host, prefix: &payload.prefix };
+    let target = ListTarget {
+        config,
+        scheme: &scheme,
+        host: &host,
+        prefix: &payload.prefix,
+    };
 
     let mut total_bytes: u64 = 0;
     let mut total_objects: u64 = 0;
     let mut token: Option<String> = None;
 
     loop {
-        sandbox::check_op_limit(metrics, max_ops)
-            .map_err(|err| S3Error { fault: S3_OP_LIMIT, message: err, details: None })?;
+        sandbox::check_op_limit(metrics, max_ops).map_err(|err| S3Error {
+            fault: S3_OP_LIMIT,
+            message: err,
+            details: None,
+        })?;
         let start = Instant::now();
         let (page_bytes, page_objects, next) =
             fetch_list_page(&client, &target, token.as_deref()).map_err(S3Error::upstream)?;
@@ -552,12 +595,14 @@ fn fetch_list_page(
         .map_err(|err| format!("s3 list read failed: {err}"))?;
     if !status.is_success() {
         let snippet: String = body.chars().take(200).collect();
-        return Err(format!("s3 list returned HTTP {}: {snippet}", status.as_u16()));
+        return Err(format!(
+            "s3 list returned HTTP {}: {snippet}",
+            status.as_u16()
+        ));
     }
     let (bytes, objects) = sum_sizes(&body)?;
-    let next =
-        extract_tag(&body, "<NextContinuationToken>", "</NextContinuationToken>")
-            .filter(|tok| !tok.is_empty());
+    let next = extract_tag(&body, "<NextContinuationToken>", "</NextContinuationToken>")
+        .filter(|tok| !tok.is_empty());
     Ok((bytes, objects, next))
 }
 
@@ -686,7 +731,9 @@ fn do_delete(
     let payload: DeletePayload =
         serde_json::from_str(payload_json).map_err(|err| format!("invalid s3 payload: {err}"))?;
     if payload.key.trim().is_empty() {
-        return Err(S3Error::signing("s3 delete requires a non-empty key".to_owned()));
+        return Err(S3Error::signing(
+            "s3 delete requires a non-empty key".to_owned(),
+        ));
     }
 
     let (scheme, host) = resolve_host(config, allow_private)?;
@@ -760,7 +807,9 @@ fn build_delete_url(
         host,
     })?;
 
-    Ok(format!("{scheme}://{host}{canonical_uri}?{query}&X-Amz-Signature={signature}"))
+    Ok(format!(
+        "{scheme}://{host}{canonical_uri}?{query}&X-Amz-Signature={signature}"
+    ))
 }
 
 /// Inputs to the `SigV4` signing step (grouped to keep the arg count low).
@@ -792,8 +841,10 @@ fn sign(input: &SignInput<'_>) -> Result<String, String> {
         input.method, input.canonical_uri, input.query, input.host
     );
     let hashed_request = sha256_hex(canonical_request.as_bytes());
-    let string_to_sign =
-        format!("AWS4-HMAC-SHA256\n{}\n{}\n{hashed_request}", input.amz_date, input.scope);
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{hashed_request}",
+        input.amz_date, input.scope
+    );
 
     let signing_key = derive_signing_key(input.secret_key, input.datestamp, input.region)?;
     let signature_bytes = hmac_sha256(&signing_key, string_to_sign.as_bytes())?;
@@ -815,7 +866,11 @@ fn normalize_method(raw: &str) -> Result<&'static str, String> {
 
 /// Resolves the requested lifetime to `[1, max_expires]`, defaulting `0`.
 fn clamp_expires(requested: u64, config: &S3Config) -> u64 {
-    let base = if requested == 0 { config.expires } else { requested };
+    let base = if requested == 0 {
+        config.expires
+    } else {
+        requested
+    };
     base.clamp(1, config.max_expires.max(1))
 }
 
@@ -832,7 +887,9 @@ fn resolve_host(config: &S3Config, allow_private: bool) -> Result<(String, Strin
 
     // Only HTTP object stores are valid targets — never `file://` or any other scheme.
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return Err(format!("s3 endpoint scheme must be http or https, got '{scheme}'"));
+        return Err(format!(
+            "s3 endpoint scheme must be http or https, got '{scheme}'"
+        ));
     }
 
     let authority_clean = authority.split('/').next().unwrap_or(authority);
@@ -852,7 +909,10 @@ fn resolve_host(config: &S3Config, allow_private: bool) -> Result<(String, Strin
     if config.path_style {
         Ok((scheme.to_owned(), authority_clean.to_owned()))
     } else {
-        Ok((scheme.to_owned(), format!("{}.{host_only}{port_suffix}", config.bucket)))
+        Ok((
+            scheme.to_owned(),
+            format!("{}.{host_only}{port_suffix}", config.bucket),
+        ))
     }
 }
 
@@ -877,7 +937,11 @@ fn endpoint_port(scheme: &str, port_suffix: &str) -> Result<u16, String> {
             .parse::<u16>()
             .map_err(|_err| format!("invalid s3 endpoint port '{port_str}'"));
     }
-    Ok(if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 })
+    Ok(if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    })
 }
 
 /// Builds the encoded canonical URI path for the configured addressing mode.

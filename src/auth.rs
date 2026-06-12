@@ -18,11 +18,11 @@ use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::blocking::{Client, RequestBuilder};
 use rquickjs::{Ctx, Function, Value as JsValue};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::errors::{self, ErrorOwner, ErrorSource, Fault};
 use crate::sandbox::{self, Collector};
@@ -38,7 +38,9 @@ const AUTH_UNAVAILABLE: Fault = Fault::new("AUTH_UNAVAILABLE", true, ErrorOwner:
 const AUTH_REQUEST: Fault = Fault::new("AUTH_REQUEST", false, ErrorOwner::Operator);
 
 /// Default connect + read timeout in milliseconds.
-const fn default_timeout() -> u64 { 10_000 }
+const fn default_timeout() -> u64 {
+    10_000
+}
 
 /// Per-request auth configuration (operator-supplied, trusted).
 #[derive(Debug, Clone, Deserialize)]
@@ -98,7 +100,11 @@ struct AuthError {
 impl AuthError {
     /// Builds an error with no structured details.
     const fn new(fault: Fault, message: String) -> Self {
-        Self { fault, message, details: None }
+        Self {
+            fault,
+            message,
+            details: None,
+        }
     }
 
     /// Builds an error tagged with the upstream HTTP status.
@@ -209,7 +215,10 @@ fn run_call(call_ctx: &CallCtx<'_>, action: &str, token: &str) -> String {
     let start = Instant::now();
     let result = dispatch(call_ctx.state, action, token);
     let status = result.as_ref().map_or(0, |outcome| outcome.status);
-    sandbox::record(call_ctx.metrics, build_metric(action, call_ctx.host, status, start));
+    sandbox::record(
+        call_ctx.metrics,
+        build_metric(action, call_ctx.host, status, start),
+    );
 
     match result {
         Ok(outcome) => outcome.json,
@@ -243,15 +252,29 @@ fn do_user_info(state: &AuthState, token: &str) -> Result<AuthOutcome, AuthError
     let (status, body) = send(state.client.get(&url).bearer_auth(token))?;
 
     if (200..=299).contains(&status) {
-        return Ok(AuthOutcome { json: ok_claims_json(&parse_claims(&body, status)?), status });
+        return Ok(AuthOutcome {
+            json: ok_claims_json(&parse_claims(&body, status)?),
+            status,
+        });
     }
     if status == 401 || status == 403 {
-        return Ok(AuthOutcome { json: invalid_token_json(status), status });
+        return Ok(AuthOutcome {
+            json: invalid_token_json(status),
+            status,
+        });
     }
     if (500..=599).contains(&status) {
-        return Err(AuthError::with_status(AUTH_UNAVAILABLE, "userinfo unavailable", status));
+        return Err(AuthError::with_status(
+            AUTH_UNAVAILABLE,
+            "userinfo unavailable",
+            status,
+        ));
     }
-    Err(AuthError::with_status(AUTH_REQUEST, "userinfo request failed", status))
+    Err(AuthError::with_status(
+        AUTH_REQUEST,
+        "userinfo request failed",
+        status,
+    ))
 }
 
 // -- introspect -------------------------------------------------------------
@@ -278,12 +301,23 @@ fn do_introspect(state: &AuthState, token: &str) -> Result<AuthOutcome, AuthErro
     let (status, body) = send(request)?;
 
     if (200..=299).contains(&status) {
-        return Ok(AuthOutcome { json: ok_claims_json(&parse_claims(&body, status)?), status });
+        return Ok(AuthOutcome {
+            json: ok_claims_json(&parse_claims(&body, status)?),
+            status,
+        });
     }
     if (500..=599).contains(&status) {
-        return Err(AuthError::with_status(AUTH_UNAVAILABLE, "introspection unavailable", status));
+        return Err(AuthError::with_status(
+            AUTH_UNAVAILABLE,
+            "introspection unavailable",
+            status,
+        ));
     }
-    Err(AuthError::with_status(AUTH_REQUEST, "introspection request failed", status))
+    Err(AuthError::with_status(
+        AUTH_REQUEST,
+        "introspection request failed",
+        status,
+    ))
 }
 
 // -- Endpoint resolution (explicit override → OIDC discovery) ----------------
@@ -295,7 +329,10 @@ impl AuthState {
             return Ok(url.clone());
         }
         self.discover()?.userinfo.ok_or_else(|| {
-            AuthError::new(AUTH_REQUEST, "issuer exposes no userinfo_endpoint".to_owned())
+            AuthError::new(
+                AUTH_REQUEST,
+                "issuer exposes no userinfo_endpoint".to_owned(),
+            )
         })
     }
 
@@ -305,7 +342,10 @@ impl AuthState {
             return Ok(url.clone());
         }
         self.discover()?.introspect.ok_or_else(|| {
-            AuthError::new(AUTH_REQUEST, "issuer exposes no introspection_endpoint".to_owned())
+            AuthError::new(
+                AUTH_REQUEST,
+                "issuer exposes no introspection_endpoint".to_owned(),
+            )
         })
     }
 
@@ -329,7 +369,11 @@ impl AuthState {
         let url = format!("{base}/.well-known/openid-configuration");
         let (status, body) = send(self.client.get(&url))?;
         if !(200..=299).contains(&status) {
-            return Err(AuthError::with_status(AUTH_REQUEST, "OIDC discovery failed", status));
+            return Err(AuthError::with_status(
+                AUTH_REQUEST,
+                "OIDC discovery failed",
+                status,
+            ));
         }
         let doc: Value = serde_json::from_str(&body).map_err(|err| {
             AuthError::new(AUTH_REQUEST, format!("invalid discovery document: {err}"))
@@ -345,18 +389,21 @@ impl AuthState {
 
 /// Sends a prepared request, returning `(status, body)` or a classified error.
 fn send(builder: RequestBuilder) -> Result<(u16, String), AuthError> {
-    let response = builder.send().map_err(|err| AuthError::from_transport(&err))?;
+    let response = builder
+        .send()
+        .map_err(|err| AuthError::from_transport(&err))?;
     let status = response.status().as_u16();
-    let body = response
-        .text()
-        .map_err(|err| AuthError::new(AUTH_UNAVAILABLE, format!("failed to read response: {err}")))?;
+    let body = response.text().map_err(|err| {
+        AuthError::new(AUTH_UNAVAILABLE, format!("failed to read response: {err}"))
+    })?;
     Ok((status, body))
 }
 
 /// Parses an IAM response body into a claims object, erroring on non-JSON.
 fn parse_claims(body: &str, status: u16) -> Result<Value, AuthError> {
-    serde_json::from_str(body)
-        .map_err(|err| AuthError::with_status(AUTH_REQUEST, &format!("invalid claims JSON: {err}"), status))
+    serde_json::from_str(body).map_err(|err| {
+        AuthError::with_status(AUTH_REQUEST, &format!("invalid claims JSON: {err}"), status)
+    })
 }
 
 /// Reads a non-empty string field off a JSON object.

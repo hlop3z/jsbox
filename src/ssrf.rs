@@ -55,7 +55,9 @@ pub(crate) fn is_private_ip(addr: &IpAddr) -> bool {
     match *addr {
         IpAddr::V4(ip) => is_private_v4(ip),
         IpAddr::V6(ip) => {
-            ip.is_loopback() || ip.is_unspecified() || ip.to_ipv4_mapped().is_some_and(is_private_v4)
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.to_ipv4_mapped().is_some_and(is_private_v4)
         }
     }
 }

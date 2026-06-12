@@ -40,11 +40,11 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use hmac::{Hmac, Mac};
-use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use rquickjs::{Ctx, Function, Object, Value as JsValue};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -237,7 +237,10 @@ fn hmac_op(payload: &Value, secrets: &SecretStore) -> Result<Value, String> {
     let algo = field_str(payload, "algo")?;
     let key = resolve_key(payload, secrets)?;
     let msg = field_str(payload, "msg")?;
-    let encoding = payload.get("encoding").and_then(Value::as_str).unwrap_or("hex");
+    let encoding = payload
+        .get("encoding")
+        .and_then(Value::as_str)
+        .unwrap_or("hex");
     let bytes = match algo {
         "sha256" => hmac_sha256(key.as_bytes(), msg.as_bytes())?,
         "sha512" => hmac_sha512(key.as_bytes(), msg.as_bytes())?,
@@ -294,8 +297,12 @@ fn encoding_dispatch(op: &str, payload: &Value) -> Result<Value, String> {
         "base64url_encode" => Ok(Value::String(URL_SAFE_NO_PAD.encode(data.as_bytes()))),
         "base64url_decode" => decode_utf8(&base64_decode(&URL_SAFE_NO_PAD, data)?),
         "hex_encode" => Ok(Value::String(hex::encode(data.as_bytes()))),
-        "hex_decode" => decode_utf8(&hex::decode(data).map_err(|err| format!("invalid hex: {err}"))?),
-        "url_encode" => Ok(Value::String(utf8_percent_encode(data, NON_ALPHANUMERIC).to_string())),
+        "hex_decode" => {
+            decode_utf8(&hex::decode(data).map_err(|err| format!("invalid hex: {err}"))?)
+        }
+        "url_encode" => Ok(Value::String(
+            utf8_percent_encode(data, NON_ALPHANUMERIC).to_string(),
+        )),
         "url_decode" => url_decode(data),
         other => Err(format!("unknown encoding op: '{other}'")),
     }
@@ -303,7 +310,9 @@ fn encoding_dispatch(op: &str, payload: &Value) -> Result<Value, String> {
 
 /// Decodes a base64 string with the given engine.
 fn base64_decode<E: Engine>(engine: &E, data: &str) -> Result<Vec<u8>, String> {
-    engine.decode(data).map_err(|err| format!("invalid base64: {err}"))
+    engine
+        .decode(data)
+        .map_err(|err| format!("invalid base64: {err}"))
 }
 
 /// Turns decoded bytes back into a UTF-8 string, erroring on non-text input.
@@ -346,7 +355,9 @@ fn now_millis() -> Result<i64, String> {
 
 /// Parses the `input` field (ISO string, date-only, or epoch millis) → epoch millis.
 fn date_parse(payload: &Value) -> Result<Value, String> {
-    let input = payload.get("input").ok_or_else(|| "missing 'input'".to_owned())?;
+    let input = payload
+        .get("input")
+        .ok_or_else(|| "missing 'input'".to_owned())?;
     Ok(Value::from(parse_input(input)?))
 }
 
@@ -393,7 +404,9 @@ fn date_iso(payload: &Value) -> Result<Value, String> {
     let millis = field_i64(payload, "ms")?;
     let parsed = DateTime::<Utc>::from_timestamp_millis(millis)
         .ok_or_else(|| "timestamp out of range".to_owned())?;
-    Ok(Value::String(parsed.to_rfc3339_opts(SecondsFormat::AutoSi, true)))
+    Ok(Value::String(
+        parsed.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+    ))
 }
 
 /// Converts a `ms` instant to epoch seconds.
@@ -436,7 +449,11 @@ fn split_duration(total_seconds: u64) -> Result<(u64, u64, u64, u64), String> {
 
 /// Checked `(value / unit, value % unit)`.
 fn divmod(value: u64, unit: u64) -> Result<(u64, u64), String> {
-    let quot = value.checked_div(unit).ok_or_else(|| "duration overflow".to_owned())?;
-    let rem = value.checked_rem(unit).ok_or_else(|| "duration overflow".to_owned())?;
+    let quot = value
+        .checked_div(unit)
+        .ok_or_else(|| "duration overflow".to_owned())?;
+    let rem = value
+        .checked_rem(unit)
+        .ok_or_else(|| "duration overflow".to_owned())?;
     Ok((quot, rem))
 }

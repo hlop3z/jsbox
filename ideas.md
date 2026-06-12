@@ -54,7 +54,8 @@ const meta = auth.introspect(token); // RFC 7662: { active, scope, exp, ... }
 - docs in `docs/`.
 
 **Estimate:** ≈ half a day to a day for someone fluent in the repo (lint gauntlet
-+ Docker-only build loop are the main friction, not the logic).
+
+- Docker-only build loop are the main friction, not the logic).
 
 ### Decisions (stateless + scalable)
 
@@ -99,11 +100,11 @@ the caller's, not the developer's. A `401` is expected business flow → return 
 `try/catch`. Reserve throwing a tagged `__jsbox` capability error (like
 `db`/`mail`) for infra failures the handler can't act on.
 
-| IAM outcome                          | Code                 | Owner    | Retryable | Surface                          |
-| ------------------------------------ | -------------------- | -------- | --------- | -------------------------------- |
-| `200`                                | —                    | —        | —         | return `{ ok: true, claims }`    |
-| `401` / `403` (invalid/expired/scope)| `AUTH_INVALID_TOKEN` | Caller   | no        | **in-band** `{ ok: false, status }` |
-| `5xx` / timeout / connect            | `AUTH_UNAVAILABLE`   | Operator | **yes**   | **throw** tagged                 |
-| other `4xx` (misconfig)              | `AUTH_REQUEST`       | Operator | no        | throw tagged                     |
+| IAM outcome                           | Code                 | Owner    | Retryable | Surface                             |
+| ------------------------------------- | -------------------- | -------- | --------- | ----------------------------------- |
+| `200`                                 | —                    | —        | —         | return `{ ok: true, claims }`       |
+| `401` / `403` (invalid/expired/scope) | `AUTH_INVALID_TOKEN` | Caller   | no        | **in-band** `{ ok: false, status }` |
+| `5xx` / timeout / connect             | `AUTH_UNAVAILABLE`   | Operator | **yes**   | **throw** tagged                    |
+| other `4xx` (misconfig)               | `AUTH_REQUEST`       | Operator | no        | throw tagged                        |
 
 Handler usage: `const u = auth.user_info(ctx.token); if (!u.ok) return json(null, { code: 'unauthorized' });`

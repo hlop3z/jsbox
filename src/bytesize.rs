@@ -6,8 +6,8 @@
 
 use std::fmt;
 
-use serde::de::{self, Visitor};
 use serde::Deserializer;
+use serde::de::{self, Visitor};
 
 /// Parses a byte size from a human-readable string (integer math, no floats).
 ///

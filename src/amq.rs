@@ -14,10 +14,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use amqprs::BasicProperties;
 use amqprs::channel::BasicPublishArguments;
 use amqprs::connection::{Connection, OpenConnectionArguments};
 use amqprs::tls::TlsAdaptor;
-use amqprs::BasicProperties;
 use rquickjs::{Ctx, Function, Value as JsValue};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -71,13 +71,21 @@ pub(crate) struct AmqConfig {
 }
 
 /// Default AMQP port.
-const fn default_port() -> u16 { 5672 }
+const fn default_port() -> u16 {
+    5672
+}
 /// Default AMQP user/password.
-fn default_user() -> String { "guest".to_owned() }
+fn default_user() -> String {
+    "guest".to_owned()
+}
 /// Default virtual host.
-fn default_vhost() -> String { "/".to_owned() }
+fn default_vhost() -> String {
+    "/".to_owned()
+}
 /// Default batch cap.
-const fn default_max_batch() -> usize { 100 }
+const fn default_max_batch() -> usize {
+    100
+}
 
 /// Metric recorded for each `amq.send` op.
 #[derive(Debug, Clone, Serialize)]
@@ -106,12 +114,18 @@ struct AmqError {
 impl AmqError {
     /// Builds a fallback (`AMQ_ERROR`) error.
     const fn fallback(message: String) -> Self {
-        Self { fault: AMQ_FALLBACK, message }
+        Self {
+            fault: AMQ_FALLBACK,
+            message,
+        }
     }
 
     /// Builds a connection error (`AMQ_CONNECTION`).
     const fn connection(message: String) -> Self {
-        Self { fault: AMQ_CONNECTION, message }
+        Self {
+            fault: AMQ_CONNECTION,
+            message,
+        }
     }
 }
 
@@ -158,9 +172,12 @@ pub(crate) fn inject_amq(
 
             match result {
                 Ok(outcome) => outcome.json,
-                Err(amq_err) => {
-                    errors::capability_fault_json(ErrorSource::Amq, amq_err.fault, &amq_err.message, None)
-                }
+                Err(amq_err) => errors::capability_fault_json(
+                    ErrorSource::Amq,
+                    amq_err.fault,
+                    &amq_err.message,
+                    None,
+                ),
             }
         },
     )?
@@ -191,7 +208,9 @@ fn do_send(config: &AmqConfig, payload_json: &str) -> Result<SendOutcome, AmqErr
 
     let count = payload.messages.len();
     if count == 0 {
-        return Err(AmqError::fallback("amq.send requires at least one message".to_owned()));
+        return Err(AmqError::fallback(
+            "amq.send requires at least one message".to_owned(),
+        ));
     }
     if count > config.max_batch {
         return Err(AmqError {
@@ -208,13 +227,21 @@ fn do_send(config: &AmqConfig, payload_json: &str) -> Result<SendOutcome, AmqErr
     let bytes = runtime.block_on(publish_batch(config, &payload.messages))?;
 
     let json = format!("{{\"published\":{count}}}");
-    Ok(SendOutcome { json, messages: count, bytes })
+    Ok(SendOutcome {
+        json,
+        messages: count,
+        bytes,
+    })
 }
 
 /// Opens one connection + channel, publishes every message, then closes.
 async fn publish_batch(config: &AmqConfig, messages: &[AmqMessage]) -> Result<usize, AmqError> {
-    let mut args =
-        OpenConnectionArguments::new(&config.host, config.port, &config.username, &config.password);
+    let mut args = OpenConnectionArguments::new(
+        &config.host,
+        config.port,
+        &config.username,
+        &config.password,
+    );
     let _ = args.virtual_host(&config.vhost);
     if config.tls {
         let ca = config.ca_cert.as_deref().map(Path::new);

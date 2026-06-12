@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lettre::message::{Mailbox, Message, MessageBuilder, MultiPart, SinglePart};
-use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::Error as SmtpError;
+use lettre::transport::smtp::authentication::Credentials;
 use lettre::{SmtpTransport, Transport};
 use rquickjs::{Ctx, Function, Value as JsValue};
 use serde::{Deserialize, Serialize};
@@ -41,12 +41,18 @@ impl MailError {
     /// Builds a fallback (`MAIL_ERROR`) error — used for non-SMTP failures (payload
     /// parsing, recipient validation, address parsing, message building).
     const fn fallback(message: String) -> Self {
-        Self { fault: MAIL_FALLBACK, message }
+        Self {
+            fault: MAIL_FALLBACK,
+            message,
+        }
     }
 
     /// Classifies an SMTP send error by transient/permanent reply class.
     fn from_driver(err: &SmtpError) -> Self {
-        Self { fault: classify(err), message: err.to_string() }
+        Self {
+            fault: classify(err),
+            message: err.to_string(),
+        }
     }
 }
 
@@ -104,11 +110,17 @@ pub(crate) struct MailConfig {
 }
 
 /// Default SMTP port.
-const fn default_port() -> u16 { 587 }
+const fn default_port() -> u16 {
+    587
+}
 /// Default recipient cap.
-const fn default_max_recipients() -> usize { 50 }
+const fn default_max_recipients() -> usize {
+    50
+}
 /// Default timeout in milliseconds.
-const fn default_timeout() -> u64 { 10_000 }
+const fn default_timeout() -> u64 {
+    10_000
+}
 
 /// Metric recorded for each mail operation.
 #[derive(Debug, Clone, Serialize)]
@@ -299,7 +311,12 @@ fn do_send(send_ctx: &SendCtx<'_>, payload_json: &str) -> Result<SendOutcome, Ma
             let line = response.first_line().unwrap_or("");
             let escaped = serde_json::to_string(line).unwrap_or_else(|_err| "\"\"".into());
             let json = format!("{{\"accepted\":{accepted},\"response\":{escaped}}}");
-            Ok(SendOutcome { json, recipients, bytes, accepted })
+            Ok(SendOutcome {
+                json,
+                recipients,
+                bytes,
+                accepted,
+            })
         }
         Err(err) => Err(MailError::from_driver(&err)),
     }
@@ -316,7 +333,11 @@ const fn count_recipients(payload: &SendPayload) -> usize {
 
 /// Builds the `Message` from a payload, validating every address.
 fn build_message(payload: &SendPayload, default_from: &str) -> Result<Message, String> {
-    let from_str = if payload.from.is_empty() { default_from } else { payload.from.as_str() };
+    let from_str = if payload.from.is_empty() {
+        default_from
+    } else {
+        payload.from.as_str()
+    };
     let mut builder = Message::builder().from(parse_mailbox(from_str, "from")?);
 
     for addr in &payload.to {
@@ -365,8 +386,9 @@ fn build_body(builder: MessageBuilder, payload: &SendPayload) -> Result<Message,
 
 /// Builds a `MailMetric` from the outcome (or zeros on failure).
 fn build_metric(action: &str, outcome: Option<&SendOutcome>, start: Instant) -> MailMetric {
-    let (recipients, bytes, accepted) =
-        outcome.map_or((0, 0, false), |out| (out.recipients, out.bytes, out.accepted));
+    let (recipients, bytes, accepted) = outcome.map_or((0, 0, false), |out| {
+        (out.recipients, out.bytes, out.accepted)
+    });
 
     MailMetric {
         action: action.into(),

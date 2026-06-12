@@ -43,16 +43,16 @@ impl JsPool {
         let size = if engine_config.pool_size > 0 {
             engine_config.pool_size
         } else {
-            available_parallelism()
-                .map(NonZero::get)
-                .unwrap_or(4)
+            available_parallelism().map(NonZero::get).unwrap_or(4)
         };
 
         let queue = ArrayQueue::new(size);
 
         for _ in 0..size {
             let runtime = create_runtime(&engine_config)?;
-            queue.push(runtime).map_err(|_err| "pool queue full during init")?;
+            queue
+                .push(runtime)
+                .map_err(|_err| "pool queue full during init")?;
         }
 
         Ok(Self {

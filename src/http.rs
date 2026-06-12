@@ -28,7 +28,12 @@ const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
 
 /// Headers users cannot override.
-const PROTECTED_HEADERS: &[&str] = &["content-type", "content-length", "host", "transfer-encoding"];
+const PROTECTED_HEADERS: &[&str] = &[
+    "content-type",
+    "content-length",
+    "host",
+    "transfer-encoding",
+];
 
 /// JS wrapper — loaded from `src/js/api.js` at compile time.
 const API_WRAPPER: &str = include_str!("js/api.js");
@@ -62,7 +67,10 @@ impl HttpError {
 
     /// Classifies a `reqwest` transport error by its predicates.
     fn from_transport(err: &reqwest::Error, method: &str, url: &str) -> Self {
-        Self { fault: classify(err), message: format!("HTTP {method} {url}: {err}") }
+        Self {
+            fault: classify(err),
+            message: format!("HTTP {method} {url}: {err}"),
+        }
     }
 }
 
@@ -208,8 +216,7 @@ impl MetricCtx<'_> {
 /// Validates URL: checks allowed hosts and blocks private/internal IPs.
 /// Returns the host string (for metrics) on success.
 fn validate_url(url: &str, allowed: &[String], allow_private: bool) -> Result<String, String> {
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|err| format!("invalid URL '{url}': {err}"))?;
+    let parsed = reqwest::Url::parse(url).map_err(|err| format!("invalid URL '{url}': {err}"))?;
 
     let host = parsed
         .host_str()
@@ -289,7 +296,10 @@ fn execute_http(
     headers: &BTreeMap<String, String>,
 ) -> Result<(u16, usize, String), HttpError> {
     let req_method: reqwest::Method = method.parse().map_err(|err| {
-        HttpError::new(HTTP_FALLBACK, format!("invalid HTTP method '{method}': {err}"))
+        HttpError::new(
+            HTTP_FALLBACK,
+            format!("invalid HTTP method '{method}': {err}"),
+        )
     })?;
 
     let mut request = client.request(req_method, url);
@@ -322,21 +332,34 @@ fn execute_http(
     }
 
     let response_body = response.text().map_err(|err| {
-        HttpError::new(HTTP_FALLBACK, format!("failed to read response body: {err}"))
+        HttpError::new(
+            HTTP_FALLBACK,
+            format!("failed to read response body: {err}"),
+        )
     })?;
 
     // Post-read check (Content-Length can lie or be absent).
     if response_body.len() > MAX_RESPONSE_BYTES {
         return Err(HttpError::new(
             HTTP_BODY_TOO_LARGE,
-            format!("response too large: {} bytes (max {MAX_RESPONSE_BYTES})", response_body.len()),
+            format!(
+                "response too large: {} bytes (max {MAX_RESPONSE_BYTES})",
+                response_body.len()
+            ),
         ));
     }
 
     let response_bytes = response_body.len();
     let escaped_body = serde_json::to_string(&response_body).map_err(|err| {
-        HttpError::new(HTTP_FALLBACK, format!("failed to serialize response: {err}"))
+        HttpError::new(
+            HTTP_FALLBACK,
+            format!("failed to serialize response: {err}"),
+        )
     })?;
 
-    Ok((status, response_bytes, format!("{{\"status\":{status},\"body\":{escaped_body}}}")))
+    Ok((
+        status,
+        response_bytes,
+        format!("{{\"status\":{status},\"body\":{escaped_body}}}"),
+    ))
 }

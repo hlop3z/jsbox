@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use redis::{Commands, Connection};
 use rquickjs::{Ctx, Function, Value as JsValue};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::errors::{self, ErrorOwner, ErrorSource, Fault};
 use crate::sandbox::{self, Collector};
@@ -43,7 +43,9 @@ pub(crate) struct RedisConfig {
 }
 
 /// Default command timeout in milliseconds.
-const fn default_timeout() -> u64 { 5000 }
+const fn default_timeout() -> u64 {
+    5000
+}
 
 /// Metric recorded for each Redis operation.
 #[derive(Debug, Clone, Serialize)]
@@ -71,12 +73,18 @@ impl RedisError {
     /// Builds a fallback (`REDIS_ERROR`) error — used for non-driver failures (payload
     /// parsing, lock, serialization, unknown action).
     const fn fallback(message: String) -> Self {
-        Self { fault: REDIS_FALLBACK, message }
+        Self {
+            fault: REDIS_FALLBACK,
+            message,
+        }
     }
 
     /// Classifies a `redis` driver error.
     fn from_driver(err: &redis::RedisError) -> Self {
-        Self { fault: classify(err), message: err.to_string() }
+        Self {
+            fault: classify(err),
+            message: err.to_string(),
+        }
     }
 }
 
@@ -121,7 +129,12 @@ pub(crate) fn inject_redis(
         qctx.clone(),
         move |action: String, payload_json: String| -> String {
             if let Err(err) = sandbox::check_op_limit(&metrics_clone, max_ops) {
-                return errors::capability_fault_json(ErrorSource::Redis, REDIS_OP_LIMIT, &err, None);
+                return errors::capability_fault_json(
+                    ErrorSource::Redis,
+                    REDIS_OP_LIMIT,
+                    &err,
+                    None,
+                );
             }
 
             let start = Instant::now();
@@ -174,13 +187,16 @@ fn dispatch(
         "del" => do_del(conn, payload_json),
         "incr" => do_incr(conn, payload_json),
         "expire" => do_expire(conn, payload_json),
-        other => Err(RedisError::fallback(format!("unknown redis action: {other}"))),
+        other => Err(RedisError::fallback(format!(
+            "unknown redis action: {other}"
+        ))),
     }
 }
 
 /// Acquires the shared connection lock.
 fn lock_conn(conn: &Arc<Mutex<Connection>>) -> Result<MutexGuard<'_, Connection>, RedisError> {
-    conn.lock().map_err(|err| RedisError::fallback(format!("lock error: {err}")))
+    conn.lock()
+        .map_err(|err| RedisError::fallback(format!("lock error: {err}")))
 }
 
 /// Parses a payload, mapping failures to a fallback error.
@@ -202,7 +218,9 @@ fn do_get(conn: &Arc<Mutex<Connection>>, payload_json: &str) -> Result<String, R
     let payload: KeyPayload = parse(payload_json)?;
     let value: Option<String> = {
         let mut guard = lock_conn(conn)?;
-        guard.get(&payload.key).map_err(|err| RedisError::from_driver(&err))?
+        guard
+            .get(&payload.key)
+            .map_err(|err| RedisError::from_driver(&err))?
     };
     encode(&json!({ "value": value }))
 }
@@ -227,7 +245,9 @@ fn do_del(conn: &Arc<Mutex<Connection>>, payload_json: &str) -> Result<String, R
     let payload: KeyPayload = parse(payload_json)?;
     let count: i64 = {
         let mut guard = lock_conn(conn)?;
-        guard.del(&payload.key).map_err(|err| RedisError::from_driver(&err))?
+        guard
+            .del(&payload.key)
+            .map_err(|err| RedisError::from_driver(&err))?
     };
     encode(&json!({ "count": count }))
 }
@@ -237,7 +257,9 @@ fn do_incr(conn: &Arc<Mutex<Connection>>, payload_json: &str) -> Result<String, 
     let payload: KeyPayload = parse(payload_json)?;
     let value: i64 = {
         let mut guard = lock_conn(conn)?;
-        guard.incr(&payload.key, 1_i64).map_err(|err| RedisError::from_driver(&err))?
+        guard
+            .incr(&payload.key, 1_i64)
+            .map_err(|err| RedisError::from_driver(&err))?
     };
     encode(&json!({ "value": value }))
 }
@@ -293,7 +315,9 @@ struct ExpirePayload {
 
 /// Builds a `RedisMetric` from the result of an operation.
 fn build_metric(action: &str, result: &Result<String, RedisError>, start: Instant) -> RedisMetric {
-    let (bytes, hit) = result.as_ref().map_or((0, false), |json| value_stats(action, json));
+    let (bytes, hit) = result
+        .as_ref()
+        .map_or((0, false), |json| value_stats(action, json));
     RedisMetric {
         action: action.to_owned(),
         duration_us: start.elapsed().as_micros(),
@@ -308,5 +332,8 @@ fn value_stats(action: &str, json: &str) -> (usize, bool) {
         return (0, false);
     }
     let parsed: Value = serde_json::from_str(json).unwrap_or(Value::Null);
-    parsed.get("value").and_then(Value::as_str).map_or((0, false), |text| (text.len(), true))
+    parsed
+        .get("value")
+        .and_then(Value::as_str)
+        .map_or((0, false), |text| (text.len(), true))
 }

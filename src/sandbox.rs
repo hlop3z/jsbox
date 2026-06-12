@@ -34,8 +34,7 @@ pub(crate) fn drain<T: Clone>(collector: Option<&Collector<T>>) -> Vec<T> {
 /// Used by the always-on `$`/Decimal global (`decimal.rs`), whose errors are
 /// script-level usage errors. Capability errors go through `errors::` instead.
 pub(crate) fn error_json(message: &str) -> String {
-    let escaped = serde_json::to_string(message)
-        .unwrap_or_else(|_err| "\"internal error\"".into());
+    let escaped = serde_json::to_string(message).unwrap_or_else(|_err| "\"internal error\"".into());
     format!("{{\"error\":{escaped}}}")
 }
 
@@ -67,7 +66,10 @@ pub(crate) fn validate_input_sizes(
 }
 
 /// Checks if the operation count exceeds the per-execution limit.
-pub(crate) fn check_op_limit<T: Serialize>(collector: &Collector<T>, max_ops: usize) -> Result<(), String> {
+pub(crate) fn check_op_limit<T: Serialize>(
+    collector: &Collector<T>,
+    max_ops: usize,
+) -> Result<(), String> {
     if let Ok(vec) = collector.lock()
         && vec.len() >= max_ops
     {
