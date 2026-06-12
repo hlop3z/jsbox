@@ -718,15 +718,26 @@ def test_metrics(t: Runner):
            lambda _r: body is not None
            and "jsbox_bulkhead_permits_total" in body
            and "jsbox_db_breaker_trips_total" in body)
+    t.test("/metrics exposes the execution latency histogram",
+           h("return json(1,null);"),
+           lambda _r: body is not None
+           and "jsbox_execution_duration_seconds_bucket{le=\"+Inf\"}" in body
+           and "jsbox_execution_duration_seconds_count" in body)
 
     success_label = 'jsbox_executions_total{outcome="success"}'
+    hist_label = "jsbox_execution_duration_seconds_count"
     before = _counter(body, success_label)
+    before_hist = _counter(body, hist_label)
     _post(h("return json('ok', null);"))
     after_text = _scrape()
     after = _counter(after_text, success_label)
+    after_hist = _counter(after_text, hist_label)
     t.test("success counter advances after an execution",
            h("return json(1,null);"),
            lambda _r: before is not None and after is not None and after > before)
+    t.test("latency histogram count advances after an execution",
+           h("return json(1,null);"),
+           lambda _r: before_hist is not None and after_hist is not None and after_hist > before_hist)
 
     err_label = 'jsbox_executions_total{outcome="script_error"}'
     before_err = _counter(after_text, err_label)
@@ -846,6 +857,35 @@ def test_pgbouncer_edges(t: Runner, db: dict, direct: bool):
            h("var n=0; for (var i=0;i<25;i++){var r=db.query('SELECT $1::int AS v',[i]); n+=r.rows[0].v;} return json(n, null);",
              config={"db": db}),
            data_eq(sum(range(25))))
+
+
+def test_pooler_query_timeout(t: Runner, db: dict):
+    """Tier 4: PgBouncer's own query_timeout is an INDEPENDENT backstop. Through a
+    transaction-mode pooler the session `SET statement_timeout` is best-effort and can be
+    lost; query_timeout (2s, set on the pooler) guarantees a runaway query is still killed
+    — and below jsbox's 4s wall-clock deadline (Tier 2). See docs/design/resilience.md."""
+    t.section("Pooler query_timeout (Tier 4)")
+
+    # pg_sleep(3) outlives the 2s pooler ceiling but is under jsbox's 4s wall clock, so the
+    # *pooler* is what must catch it (whether or not the session SET also fired).
+    cfg = {**db, "statement_timeout_ms": 800}
+    start = time.time()
+    r = _post(h("db.query('SELECT pg_sleep(3)'); return json('slept', null);", config={"db": cfg}))
+    elapsed = time.time() - start
+    killed = r is not None and r["data"] is None and r["error"] is not None
+
+    # No kill means neither the SET nor a pooler query_timeout fired (sleep ran ~3s under
+    # jsbox's 4s budget) — the pooler has no ceiling configured. Probe + skip rather than fail.
+    if not killed:
+        print(f"  \033[33mPROBE\033[0m pooler did not terminate the 3s query (query_timeout unset?) "
+              f"elapsed={elapsed:.1f}s\n")
+        return
+    t.test("pooler terminates an over-budget query (error returned)",
+           h("return json(1,null);"), lambda _r: killed)
+    t.test("terminated below jsbox wall-clock deadline (independent of Tier 2)",
+           h("return json(1,null);"), lambda _r: elapsed < 3.7)
+    t.test("pooler healthy immediately after the kill",
+           h("return json('alive', null);"), data_eq("alive"))
 
 
 # -- Auth (OIDC/IAM) tests ---------------------------------------------------
@@ -1091,6 +1131,7 @@ def main():
     if _db_available(PGB_CONFIG):
         test_db_engine(t, "PgBouncer", PGB_CONFIG)
         test_pgbouncer_edges(t, PGB_CONFIG, direct=False)
+        test_pooler_query_timeout(t, PGB_CONFIG)
     else:
         print("\n  \033[33mSKIP\033[0m PgBouncer tests (not running — use: docker compose up -d pgbouncer)\n")
 

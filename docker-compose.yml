@@ -22,6 +22,11 @@ services:
   # SCRAM challenge both ways (client → pgbouncer, pgbouncer → postgres 17).
   # MAX_PREPARED_STATEMENTS > 0 lets the Rust driver's named prepared statements work
   # across pooled server connections (PgBouncer ≥ 1.21 tracks them protocol-level).
+  # QUERY_TIMEOUT (Tier 4, docs/design/resilience.md) is the pooler's OWN ceiling: it
+  # cancels any query running longer than 2s — an independent backstop that fires even
+  # when jsbox's session `SET statement_timeout` is lost through transaction pooling, and
+  # below jsbox's 4s wall-clock deadline (Tier 2). 2s sits above normal query latency and
+  # is operator-tunable; it's the layer that makes a runaway query a guaranteed kill.
   pgbouncer:
     image: edoburu/pgbouncer:latest
     environment:
@@ -34,6 +39,7 @@ services:
       MAX_PREPARED_STATEMENTS: "200"
       MAX_CLIENT_CONN: "200"
       DEFAULT_POOL_SIZE: "10"
+      QUERY_TIMEOUT: "2"
     ports:
       - "6432:5432"
     depends_on:

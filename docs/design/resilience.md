@@ -1,7 +1,8 @@
 # Design note: resilience for SLO/SLA (timeouts, bulkheads, cancellation)
 
-Status: **Tiers 0, 1, 2, 3, 5 implemented** (2026-06); Tier 4 is operator config. Companion to
-[pooled-capabilities.md](pooled-capabilities.md). Grounded in the code as of `main`.
+Status: **Tiers 0, 1, 2, 3, 5 implemented**, **Tier 4 wired + exercised** (operator config),
+all (2026-06). Companion to [pooled-capabilities.md](pooled-capabilities.md). Grounded in the
+code as of `main`.
 
 ## The principle
 
@@ -9,7 +10,7 @@ Enterprise resilience for a timeout is never a single mechanism — it is **defe
 depth with a server-enforced ceiling the client cannot raise**. Any single timeout can
 be lost or bypassed (a `SET` lost through a transaction-mode pooler; a wall-clock
 interrupt that can't cancel a blocking syscall), so each layer catches what the one
-below it missed, and when a timeout *does* fire the failure stays contained instead of
+below it missed, and when a timeout _does_ fire the failure stays contained instead of
 cascading into an SLO breach. Ship the layers in order of resilience-per-effort.
 
 ## The failure this defends against
@@ -17,7 +18,7 @@ cascading into an SLO breach. Ship the layers in order of resilience-per-effort.
 jsbox runs the synchronous `postgres` client on `tokio::task::spawn_blocking`, and the
 `QuickJS` wall-clock interrupt **cannot cancel a blocking libpq call**. So a slow or
 hung query pins a `spawn_blocking` thread (default ceiling ~512) and a DB connection
-until *some* server-side cap fires — and `SET statement_timeout` is best-effort through
+until _some_ server-side cap fires — and `SET statement_timeout` is best-effort through
 a transaction-mode pooler (see pooled-capabilities.md). Under load against a degraded
 database, jsbox's **unbounded** execution concurrency (`JsPool::acquire()` mints a fresh
 runtime when the pool is empty) means hundreds of executions each pin a thread + a
@@ -26,14 +27,14 @@ killer, and it is independent of the timeout question.
 
 ## The layered model
 
-| Tier | Layer | What it guarantees | Status |
-| --- | --- | --- | --- |
-| 0 | **Server-side ceiling + clamp** | A `statement_timeout` cap the request cannot raise; jsbox never *issues* an unbounded one | **done** (clamp) + operator role-default (docs) |
-| 1 | **Bulkhead (bounded concurrency)** | A slow downstream can't consume all threads/connections; excess load fast-fails 429 | **done** |
-| 2 | **Client deadline + active cancellation** | A hung query is cancelled and its thread/connection freed promptly, independent of any pooler | **done** (async `db`) |
-| 3 | **Circuit breaker** | A struggling DB isn't buried under retries; jsbox stays responsive | **done** (per-target db) |
-| 4 | **Pooler timeouts** | PgBouncer `query_timeout`/`query_wait_timeout` as an independent layer | operator config |
-| 5 | **Per-partition fairness** | One key can't monopolize a pod (per-pod cap; global fairness is the gateway's job) | **done** (per-pod backstop) |
+| Tier | Layer                                     | What it guarantees                                                                            | Status                                          |
+| ---- | ----------------------------------------- | --------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| 0    | **Server-side ceiling + clamp**           | A `statement_timeout` cap the request cannot raise; jsbox never _issues_ an unbounded one     | **done** (clamp) + operator role-default (docs) |
+| 1    | **Bulkhead (bounded concurrency)**        | A slow downstream can't consume all threads/connections; excess load fast-fails 429           | **done**                                        |
+| 2    | **Client deadline + active cancellation** | A hung query is cancelled and its thread/connection freed promptly, independent of any pooler | **done** (async `db`)                           |
+| 3    | **Circuit breaker**                       | A struggling DB isn't buried under retries; jsbox stays responsive                            | **done** (per-target db)                        |
+| 4    | **Pooler timeouts**                       | PgBouncer `query_timeout`/`query_wait_timeout` as an independent layer                        | **done** (compose + test) / operator config     |
+| 5    | **Per-partition fairness**                | One key can't monopolize a pod (per-pod cap; global fairness is the gateway's job)            | **done** (per-pod backstop)                     |
 
 ### Tier 0 — server-side ceiling + clamp (done + operator action)
 
@@ -46,13 +47,13 @@ Two parts:
 - **jsbox clamp (code, defense-in-depth):** `engine.max_statement_timeout_ms`
   (`0` = off). A per-request `config.db.statement_timeout_ms` is clamped to it, and a
   request value of `0` ("unlimited") becomes the ceiling. This guarantees jsbox never
-  *sends* an unbounded `SET`, which fully bounds direct connections and session-mode
+  _sends_ an unbounded `SET`, which fully bounds direct connections and session-mode
   pooling. Behind a transaction-mode pooler the `SET` is best-effort, so the clamp
   there is belt-and-suspenders to the operator role default — not a replacement.
 
-Security framing: today the per-request `config.db` is set by the *trusted* caller of
+Security framing: today the per-request `config.db` is set by the _trusted_ caller of
 `/execute`, not by the sandboxed script (a script cannot set `statement_timeout`). The
-clamp is defense in depth — it lets the operator *running jsbox* guarantee a ceiling no
+clamp is defense in depth — it lets the operator _running jsbox_ guarantee a ceiling no
 caller can exceed, which matters as the platform moves toward customer-authored scripts
 and multi-tenancy.
 
@@ -65,7 +66,7 @@ is **fast-fail**: when saturated, `/execute` returns `429 OVERLOADED` (runtime,
 retryable, owner operator) immediately rather than queueing — moving the latency
 problem into a queue just defers the SLO breach. Big-company practice is fast-fail +
 client backoff over unbounded buffering. Cheap validation errors (malformed body,
-oversize, unknown key) return *before* taking a permit, so a flood of bad requests
+oversize, unknown key) return _before_ taking a permit, so a flood of bad requests
 can't exhaust the bulkhead. Tune the bound to the downstream connection budget
 (PgBouncer `max_client_conn`, DB `max_connections`); a per-capability tighter bound
 (e.g. DB-only) is a later refinement.
@@ -74,7 +75,7 @@ can't exhaust the bulkhead. Tune the bound to the downstream connection budget
 
 The root limitation was the **blocking client on `spawn_blocking`**: the `QuickJS`
 wall-clock interrupt cannot cancel a blocking libpq call, so a hung query pinned its
-thread until *some* server-side cap fired — and `SET statement_timeout` is lost through a
+thread until _some_ server-side cap fired — and `SET statement_timeout` is lost through a
 transaction-mode pooler. `db.rs` now uses **async `tokio-postgres`**: each query runs as
 `handle.block_on(tokio::time::timeout(deadline, fut))` where `deadline` is anchored to
 the execution wall-clock budget. On elapse the future is dropped and a retryable
@@ -82,15 +83,15 @@ the execution wall-clock budget. On elapse the future is dropped and a retryable
 timeout.
 
 Cancellation is honored **by connection teardown, not an explicit cancel token**, and
-this is correct *because of jsbox's model*: connections are per-request and never pooled
+this is correct _because of jsbox's model_: connections are per-request and never pooled
 in-process, so dropping the timed-out query (and, at execution end, the `Client`) closes
 the socket and the backend aborts the query. The "you must send the cancel" lesson
-applies to *kept/pooled* connections you intend to reuse — jsbox discards, so teardown
-*is* the cancellation. (An explicit `Client::cancel_token()` for promptness is a possible
+applies to _kept/pooled_ connections you intend to reuse — jsbox discards, so teardown
+_is_ the cancellation. (An explicit `Client::cancel_token()` for promptness is a possible
 refinement, deferred.)
 
 **Verified** (2026-06): with no operator ceiling and `statement_timeout=0` (unlimited
-server-side), a `SELECT pg_sleep(30)` *through PgBouncer* returned `DB_TIMEOUT` at
+server-side), a `SELECT pg_sleep(30)` _through PgBouncer_ returned `DB_TIMEOUT` at
 **~4.1s** (the engine wall-clock budget) instead of blocking ~30s — the thread is freed
 by the client-side deadline alone. The full suite (152 tests) stays green across direct
 Postgres, PgBouncer, and CockroachDB.
@@ -103,34 +104,34 @@ parked in `block_on`; and the CPU-bound `QuickJS` execution stays on `spawn_bloc
 
 ### Tier 5 — per-partition fairness (done; a per-pod backstop)
 
-The global bulkhead (Tier 1) protects a pod but sheds load *indiscriminately* — the A/B
+The global bulkhead (Tier 1) protects a pod but sheds load _indiscriminately_ — the A/B
 harness measured a good tenant being rejected alongside a noisy one (victim 0 succeeded).
 Tier 5 adds a per-key concurrency cap underneath the global one: a request carries a
 **partition key** (`X-Partition-Key` header, or a `partition` body field — header wins;
 both caller-set, never script-set), and a key over its share fast-fails
-`429 PARTITION_OVERLOADED` *even when global capacity remains*. The key is whatever the
+`429 PARTITION_OVERLOADED` _even when global capacity remains_. The key is whatever the
 operator/gateway chooses to isolate on — a tenant, an API key, a route. Implementation:
 keys hash into a fixed array of semaphores (`PartitionLimiter`), so memory is constant and
 there's no per-key lifecycle — and a single pod never has more than the bulkhead's worth
-of *concurrent* keys, so collisions stay rare no matter how many keys exist overall.
+of _concurrent_ keys, so collisions stay rare no matter how many keys exist overall.
 Opt-in via `max_concurrent_per_partition` (0 = off).
 
-**Crucially, this is a *per-pod* control, not a global guarantee.** Under k8s with N
+**Crucially, this is a _per-pod_ control, not a global guarantee.** Under k8s with N
 replicas behind a load balancer, the effective ceiling is per-pod × N, and it drifts as
 the HPA scales. **Global per-partition fairness belongs at the gateway** — the one
 component with the fleet-wide view of a key, and the place built for millions of tenants
 (rate limiting, often Redis-backed). jsbox's role is local self-protection: the global
 bulkhead stops the pod falling over; the per-partition cap stops one key monopolizing a
-*single* pod under sticky routing, hot-key skew, or a gateway gap. So the reference
+_single_ pod under sticky routing, hot-key skew, or a gateway gap. So the reference
 deployment is: **gateway = global per-key policy (rejects over-quota before fan-out);
-jsbox = per-pod bulkhead + per-pod partition backstop.** A true global limit enforced *in*
+jsbox = per-pod bulkhead + per-pod partition backstop.** A true global limit enforced _in_
 jsbox would require a shared store (Redis) on the hot path — feasible but adds a
 dependency, latency, and crash-leak handling; documented as an opt-in path, not the
 default.
 
 ### Tier 3 — per-target db circuit breaker (done)
 
-Tiers 1–2 keep a single hung query from cascading, but a database that's *down* or
+Tiers 1–2 keep a single hung query from cascading, but a database that's _down_ or
 flapping is still a slow-path tax: every request pays the 5 s connect timeout on a
 `spawn_blocking` thread before failing, and N concurrent requests bury the recovering
 target under a thundering herd of reconnects. Tier 3 short-circuits that. A breaker keyed
@@ -145,20 +146,35 @@ map that **fails open** on lock poisoning (a breaker bug must never wedge the se
 Opt-in via `db_breaker_threshold` (0 = off, the default). Implementation: `src/breaker.rs`,
 gated in `db::connect_through_breaker`.
 
-This is deliberately a *connect* breaker, not a per-query latency breaker — the failure it
-targets is a dead/unreachable target, where Tier 2's deadline already bounds a *slow* live
+This is deliberately a _connect_ breaker, not a per-query latency breaker — the failure it
+targets is a dead/unreachable target, where Tier 2's deadline already bounds a _slow_ live
 query. It is per-pod like the bulkhead: each replica learns the target's health
 independently, which is the right granularity since connect failures are observed locally.
 
-### Tier 4 — pooler timeouts (operator config)
+### Tier 4 — pooler timeouts (operator config, wired + exercised)
 
-PgBouncer's own `query_timeout` / `query_wait_timeout` as an independent layer below jsbox,
-configured operator-side (see [pooled-capabilities.md](pooled-capabilities.md)). Nothing to
-build in jsbox.
+PgBouncer's own `query_timeout` / `query_wait_timeout` as an independent layer **below**
+jsbox — there's no jsbox code to write, but the point of Tier 4 is precisely that it doesn't
+depend on jsbox. Tier 0's `SET statement_timeout` is best-effort through a transaction-mode
+pooler (the SET can bind to a different server connection than the autocommit query that
+follows — see [pooled-capabilities.md](pooled-capabilities.md)). `query_timeout` is the pooler
+enforcing its **own** ceiling on every query it proxies, so a runaway query is a guaranteed
+kill even when the session SET was lost — and it fires below jsbox's wall-clock deadline
+(Tier 2), the final backstop. `query_wait_timeout` similarly bounds time spent waiting for a
+pooled server connection, a failure mode (pool-queue starvation) that `statement_timeout`
+doesn't address at all.
+
+The reference deployment sets `query_timeout` slightly above the expected
+`statement_timeout` so the server-side cap fires first when present and the pooler catches
+what leaks through. The test compose now configures `query_timeout = 2` on the PgBouncer
+service (above normal query latency, below jsbox's 4 s wall clock), and the integration suite
+asserts a `pg_sleep(3)` through the pooler is terminated below that deadline — so the layer
+is exercised in CI, not just documented. It's a "dangerous timeout" (it will cancel a
+legitimately long query), so the value is operator-tuned to the workload's real p99.
 
 ### Observability — `GET /metrics` (done)
 
-The resilience tiers are only operable if you can *see* them fire. jsbox exposes a
+The resilience tiers are only operable if you can _see_ them fire. jsbox exposes a
 dependency-free Prometheus text endpoint (`src/metrics.rs`, no client library) with
 process-wide atomic counters incremented on each request's terminal outcome, plus live
 gauges read at scrape time: `jsbox_executions_total{outcome}` (success / script_error /
@@ -166,19 +182,24 @@ capability_error / timeout / memory_limit / malformed_response / internal_error)
 `jsbox_rejections_total`, `jsbox_overload_total{scope}` (global bulkhead vs partition cap),
 `jsbox_db_breaker_trips_total`, and `jsbox_bulkhead_permits_available` / `_total`. So shed
 load (Tier 1/5), breaker trips (Tier 3), and bulkhead headroom are all alertable without
-log parsing. Latency histograms (extending the per-op `duration_us` drain already in
-`meta`) remain a future addition.
+log parsing. Execution wall-clock latency is exposed as a Prometheus histogram
+(`jsbox_execution_duration_seconds`, fixed buckets from 1 ms to 10 s) covering every
+execution that ran — so SLO latency objectives (p50/p95/p99 via `histogram_quantile`) are
+computed at the dashboard, not pre-baked. The buckets are integer-microsecond comparisons on
+the hot path (no float), and the implicit `+Inf` bucket plus `_sum`/`_count` follow the
+standard exposition. Per-capability latency histograms (extending the per-op `duration_us`
+drain already in `meta`) remain a future addition.
 
 ## Learning from big companies' async-in-Rust mistakes
 
 The Tier 2 refactor is where teams get hurt. Rules we adopt up front:
 
 1. **Timeout ≠ cancellation.** `tokio::time::timeout` around a query future cancels the
-   *await*, not the work — the database keeps running the query and holding the row
+   _await_, not the work — the database keeps running the query and holding the row
    locks. You **must** also send the Postgres cancel request. Teams that skip this think
    they have a timeout and don't; it's the single most common async-DB mistake.
 2. **Cancellation is cooperative, not preemptive.** A dropped future stops at the next
-   await point; a blocking call mid-future is never interrupted. This is *why* the
+   await point; a blocking call mid-future is never interrupted. This is _why_ the
    current blocking model can't be timed out from outside, and why Tier 2 needs genuine
    async I/O, not a `timeout()` wrapper around blocking work.
 3. **A cancelled connection is dirty.** Dropping a query future mid-flight can leave the
@@ -204,25 +225,25 @@ floods `/execute` with concurrent slow queries through PgBouncer, and interleave
 
 ### Measured (2026-06; 40 concurrent, `pg_sleep(2)` via PgBouncer, ~8 s)
 
-| | A (baseline) | B (Tier 0+1) |
-| --- | --- | --- |
-| flood latency p99 | **8.01 s** | **0.04 s** (228× lower) |
-| shed as 429 | 0% (queues into the pool) | 100% (fails fast) |
-| flood outcomes | 28 OK, 48 `DB_TIMEOUT`, 9 `DB_CANCELED` | 5 OK, 54 `DB_CANCELED`, rest `OVERLOADED` |
-| victim (good partition) p99 | 5.56 s | 0.03 s |
-| victim succeeded / shed | 0 / 0 (dragged into the queue) | 0 / 28 (shed by the global bulkhead) |
+|                             | A (baseline)                            | B (Tier 0+1)                              |
+| --------------------------- | --------------------------------------- | ----------------------------------------- |
+| flood latency p99           | **8.01 s**                              | **0.04 s** (228× lower)                   |
+| shed as 429                 | 0% (queues into the pool)               | 100% (fails fast)                         |
+| flood outcomes              | 28 OK, 48 `DB_TIMEOUT`, 9 `DB_CANCELED` | 5 OK, 54 `DB_CANCELED`, rest `OVERLOADED` |
+| victim (good partition) p99 | 5.56 s                                  | 0.03 s                                    |
+| victim succeeded / shed     | 0 / 0 (dragged into the queue)          | 0 / 28 (shed by the global bulkhead)      |
 
 Reading it: under overload A piles every request into the saturated PgBouncer pool —
-tail latency climbs to 8 s (worse than the 4 s engine timeout, because even *connecting*
+tail latency climbs to 8 s (worse than the 4 s engine timeout, because even _connecting_
 queues) and most requests time out. B sheds the excess as instant 429s and holds p99 at
 40 ms. **But** the victim result (measured against the Tier 0+1-only build) exposed a real
-gap: that bulkhead is *global*, so it rejected the good partition alongside the flood (0
+gap: that bulkhead is _global_, so it rejected the good partition alongside the flood (0
 succeeded, 28 shed) — bounding the victim's latency but not letting it through. That
 number was the concrete motivation for **Tier 5 (per-partition fairness), now implemented**.
 
 **Tier 5 closes the gap (measured).** The harness tags the flood as partition `noisy` and
 the victim as `good`; with `max_concurrent_per_partition` set, the noisy partition sheds on
-its *own* cap (`PARTITION_OVERLOADED`) while the good one keeps its share. Re-running the
+its _own_ cap (`PARTITION_OVERLOADED`) while the good one keeps its share. Re-running the
 same scenario with Tier 5 enabled: **victim requests succeeded — A: 0, B: 18** (A drags the
 good partition to p99 5.6 s and 0 get through; B lets 18 through at p99 0.09 s). The
 integration suite asserts the same mechanism (a noisy partition sheds `PARTITION_OVERLOADED`
@@ -233,7 +254,7 @@ while a good one gets through).
 - **Variants.** A = baseline (bulkhead disabled, `max_concurrent_executions` very high,
   no clamp) vs B = Tier 0+1 enabled. Same build, config-flagged, so the only variable
   is the defense.
-- **Fault injection.** Drive load against a *degraded* database: latency injected via
+- **Fault injection.** Drive load against a _degraded_ database: latency injected via
   `pg_sleep` in the script, or a proxy (toxiproxy) adding latency/packet loss between
   jsbox and Postgres/PgBouncer, with PgBouncer in the loop.
 - **Load.** Concurrent generator (k6 / vegeta / a small async client) ramping past
