@@ -76,7 +76,11 @@ fn derive_key(root: &Path, path: &Path) -> Result<String, Box<dyn Error + Send +
     let relative = path.strip_prefix(root)?.with_extension("");
     let parts = relative
         .components()
-        .map(|comp| comp.as_os_str().to_str().ok_or("script path is not valid UTF-8"))
+        .map(|comp| {
+            comp.as_os_str()
+                .to_str()
+                .ok_or("script path is not valid UTF-8")
+        })
         .collect::<Result<Vec<&str>, &str>>()?;
     Ok(parts.join("/"))
 }
@@ -99,8 +103,14 @@ mod tests {
         let dir = env::temp_dir().join(format!("jsbox-registry-test-{tag}"));
         let nested = dir.join("acme").join("billing");
         fs::create_dir_all(&nested)?;
-        fs::write(dir.join("greet.js"), "function handler(ctx) { return json(1, null); }")?;
-        fs::write(nested.join("pricing.js"), "function handler(ctx) { return json(2, null); }")?;
+        fs::write(
+            dir.join("greet.js"),
+            "function handler(ctx) { return json(1, null); }",
+        )?;
+        fs::write(
+            nested.join("pricing.js"),
+            "function handler(ctx) { return json(2, null); }",
+        )?;
         fs::write(dir.join("notes.txt"), "not a script")?;
         Ok(dir)
     }
@@ -112,8 +122,14 @@ mod tests {
         let registry = ScriptRegistry::load(&dir, 1024)?;
         assert_eq!(registry.count(), 2, "exactly the two .js files load");
         assert!(registry.get("greet").is_some(), "top-level key resolves");
-        assert!(registry.get("acme/billing/pricing").is_some(), "nested key resolves");
-        assert!(registry.get("notes").is_none(), "non-JS files are not registered");
+        assert!(
+            registry.get("acme/billing/pricing").is_some(),
+            "nested key resolves"
+        );
+        assert!(
+            registry.get("notes").is_none(),
+            "non-JS files are not registered"
+        );
         fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -123,7 +139,10 @@ mod tests {
     fn unknown_key_is_none() -> TestResult {
         let dir = fixture_dir("unknown")?;
         let registry = ScriptRegistry::load(&dir, 1024)?;
-        assert!(registry.get("no/such/script").is_none(), "unknown key resolves to None");
+        assert!(
+            registry.get("no/such/script").is_none(),
+            "unknown key resolves to None"
+        );
         fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -132,7 +151,10 @@ mod tests {
     #[test]
     fn oversized_script_fails_load() -> TestResult {
         let dir = fixture_dir("oversized")?;
-        assert!(ScriptRegistry::load(&dir, 8).is_err(), "oversized script must fail the load");
+        assert!(
+            ScriptRegistry::load(&dir, 8).is_err(),
+            "oversized script must fail the load"
+        );
         fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -142,6 +164,91 @@ mod tests {
     fn default_is_empty() {
         let registry = ScriptRegistry::default();
         assert_eq!(registry.count(), 0, "default registry holds no scripts");
-        assert!(registry.get("greet").is_none(), "default registry resolves nothing");
+        assert!(
+            registry.get("greet").is_none(),
+            "default registry resolves nothing"
+        );
+    }
+
+    // -- Adversarial: prove lookup is a pure in-memory map, never a filesystem walk ---
+
+    /// Path-traversal-shaped keys resolve to `None` — `get` is a `HashMap` lookup, so
+    /// `../` has no filesystem meaning and can never escape `scripts_dir`. This is the
+    /// load-bearing safety property of the whole registry.
+    #[test]
+    fn traversal_keys_never_resolve() -> TestResult {
+        let dir = fixture_dir("traversal")?;
+        let registry = ScriptRegistry::load(&dir, 1024)?;
+        for evil in [
+            "../greet",
+            "../../greet",
+            "../../../etc/passwd",
+            "..\\..\\greet",
+            "acme/../greet",
+            "/etc/passwd",
+            "/greet",
+            "greet/../greet",
+            "./greet",
+        ] {
+            assert!(
+                registry.get(evil).is_none(),
+                "traversal key must not resolve: {evil}"
+            );
+        }
+        // The legitimate key still works — traversal rejection isn't over-broad.
+        assert!(registry.get("greet").is_some(), "plain key still resolves");
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// The key is the path WITHOUT the extension; passing the `.js` filename must miss.
+    #[test]
+    fn extension_in_key_does_not_resolve() -> TestResult {
+        let dir = fixture_dir("extension")?;
+        let registry = ScriptRegistry::load(&dir, 1024)?;
+        assert!(
+            registry.get("greet").is_some(),
+            "extensionless key resolves"
+        );
+        assert!(
+            registry.get("greet.js").is_none(),
+            "key with extension must miss"
+        );
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Empty, whitespace, and absurd-length keys resolve to `None` without panicking.
+    #[test]
+    fn degenerate_keys_are_none() -> TestResult {
+        let dir = fixture_dir("degenerate")?;
+        let registry = ScriptRegistry::load(&dir, 1024)?;
+        assert!(registry.get("").is_none(), "empty key");
+        assert!(registry.get("   ").is_none(), "whitespace key");
+        assert!(
+            registry.get(&"a/".repeat(10_000)).is_none(),
+            "very long key"
+        );
+        assert!(registry.get("greet\0").is_none(), "embedded NUL");
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Keys use forward slashes on every platform — a backslash separator must miss so
+    /// behavior is identical whether the registry was built on Windows or Linux.
+    #[test]
+    fn backslash_separator_does_not_resolve() -> TestResult {
+        let dir = fixture_dir("backslash")?;
+        let registry = ScriptRegistry::load(&dir, 1024)?;
+        assert!(
+            registry.get("acme/billing/pricing").is_some(),
+            "forward-slash key resolves"
+        );
+        assert!(
+            registry.get("acme\\billing\\pricing").is_none(),
+            "backslash key must miss"
+        );
+        fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }
