@@ -38,6 +38,9 @@ const AUTO_CONCURRENCY_FACTOR: usize = 16;
 /// Enough that distinct keys rarely collide while keeping the semaphore array small.
 const DEFAULT_PARTITION_BUCKETS: usize = 256;
 
+/// Default `db` circuit-breaker cool-down (ms) when `db_breaker_cooldown_ms` is `0`.
+const DEFAULT_BREAKER_COOLDOWN_MS: u64 = 5000;
+
 /// Top-level configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -128,6 +131,14 @@ pub(crate) struct EngineConfig {
     /// unbounded `SET`. The robust, pooler-proof ceiling is still a server-side role
     /// default; this is defense in depth (see `docs/design/resilience.md`).
     pub(crate) max_statement_timeout_ms: u64,
+    /// Circuit breaker (Tier 5/3): consecutive `db` connect failures (per `host:port`)
+    /// that trip the breaker open. `0` = off. While open, `db` requests to that target
+    /// fast-fail `DB_CIRCUIT_OPEN` (retryable) instead of waiting on the connect timeout
+    /// to a dead database (see `docs/design/resilience.md`).
+    pub(crate) db_breaker_threshold: u32,
+    /// How long (ms) the `db` circuit breaker stays open before allowing a half-open
+    /// probe. Used only when `db_breaker_threshold > 0`. `0` = default 5000.
+    pub(crate) db_breaker_cooldown_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -180,6 +191,8 @@ impl Default for EngineConfig {
             max_statement_timeout_ms: 0,     // 0 = no operator ceiling (opt-in)
             max_concurrent_per_partition: 0, // 0 = per-partition fairness off (opt-in)
             partition_buckets: 0,            // 0 = default DEFAULT_PARTITION_BUCKETS
+            db_breaker_threshold: 0,         // 0 = circuit breaker off (opt-in)
+            db_breaker_cooldown_ms: 0,       // 0 = default DEFAULT_BREAKER_COOLDOWN_MS
         }
     }
 }
@@ -215,6 +228,16 @@ impl EngineConfig {
             self.partition_buckets
         } else {
             DEFAULT_PARTITION_BUCKETS
+        }
+    }
+
+    /// Resolves the `db` circuit-breaker cool-down: the configured value, or
+    /// `DEFAULT_BREAKER_COOLDOWN_MS` when left at `0`.
+    pub(crate) const fn resolved_breaker_cooldown_ms(&self) -> u64 {
+        if self.db_breaker_cooldown_ms > 0 {
+            self.db_breaker_cooldown_ms
+        } else {
+            DEFAULT_BREAKER_COOLDOWN_MS
         }
     }
 

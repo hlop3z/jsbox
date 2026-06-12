@@ -2,6 +2,7 @@
 
 mod amq;
 mod auth;
+mod breaker;
 mod bytesize;
 mod config;
 mod db;
@@ -23,6 +24,7 @@ mod sys;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -35,6 +37,7 @@ use tokio::sync::Semaphore;
 use tracing::info;
 use tracing_subscriber::fmt::init as init_tracing;
 
+use crate::breaker::{BreakerConfig, CircuitBreaker};
 use crate::config::Config;
 use crate::handler::AppState;
 use crate::partition::PartitionLimiter;
@@ -106,11 +109,24 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             "per-partition fairness: {per_partition} concurrent/partition across {partition_buckets} buckets"
         );
     }
+    let breaker_threshold = js_pool.engine_config().db_breaker_threshold;
+    let breaker_cooldown_ms = js_pool.engine_config().resolved_breaker_cooldown_ms();
+    let db_breaker = CircuitBreaker::new(BreakerConfig {
+        threshold: breaker_threshold,
+        cooldown: Duration::from_millis(breaker_cooldown_ms),
+    })
+    .map(Arc::new);
+    if db_breaker.is_some() {
+        info!(
+            "db circuit breaker: trip after {breaker_threshold} fails, {breaker_cooldown_ms}ms cool-down"
+        );
+    }
     let state = AppState {
         pool: js_pool,
         registry: Arc::new(script_registry),
         limiter: Arc::new(Semaphore::new(max_concurrent)),
         partition_limiter,
+        db_breaker,
     };
 
     let app = Router::new()

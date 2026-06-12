@@ -26,6 +26,7 @@ use crate::amq;
 use crate::amq::{AmqConfig, AmqMetric};
 use crate::auth;
 use crate::auth::{AuthConfig, AuthMetric};
+use crate::breaker::CircuitBreaker;
 use crate::db;
 use crate::db::{DbConfig, DbMetric};
 use crate::decimal;
@@ -56,6 +57,8 @@ pub(crate) struct ExecParams<'a> {
     /// Tokio runtime handle — drives async capability I/O (e.g. `db`) from this blocking
     /// thread via `block_on` (Tier 2, see `docs/design/resilience.md`).
     pub(crate) tokio_handle: &'a Handle,
+    /// `db` circuit breaker (Tier 3). `None` = disabled.
+    pub(crate) db_breaker: Option<&'a CircuitBreaker>,
     /// JS script source.
     pub(crate) script: &'a str,
     /// Context JSON string.
@@ -313,8 +316,11 @@ fn inject_apis(
             db::inject_db(
                 qctx,
                 db_cfg,
-                params.tokio_handle,
-                params.timeout,
+                &db::DbDeps {
+                    handle: params.tokio_handle,
+                    timeout: params.timeout,
+                    breaker: params.db_breaker,
+                },
                 params.max_ops,
             )
             .map_err(map_db_inject_error)?,
@@ -349,7 +355,9 @@ fn inject_apis(
 /// Maps a `db` inject failure: a connection failure → retryable capability error;
 /// an engine-setup failure → internal.
 fn map_db_inject_error(err: Box<dyn Error + Send + Sync>) -> EngineError {
-    if db::is_connect_error(err.as_ref()) {
+    if db::is_circuit_open(err.as_ref()) {
+        EngineError::capability_inject(ErrorSource::Db, db::DB_CIRCUIT_OPEN_FAULT, err.to_string())
+    } else if db::is_connect_error(err.as_ref()) {
         EngineError::capability_inject(ErrorSource::Db, db::DB_CONNECTION_FAULT, err.to_string())
     } else {
         EngineError::internal(err)

@@ -6,6 +6,7 @@
 //! i64/BIGINT/NUMERIC always serialized as strings for JS safety.
 
 use std::error::Error;
+use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ use tokio::time::timeout;
 use tokio_postgres::types::{FromSql, IsNull, ToSql, Type};
 use tokio_postgres::{Client, Connection, NoTls};
 
+use crate::breaker::CircuitBreaker;
 use crate::errors::{self, ErrorOwner, ErrorSource, Fault};
 use crate::sandbox::{self, Collector};
 
@@ -39,6 +41,36 @@ pub(crate) const DB_CONNECTION_FAULT: Fault =
 /// the blocking thread even when the server-side `statement_timeout` was lost through a
 /// transaction-mode pooler (see `docs/design/resilience.md`).
 const DB_TIMEOUT: Fault = Fault::new("DB_TIMEOUT", true, ErrorOwner::Operator);
+/// Fault for a `db` request refused because the circuit breaker is open (Tier 3) — the
+/// target has been failing to connect, so we fast-fail instead of waiting on the timeout.
+pub(crate) const DB_CIRCUIT_OPEN_FAULT: Fault =
+    Fault::new("DB_CIRCUIT_OPEN", true, ErrorOwner::Operator);
+
+/// Marker error returned at inject time when the breaker is open (no connect attempted).
+#[derive(Debug)]
+pub(crate) struct CircuitOpen;
+
+impl Display for CircuitOpen {
+    #[expect(
+        clippy::renamed_function_params,
+        reason = "`formatter` reads better than the trait's single-char `f` (min_ident_chars)"
+    )]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("db circuit breaker open")
+    }
+}
+
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "the default Error methods (source/description/cause) are correct for a marker error"
+)]
+impl Error for CircuitOpen {}
+
+/// Returns `true` if an `inject_db` error is a breaker-open refusal (mapped to a
+/// retryable `capability/db/DB_CIRCUIT_OPEN` rather than a server fault).
+pub(crate) fn is_circuit_open(err: &(dyn Error + Send + Sync + 'static)) -> bool {
+    err.downcast_ref::<CircuitOpen>().is_some()
+}
 
 /// A db error carrying its classified [`Fault`], the raw message, and structured details.
 #[derive(Debug)]
@@ -174,12 +206,24 @@ pub(crate) struct DbMetric {
 
 // -- Public API -------------------------------------------------------------
 
+/// Runtime and resilience dependencies threaded into [`inject_db`]. Grouped so the
+/// connect/inject entry point stays within the argument-count limit as the async
+/// plumbing (Tier 2) and breaker (Tier 3) are added.
+pub(crate) struct DbDeps<'a> {
+    /// Runtime handle driving the async driver from this blocking thread (`block_on`).
+    pub(crate) handle: &'a Handle,
+    /// Execution wall-clock budget, used as the per-query client-side deadline (Tier 2).
+    pub(crate) timeout: Duration,
+    /// Optional per-target circuit breaker fast-failing a flapping database (Tier 3).
+    pub(crate) breaker: Option<&'a CircuitBreaker>,
+}
+
 /// Connects and injects the `db` global. Returns a metrics collector.
 ///
-/// `handle` drives the async driver from this blocking thread (`block_on`); `timeout`
-/// is the execution wall-clock budget, used as the per-query client-side deadline so a
-/// hung query frees its thread even when the server-side `statement_timeout` is lost
-/// through a transaction-mode pooler (Tier 2, see `docs/design/resilience.md`).
+/// `deps.handle` drives the async driver from this blocking thread (`block_on`);
+/// `deps.timeout` is the execution wall-clock budget, used as the per-query client-side
+/// deadline so a hung query frees its thread even when the server-side `statement_timeout`
+/// is lost through a transaction-mode pooler (Tier 2, see `docs/design/resilience.md`).
 ///
 /// # Errors
 ///
@@ -187,20 +231,19 @@ pub(crate) struct DbMetric {
 pub(crate) fn inject_db(
     qctx: &Ctx<'_>,
     config: &DbConfig,
-    handle: &Handle,
-    timeout: Duration,
+    deps: &DbDeps<'_>,
     max_ops: usize,
 ) -> Result<Collector<DbMetric>, Box<dyn Error + Send + Sync>> {
-    let pg_client = handle.block_on(connect(config, handle))?;
+    let pg_client = connect_through_breaker(config, deps.handle, deps.breaker)?;
     let shared_client = Arc::new(pg_client);
     let max_rows = config.max_rows;
     // Anchor the deadline at inject time (≈ execution start) so total db time is bounded
     // by the wall-clock budget. On the (practically impossible) `Instant` overflow we
     // fall back to "now", which simply makes queries deadline immediately.
     let deadline = Instant::now()
-        .checked_add(timeout)
+        .checked_add(deps.timeout)
         .unwrap_or_else(Instant::now);
-    let handle_owned = handle.clone();
+    let handle_owned = deps.handle.clone();
 
     let metrics: Collector<DbMetric> = sandbox::new_collector();
     let metrics_clone = Arc::clone(&metrics);
@@ -296,6 +339,26 @@ where
 }
 
 // -- Connection -------------------------------------------------------------
+
+/// Connects, guarded by the circuit breaker (Tier 3). An open breaker fast-fails with
+/// `CircuitOpen` (no connect attempt, no waiting on the connect timeout); otherwise the
+/// connect outcome is recorded so repeated failures trip the breaker for this target.
+fn connect_through_breaker(
+    config: &DbConfig,
+    handle: &Handle,
+    breaker: Option<&CircuitBreaker>,
+) -> Result<Client, Box<dyn Error + Send + Sync>> {
+    let Some(guard) = breaker else {
+        return handle.block_on(connect(config, handle));
+    };
+    let target = format!("{}:{}", config.host, config.port);
+    if !guard.allow(&target) {
+        return Err(Box::new(CircuitOpen));
+    }
+    let result = handle.block_on(connect(config, handle));
+    guard.record(&target, result.is_ok());
+    result
+}
 
 /// Connects to the database and applies the per-request `statement_timeout`.
 ///

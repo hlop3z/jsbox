@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::amq::{AmqConfig, AmqMetric};
 use crate::auth::{AuthConfig, AuthMetric};
+use crate::breaker::CircuitBreaker;
 use crate::db::{DbConfig, DbMetric};
 use crate::engine::{self, EngineError, ExecOutcome, ExecParams, ExecResult};
 use crate::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
@@ -47,6 +48,9 @@ pub(crate) struct AppState {
     /// disabled. Acquired *before* the global bulkhead so a noisy partition fast-fails on its
     /// own share (`429 PARTITION_OVERLOADED`) while global capacity stays free for others.
     pub(crate) partition_limiter: Option<PartitionLimiter>,
+    /// `db` circuit breaker (Tier 3): fast-fails requests to a target that keeps failing
+    /// to connect. `None` = disabled. Shared across requests.
+    pub(crate) db_breaker: Option<Arc<CircuitBreaker>>,
 }
 
 /// Pre-allocated `Box<RawValue>` for `{}` — used as default context.
@@ -357,6 +361,7 @@ pub(crate) async fn execute(
         Admission::GlobalBusy => return overloaded_response(busy_meta),
     };
 
+    let db_breaker = state.db_breaker.clone();
     let js_pool = state.pool;
     // Capture the runtime handle in the async context so the blocking task can drive
     // async capability I/O (db) via `block_on` (Tier 2).
@@ -369,6 +374,7 @@ pub(crate) async fn execute(
         let res = engine::run(&ExecParams {
             runtime: &runtime,
             tokio_handle: &tokio_handle,
+            db_breaker: db_breaker.as_deref(),
             script: source.as_str(),
             context_json: &context_json,
             timeout: engine_cfg.timeout(),

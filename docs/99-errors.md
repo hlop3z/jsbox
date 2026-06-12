@@ -157,6 +157,7 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `DB_CONNECTION`    | yes   | operator  | Couldn't reach the database (drop, or can't connect).      |
 | `DB_CANCELED`      | yes   | operator  | Query canceled / server-side statement timeout.            |
 | `DB_TIMEOUT`       | yes   | operator  | Query exceeded the client-side execution deadline (freed the thread even when the server-side timeout was lost through a pooler). |
+| `DB_CIRCUIT_OPEN`  | yes   | operator  | Circuit breaker is open — the database keeps failing to connect, so jsbox fast-failed instead of waiting. Retry after the cool-down. |
 | `DB_CONSTRAINT`    | no    | developer | Broke a rule (unique/foreign-key/etc). `details.sqlstate`. |
 | `DB_QUERY`         | no    | developer | Bad SQL.                                                   |
 | `DB_OP_LIMIT`      | no    | developer | Hit `max_ops`.                                             |

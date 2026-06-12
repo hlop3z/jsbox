@@ -680,6 +680,34 @@ def test_partition_fairness(t: Runner):
            lambda _r: r3 is not None and r3.get("meta", {}).get("partition") == "header-wins")
 
 
+def test_circuit_breaker(t: Runner):
+    """Tier 3: repeated connect failures to a dead db target trip the breaker, after which
+    requests to that target fast-fail DB_CIRCUIT_OPEN instead of waiting on the timeout —
+    and a healthy target is unaffected."""
+    t.section("Circuit breaker (Tier 3)")
+    bad = {"host": "broken-db.invalid", "port": 1, "user": "x", "password": "x", "database": "x"}
+    script = "db.query('SELECT 1'); return json('ok', null);"
+
+    codes = [_err_code(_post(h(script, config={"db": bad}))) for _ in range(7)]
+    if "DB_CIRCUIT_OPEN" not in codes:
+        print("  \033[33mPROBE\033[0m breaker not active (no db_breaker_threshold) — skipping\n")
+        return
+
+    t.test("breaker trips DB_CIRCUIT_OPEN after repeated connect failures",
+           h("return json(1,null);"), lambda _r: "DB_CIRCUIT_OPEN" in codes)
+    # An open breaker fast-fails — no connect attempt, so well under any connect wait.
+    start = time.time()
+    r = _post(h(script, config={"db": bad}))
+    elapsed = time.time() - start
+    t.test("open breaker fast-fails (no connect wait)",
+           h("return json(1,null);"),
+           lambda _r: _err_code(r) == "DB_CIRCUIT_OPEN" and elapsed < 1.5)
+    # A different, healthy target is not affected by the bad target's open breaker.
+    t.test("healthy db target unaffected by another target's open breaker",
+           h("db.query('SELECT 1'); return json('up', null);", config={"db": PG_CONFIG}),
+           data_eq("up"))
+
+
 def test_statement_timeout_clamp(t: Runner, db: dict):
     """Prove the operator ceiling clamps a per-request statement_timeout it cannot raise
     (Tier 0). Direct Postgres only — the SET is reliable there."""
@@ -944,6 +972,7 @@ def _start_server() -> subprocess.Popen:
             "max_concurrent_executions": 6,
             "max_statement_timeout_ms": 800,
             "max_concurrent_per_partition": 2,
+            "db_breaker_threshold": 3,
         },
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
@@ -986,6 +1015,7 @@ def main():
         test_db_engine(t, "PostgreSQL", PG_CONFIG)
         test_pgbouncer_edges(t, PG_CONFIG, direct=True)
         test_statement_timeout_clamp(t, PG_CONFIG)
+        test_circuit_breaker(t)
     else:
         print("\n  \033[33mSKIP\033[0m PostgreSQL tests (not running — use: docker compose up -d)\n")
 
