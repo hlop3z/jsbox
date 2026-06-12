@@ -42,9 +42,12 @@ DB_CONFIG = {"host": PGB_HOST, "port": PGB_PORT, "user": "test",
 
 # The load: a slow DB query (simulates a degraded database / saturated pool). Each
 # request holds a connection for SLEEP_S server-side.
+# The flood is tagged tenant "noisy"; the victim "good" — so with Tier 5 enabled (variant
+# B) the noisy tenant sheds on its own cap and the good tenant keeps its share.
 WORK_BODY = {
     "script": f"function handler(ctx) {{ db.query('SELECT pg_sleep({SLEEP_S})'); return json('ok', null); }}",
     "config": {"db": DB_CONFIG},
+    "tenant": "noisy",
 }
 TRIVIAL_BODY = {"script": "function handler(ctx) { return json(1, null); }"}
 # A well-behaved tenant's normal, fast query — interleaved during the overload to measure
@@ -52,6 +55,7 @@ TRIVIAL_BODY = {"script": "function handler(ctx) { return json(1, null); }"}
 VICTIM_BODY = {
     "script": "function handler(ctx) { var r = db.query('SELECT 1 AS ok'); return json(r.rows[0].ok, null); }",
     "config": {"db": DB_CONFIG},
+    "tenant": "good",
 }
 
 
@@ -218,10 +222,12 @@ def report(a: dict, b: dict):
               f"({a['p99'] / max(b['p99'], 1e-3):.0f}x lower under overload)")
     if b["shed_429"] > 0 and a["shed_429"] == 0:
         print(f"    Tier 1 ✓  B fails fast — sheds {b['shed_pct']:.0f}% as 429s; A queues (none shed)")
-    print(f"    Noisy neighbor  victim p99  A {a['vic_p99']:.2f}s  vs  B {b['vic_p99']:.2f}s")
-    if b["vic_ok"] == 0 and b["vic_shed"] > 0:
-        print("    Tier 5 gap: the global bulkhead sheds the good tenant too — per-tenant")
-        print("                fairness (Tier 5) is needed to let a good request through.")
+    print(f"    Noisy neighbor  victim (tenant 'good')  A succeeded {a['vic_ok']}  vs  B succeeded {b['vic_ok']}")
+    if b["vic_ok"] > 0:
+        print(f"    Tier 5 ✓  the good tenant keeps its share — {b['vic_ok']} victim requests got")
+        print(f"              through under the flood (A: {a['vic_ok']}, dragged to p99 {a['vic_p99']:.2f}s).")
+    elif b["vic_shed"] > 0:
+        print("    Tier 5 gap: the good tenant was shed too — is max_concurrent_per_tenant set?")
     print()
 
 
@@ -244,7 +250,8 @@ def main():
     # A: bulkhead effectively off, no statement_timeout ceiling.
     a = experiment("A baseline", {"max_concurrent_executions": 1000, "max_statement_timeout_ms": 0})
     # B: Tier 1 bulkhead + Tier 0 clamp.
-    b = experiment("B resilient", {"max_concurrent_executions": 8, "max_statement_timeout_ms": 1000})
+    b = experiment("B resilient", {"max_concurrent_executions": 8, "max_statement_timeout_ms": 1000,
+                                    "max_concurrent_per_tenant": 4})
     report(a, b)
 
 

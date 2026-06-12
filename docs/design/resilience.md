@@ -155,12 +155,18 @@ floods `/execute` with concurrent slow queries through PgBouncer, and interleave
 Reading it: under overload A piles every request into the saturated PgBouncer pool —
 tail latency climbs to 8 s (worse than the 4 s engine timeout, because even *connecting*
 queues) and most requests time out. B sheds the excess as instant 429s and holds p99 at
-40 ms. **But** the victim result exposes a real gap: B's bulkhead is *global*, so it
-rejects the good tenant alongside the flood (0 succeeded, 28 shed) — it bounds the
-victim's latency but doesn't let it through. **This is the concrete motivation for Tier 5
-(per-tenant fairness):** a global bulkhead protects the system but can't give a healthy
-tenant priority over a noisy one. The harness turning this into a number is exactly its
-job.
+40 ms. **But** the victim result (measured against the Tier 0+1-only build) exposed a real
+gap: that bulkhead is *global*, so it rejected the good tenant alongside the flood (0
+succeeded, 28 shed) — bounding the victim's latency but not letting it through. That
+number was the concrete motivation for **Tier 5 (per-tenant fairness), now implemented**.
+
+**Tier 5 closes the gap (measured).** The harness tags the flood as tenant `noisy` and the
+victim as `good`; with `max_concurrent_per_tenant` set, the noisy tenant sheds on its *own*
+cap (`TENANT_OVERLOADED`) while the good tenant keeps its share. Re-running the same
+scenario with Tier 5 enabled: **victim requests succeeded — A: 0, B: 18** (A drags the
+good tenant to p99 5.6 s and 0 get through; B lets 18 through at p99 0.09 s). The
+integration suite asserts the same mechanism (a noisy tenant sheds `TENANT_OVERLOADED`
+while a good tenant gets through).
 
 ### The plan (variants, knobs, hypotheses)
 
