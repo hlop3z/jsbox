@@ -133,6 +133,7 @@ flapping database without parsing logs:
 | `jsbox_db_breaker_trips_total`    | counter | —                               | Cumulative db circuit-breaker open transitions (Tier 3).      |
 | `jsbox_bulkhead_permits_available`| gauge   | —                               | Free global bulkhead permits right now.                       |
 | `jsbox_bulkhead_permits_total`    | gauge   | —                               | Configured global bulkhead capacity.                          |
+| `jsbox_execution_duration_seconds`| histogram | `le`                          | Execution wall-clock latency (`_bucket`/`_sum`/`_count`; executions that ran). |
 
 ## JS API
 

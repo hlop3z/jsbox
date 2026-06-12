@@ -5,9 +5,86 @@
 //! time. `Relaxed` ordering is fine — these are monotonic counters with no cross-counter
 //! invariant a reader depends on. Shared via `Arc` in `AppState`.
 
+use core::array::from_fn;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::engine::EngineError;
+
+/// Upper bounds (inclusive, microseconds) of the execution-latency histogram buckets.
+/// Integer micros are compared directly — no float conversion on the hot path. The
+/// matching `le` labels (seconds, Prometheus convention) are in [`LATENCY_BUCKET_LABELS`].
+const LATENCY_BUCKETS_US: [u64; 12] = [
+    1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000,
+    5_000_000, 10_000_000,
+];
+
+/// `le` labels (seconds) for [`LATENCY_BUCKETS_US`], in the same order.
+const LATENCY_BUCKET_LABELS: [&str; 12] = [
+    "0.001", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10",
+];
+
+/// A fixed-bucket latency histogram (Prometheus `_bucket`/`_sum`/`_count`). Lock-free:
+/// each observation increments one bucket plus the running sum/count. Buckets are stored
+/// non-cumulatively and accumulated at render time.
+#[derive(Debug)]
+struct LatencyHistogram {
+    /// Per-bucket observation counts, aligned with [`LATENCY_BUCKETS_US`].
+    buckets: [AtomicU64; 12],
+    /// Sum of all observed durations, in microseconds (rendered as seconds).
+    sum_us: AtomicU64,
+    /// Total number of observations (the implicit `+Inf` bucket).
+    count: AtomicU64,
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: from_fn(|_idx| AtomicU64::new(0)),
+            sum_us: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+}
+
+impl LatencyHistogram {
+    /// Records one observation: bumps the first bucket whose bound it falls within (an
+    /// over-`10s` outlier lands only in `+Inf`/`count`), plus the sum and count.
+    fn observe(&self, micros: u64) {
+        for (bound, counter) in LATENCY_BUCKETS_US.iter().zip(self.buckets.iter()) {
+            if micros <= *bound {
+                let _ = counter.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+        let _ = self.count.fetch_add(1, Ordering::Relaxed);
+        let _ = self.sum_us.fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// Renders the full Prometheus histogram family for metric `name` (a `_seconds`
+    /// histogram): cumulative `_bucket{le}` lines, the `+Inf` bucket, `_sum`, `_count`.
+    fn render(&self, name: &str) -> String {
+        let total = self.count.load(Ordering::Relaxed);
+        let mut cumulative: u64 = 0;
+        let mut lines: Vec<String> = Vec::new();
+        for (label, counter) in LATENCY_BUCKET_LABELS.iter().zip(self.buckets.iter()) {
+            cumulative = cumulative.saturating_add(counter.load(Ordering::Relaxed));
+            lines.push(format!("{name}_bucket{{le=\"{label}\"}} {cumulative}"));
+        }
+        lines.push(format!("{name}_bucket{{le=\"+Inf\"}} {total}"));
+        let sum_us = self.sum_us.load(Ordering::Relaxed);
+        // Seconds, formatted from integer micros (no float): whole.frac, 6-digit fraction.
+        let whole = sum_us / 1_000_000;
+        let frac = sum_us % 1_000_000;
+        format!(
+            "# HELP {name} Execution wall-clock latency.\n\
+             # TYPE {name} histogram\n\
+             {buckets}\n\
+             {name}_sum {whole}.{frac:06}\n\
+             {name}_count {total}\n",
+            buckets = lines.join("\n"),
+        )
+    }
+}
 
 /// All process-wide counters. One instance lives in `AppState`, shared across requests.
 #[derive(Debug, Default)]
@@ -32,6 +109,8 @@ pub(crate) struct Metrics {
     overload_global: AtomicU64,
     /// Requests shed by a partition's fairness cap (`429 PARTITION_OVERLOADED`).
     overload_partition: AtomicU64,
+    /// Wall-clock latency of executions that actually ran (excludes shed/rejected requests).
+    exec_latency: LatencyHistogram,
 }
 
 impl Metrics {
@@ -70,6 +149,13 @@ impl Metrics {
         let _ = self.overload_partition.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Observes the wall-clock latency (microseconds) of an execution that ran. Clamps a
+    /// (practically impossible) `u128` overflow to `u64::MAX` rather than wrapping.
+    pub(crate) fn observe_execution(&self, micros: u128) {
+        self.exec_latency
+            .observe(u64::try_from(micros).unwrap_or(u64::MAX));
+    }
+
     /// Renders the Prometheus text exposition (v0.0.4). `bulkhead_available` /
     /// `bulkhead_total` are the live semaphore permits; `breaker_trips` is the cumulative
     /// circuit-breaker open count (both read at scrape time, not stored here).
@@ -105,7 +191,8 @@ impl Metrics {
              jsbox_bulkhead_permits_available {bulkhead_available}\n\
              # HELP jsbox_bulkhead_permits_total Configured global bulkhead capacity.\n\
              # TYPE jsbox_bulkhead_permits_total gauge\n\
-             jsbox_bulkhead_permits_total {bulkhead_total}\n",
+             jsbox_bulkhead_permits_total {bulkhead_total}\n\
+             {latency}",
             success = load(&self.success),
             script_error = load(&self.script_error),
             capability_error = load(&self.capability_error),
@@ -116,6 +203,7 @@ impl Metrics {
             rejections = load(&self.rejections),
             overload_global = load(&self.overload_global),
             overload_partition = load(&self.overload_partition),
+            latency = self.exec_latency.render("jsbox_execution_duration_seconds"),
         )
     }
 }
@@ -160,5 +248,32 @@ mod tests {
         assert!(text.contains("jsbox_overload_total{scope=\"partition\"} 1"));
         assert!(text.contains("jsbox_db_breaker_trips_total 2"));
         assert!(text.contains("jsbox_bulkhead_permits_available 5"));
+    }
+
+    /// Latency observations land in the right cumulative buckets and sum/count totals.
+    #[test]
+    fn histogram_buckets_are_cumulative() {
+        let metrics = Metrics::default();
+        metrics.observe_execution(3_000); // 3ms  -> le="0.005" and up
+        metrics.observe_execution(80_000); // 80ms -> le="0.1" and up
+        metrics.observe_execution(50_000_000); // 50s -> only +Inf
+        let text = metrics.render(1, 1, 0);
+        // le="0.005" has counted the 3ms observation only.
+        assert!(
+            text.contains("jsbox_execution_duration_seconds_bucket{le=\"0.005\"} 1"),
+            "3ms in the 5ms bucket"
+        );
+        // le="0.1" is cumulative: the 3ms + 80ms observations.
+        assert!(
+            text.contains("jsbox_execution_duration_seconds_bucket{le=\"0.1\"} 2"),
+            "cumulative through 100ms"
+        );
+        // +Inf and count include the 50s outlier; sum = 0.003+0.08+50 = 50.083s.
+        assert!(text.contains("jsbox_execution_duration_seconds_bucket{le=\"+Inf\"} 3"));
+        assert!(text.contains("jsbox_execution_duration_seconds_count 3"));
+        assert!(
+            text.contains("jsbox_execution_duration_seconds_sum 50.083000"),
+            "sum rendered as seconds from integer micros"
+        );
     }
 }

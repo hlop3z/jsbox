@@ -439,6 +439,8 @@ fn build_response(
     error_debug: bool,
     metrics: &Metrics,
 ) -> AxumResponse {
+    // Record latency for every execution that ran (shed/rejected requests return earlier).
+    metrics.observe_execution(base_meta.exec_time_us);
     match result {
         Ok(Ok(exec)) => {
             let drained = ExecMetrics {
