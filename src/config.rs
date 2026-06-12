@@ -28,6 +28,12 @@ const PARSE_HEAP_FACTOR: usize = 4;
 /// memory limit by 8 leaves headroom for real handler work, not just loading the input.
 const CONTEXT_LIMIT_DIVISOR: usize = 8;
 
+/// Multiplier for the auto-derived concurrency bulkhead (used when
+/// `max_concurrent_executions` is left at `0`): `pool_size × this`. Generous enough not
+/// to throttle typical I/O-bound load, but far below the `spawn_blocking` thread ceiling
+/// (~512) so a slow downstream can't exhaust the runtime (see `docs/design/resilience.md`).
+const AUTO_CONCURRENCY_FACTOR: usize = 16;
+
 /// Top-level configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -98,6 +104,17 @@ pub(crate) struct EngineConfig {
     pub(crate) max_context_size: usize,
     /// Maximum HTTP/DB operations per execution (default 50).
     pub(crate) max_ops: usize,
+    /// Bulkhead: max concurrent executions in flight. `0` = auto
+    /// (`pool_size × AUTO_CONCURRENCY_FACTOR`). Excess load fast-fails `429 OVERLOADED`
+    /// rather than exhausting blocking threads / DB connections under a slow downstream
+    /// (see `docs/design/resilience.md`). Tune to the downstream connection budget.
+    pub(crate) max_concurrent_executions: usize,
+    /// Operator ceiling (ms) for the `db` `statement_timeout`. `0` = no ceiling. A
+    /// per-request `config.db.statement_timeout_ms` is clamped to this, and a request
+    /// value of `0` ("unlimited") becomes this ceiling — so jsbox never issues an
+    /// unbounded `SET`. The robust, pooler-proof ceiling is still a server-side role
+    /// default; this is defense in depth (see `docs/design/resilience.md`).
+    pub(crate) max_statement_timeout_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -108,8 +125,6 @@ impl Default for ServerConfig {
         }
     }
 }
-
-
 
 /// `EngineConfig`
 ///
@@ -141,13 +156,15 @@ impl Default for ServerConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            memory_limit: 32 * 1024 * 1024,      // 32mb
-            max_stack_size: 512 * 1024,          // 512kb
-            timeout_ms: 4000,                    // 4s balanced default
-            pool_size: 0,                        // Auto
-            max_script_size: 1024 * 1024,        // 1mb
-            max_context_size: 0,                 // 0 = auto: memory_limit / CONTEXT_LIMIT_DIVISOR
-            max_ops: 1500,                       // safe cap for API workloads
+            memory_limit: 32 * 1024 * 1024, // 32mb
+            max_stack_size: 512 * 1024,     // 512kb
+            timeout_ms: 4000,               // 4s balanced default
+            pool_size: 0,                   // Auto
+            max_script_size: 1024 * 1024,   // 1mb
+            max_context_size: 0,            // 0 = auto: memory_limit / CONTEXT_LIMIT_DIVISOR
+            max_ops: 1500,                  // safe cap for API workloads
+            max_concurrent_executions: 0,   // 0 = auto: pool_size * AUTO_CONCURRENCY_FACTOR
+            max_statement_timeout_ms: 0,    // 0 = no operator ceiling (opt-in)
         }
     }
 }
@@ -163,6 +180,17 @@ impl EngineConfig {
     /// Returns the timeout as a `Duration`.
     pub(crate) const fn timeout(&self) -> Duration {
         Duration::from_millis(self.timeout_ms)
+    }
+
+    /// Resolves the concurrency bulkhead size: the configured value, or the auto default
+    /// `pool_size × AUTO_CONCURRENCY_FACTOR` when left at `0`. Never returns `0` (a
+    /// zero-permit semaphore would deadlock every request).
+    pub(crate) const fn resolved_max_concurrent(&self, pool_size: usize) -> usize {
+        if self.max_concurrent_executions > 0 {
+            return self.max_concurrent_executions;
+        }
+        let auto = pool_size.saturating_mul(AUTO_CONCURRENCY_FACTOR);
+        if auto > 0 { auto } else { 1 }
     }
 
     /// Maximum HTTP request body size (derived from script + context limits + overhead).
@@ -185,10 +213,15 @@ impl EngineConfig {
     /// `memory_limit / PARSE_HEAP_FACTOR`.
     fn resolve_limits(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
         if self.max_context_size == 0 {
-            self.max_context_size =
-                self.memory_limit.checked_div(CONTEXT_LIMIT_DIVISOR).unwrap_or(0);
+            self.max_context_size = self
+                .memory_limit
+                .checked_div(CONTEXT_LIMIT_DIVISOR)
+                .unwrap_or(0);
         }
-        let parse_ceiling = self.memory_limit.checked_div(PARSE_HEAP_FACTOR).unwrap_or(0);
+        let parse_ceiling = self
+            .memory_limit
+            .checked_div(PARSE_HEAP_FACTOR)
+            .unwrap_or(0);
         if self.max_context_size > parse_ceiling {
             return Err(format!(
                 "max_context_size ({} bytes) exceeds the parse ceiling memory_limit/{} ({} bytes): \

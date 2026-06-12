@@ -23,13 +23,14 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::serve::ListenerExt as _;
-use axum::Router;
 use rustls::crypto::aws_lc_rs;
 use tokio::net::TcpListener;
 use tokio::signal;
+use tokio::sync::Semaphore;
 use tracing::info;
 use tracing_subscriber::fmt::init as init_tracing;
 
@@ -70,7 +71,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     );
 
     if config.debug {
-        info!("DEBUG MODE: SSRF private-IP block relaxed (local testing only — do not use in production)");
+        info!(
+            "DEBUG MODE: SSRF private-IP block relaxed (local testing only — do not use in production)"
+        );
     }
 
     // Load the read-only script registry before the engine config moves into the pool.
@@ -79,14 +82,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         |dir| ScriptRegistry::load(dir, config.engine.max_script_size),
     )?;
     if script_registry.count() > 0 {
-        info!("script registry: {} scripts loaded", script_registry.count());
+        info!(
+            "script registry: {} scripts loaded",
+            script_registry.count()
+        );
     }
 
     let js_pool = JsPool::new(config.engine, config.debug, config.error_debug)?;
     info!("JS runtime pool: {} slots", js_pool.size());
 
     let body_limit = js_pool.engine_config().max_body_size();
-    let state = AppState { pool: js_pool, registry: Arc::new(script_registry) };
+    let max_concurrent = js_pool
+        .engine_config()
+        .resolved_max_concurrent(js_pool.size());
+    info!("execution bulkhead: {max_concurrent} concurrent");
+    let state = AppState {
+        pool: js_pool,
+        registry: Arc::new(script_registry),
+        limiter: Arc::new(Semaphore::new(max_concurrent)),
+    };
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -115,9 +129,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 /// Waits for SIGTERM (container stop) or Ctrl+C.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .unwrap_or_else(|_err| unreachable!());
+        signal::ctrl_c().await.unwrap_or_else(|_err| unreachable!());
     };
 
     #[cfg(unix)]

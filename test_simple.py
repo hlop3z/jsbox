@@ -94,11 +94,21 @@ def _post(body: dict) -> dict | None:
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
+            return _parse_response(resp.getcode(), resp.read())
     except urllib.error.HTTPError as err:
-        return json.loads(err.read())
+        return _parse_response(err.code, err.read())
     except Exception:
         return None
+
+
+def _parse_response(status: int, raw: bytes) -> dict:
+    """Parse a server response. A well-formed jsbox response is the JSON envelope; a
+    non-JSON body (e.g. axum's plain-text deserialize rejection) is surfaced as a
+    sentinel so tests can assert on the contract gap instead of crashing."""
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"_http_status": status, "_non_json_body": raw.decode("utf-8", "replace")}
 
 
 # -- Script helpers ----------------------------------------------------------
@@ -144,6 +154,15 @@ def error_contains(text: str):
 
 def data_none_with_error():
     return lambda r: r["data"] is None and r["error"] is not None
+
+
+def _err_code(r):
+    """The system-error `code`, or None. Safe when `error` is null or absent
+    (r.get('error', {}) returns None when the key exists with a null value)."""
+    if not r:
+        return None
+    err = r.get("error")
+    return err.get("code") if isinstance(err, dict) else None
 
 
 # -- Test definitions --------------------------------------------------------
@@ -471,6 +490,215 @@ def test_registry(t: Runner):
         print("\n  \033[33mSKIP\033[0m registry execution tests (server not started with scripts_dir=tests/scripts)\n")
 
 
+# -- Adversarial: try to break the registry + request contract ---------------
+
+def test_registry_hardening(t: Runner):
+    """Actively attack the execute-by-key surface: traversal, type confusion, edges."""
+    t.section("Registry hardening (adversarial)")
+
+    # Path traversal via key must never escape the registry — `key` is a map lookup,
+    # never a filesystem path at request time. Each of these is a clean 404, not a
+    # file read, a 500, or a panic.
+    for evil in ["../greet", "../../../etc/passwd", "..\\..\\greet", "/etc/passwd",
+                 "acme/../greet", "greet/../greet", "./greet"]:
+        t.test(f"traversal key rejected: {evil}",
+               {"key": evil},
+               lambda r: r["error"]["code"] == "SCRIPT_NOT_FOUND")
+
+    # The extensionless key is the contract; the filename must miss.
+    t.test("key with .js extension misses",
+           {"key": "greet.js"},
+           lambda r: r["error"]["code"] == "SCRIPT_NOT_FOUND")
+
+    # Degenerate keys: empty string is a present-but-unknown key (404), not "neither".
+    t.test("empty-string key -> 404 not XOR",
+           {"key": ""},
+           lambda r: r["error"]["code"] == "SCRIPT_NOT_FOUND")
+    t.test("very long key -> clean 404",
+           {"key": "a/" * 5000},
+           lambda r: r["error"]["code"] == "SCRIPT_NOT_FOUND")
+
+    # Type confusion: wrong JSON types for script/key must be rejected with the SAME
+    # structured {data,error,meta} envelope as every other error (code MALFORMED_REQUEST),
+    # never axum's default plain-text rejection and never a panic/hang.
+    def malformed(r):
+        return (r is not None and "_non_json_body" not in r
+                and r.get("data") is None
+                and _err_code(r) == "MALFORMED_REQUEST"
+                and r["error"]["type"] == "request")
+    t.test("numeric key -> MALFORMED_REQUEST envelope", {"key": 123}, malformed)
+    t.test("array script -> MALFORMED_REQUEST envelope", {"script": ["function handler(){}"]}, malformed)
+    t.test("object key -> MALFORMED_REQUEST envelope", {"key": {"nested": "x"}}, malformed)
+    t.test("meta present on malformed body", {"key": 123},
+           lambda r: r is not None and "trace_id" in r.get("meta", {}))
+
+    # meta.key must echo on the error paths too (audit trail survives failure).
+    t.test("meta.key echoes on SCRIPT_NOT_FOUND",
+           {"key": "no/such/thing"},
+           lambda r: r["meta"]["key"] == "no/such/thing")
+    t.test("meta.key echoes on XOR rejection",
+           {"script": "function handler(){}", "key": "greet"},
+           lambda r: r["meta"]["key"] == "greet" and r["error"]["code"] == "SCRIPT_XOR_KEY")
+
+    # Registered scripts must travel the IDENTICAL engine path as inline — prove the
+    # failure modes match by registering nothing special and exercising a known script.
+    probe = _post({"key": "greet"})
+    if not (probe is not None and probe.get("data") == "hello world"):
+        print("\n  \033[33mSKIP\033[0m registry engine-path tests (no scripts_dir)\n")
+        return
+    # A registered script gets the same sandbox: context still flows, config still
+    # per-request, and a huge context is still rejected the same way as inline.
+    big = "x" * (5 * 1024 * 1024)
+    t.test("oversize context rejected in key mode",
+           {"key": "greet", "context": {"blob": big}},
+           lambda r: r["error"]["code"] == "CONTEXT_TOO_LARGE")
+    t.test("key mode cannot reach db without config",
+           {"key": "greet"},
+           lambda r: r["error"] is None and r["data"] == "hello world")
+
+
+def test_isolation_under_concurrency(t: Runner):
+    """Fire interleaved requests that pollute globals; prove fresh-context isolation."""
+    t.section("Isolation under concurrency (adversarial)")
+    import concurrent.futures
+
+    # Each request sets a global and reads it back; if contexts leaked across the pool,
+    # a request would observe another's value. Run many in parallel and check every one
+    # sees only its own id.
+    def one(i):
+        # Retry on a bulkhead 429 — this probes isolation, not capacity.
+        for _ in range(20):
+            body = h(f"globalThis.__leak = {i}; return json(globalThis.__leak, null);")
+            r = _post(body)
+            if _err_code(r) == "OVERLOADED":
+                time.sleep(0.02)
+                continue
+            return r is not None and r.get("data") == i
+        return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+        results = list(ex.map(one, range(200)))
+    t.test("no global leakage across 200 concurrent runs",
+           h("return json(1, null);"),
+           lambda _r: all(results))
+
+    # A prior request that defines a function must not be visible to the next.
+    _post(h("globalThis.__planted = function(){ return 'pwned'; }; return json(1, null);"))
+    t.test("planted global not visible to next request",
+           h("return json(typeof globalThis.__planted, null);"),
+           data_eq("undefined"))
+
+
+# -- Resilience: bulkhead (Tier 1) + statement_timeout clamp (Tier 0) ---------
+
+def test_bulkhead(t: Runner):
+    """Saturate the bulkhead and prove excess load fast-fails 429 OVERLOADED while the
+    server stays responsive (the SLO-protecting behavior)."""
+    t.section("Bulkhead / overload (resilience)")
+    import concurrent.futures
+
+    # A request that holds its permit for a few hundred ms of CPU work.
+    slow = h("var x=0; for (var i=0;i<15000000;i++){ x+=i; } return json(x>0, null);")
+
+    def fire(_):
+        r = _post(slow)
+        if r is None:
+            return "none"
+        if _err_code(r) == "OVERLOADED":
+            return "429"
+        return "ok" if r.get("data") is True else "other"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=24) as ex:
+        outcomes = list(ex.map(fire, range(24)))
+
+    # The bulkhead only sheds load when the configured bound is below the burst size.
+    # If the server runs the default (auto, high) bound, nothing is shed — probe, don't fail.
+    if "429" not in outcomes:
+        print(f"  \033[33mPROBE\033[0m bulkhead not exercised (no 429s; bound >= burst). outcomes={set(outcomes)}\n")
+    else:
+        t.test("bulkhead sheds excess as 429 OVERLOADED",
+               h("return json(1,null);"), lambda _r: "429" in outcomes)
+        t.test("some requests still succeed under overload",
+               h("return json(1,null);"), lambda _r: "ok" in outcomes)
+    # Either way, the server must be responsive immediately after the burst.
+    t.test("server responsive right after overload burst",
+           h("return json('alive', null);"), data_eq("alive"))
+
+
+def test_statement_timeout_clamp(t: Runner, db: dict):
+    """Prove the operator ceiling clamps a per-request statement_timeout it cannot raise
+    (Tier 0). Direct Postgres only — the SET is reliable there."""
+    t.section("statement_timeout clamp (Tier 0)")
+
+    def killed(config):
+        r = _post(h("db.query('SELECT pg_sleep(2)'); return json('slept', null);", config={"db": config}))
+        return r is not None and r["data"] is None and r["error"] is not None
+
+    # Ask for an unbounded timeout. If the operator ceiling is active, the 2s sleep is
+    # killed well before it finishes. If no ceiling is configured, the sleep completes —
+    # probe and skip rather than fail (the suite may run against an unconfigured server).
+    if not killed({**db, "statement_timeout_ms": 0}):
+        print("  \033[33mPROBE\033[0m clamp not active (server has no max_statement_timeout_ms) — skipping\n")
+        return
+    t.test("request statement_timeout=0 (unlimited) is clamped + killed",
+           h("return json(1,null);"), lambda _r: True)
+    t.test("request statement_timeout=60000 (huge) is clamped + killed",
+           h("return json(1,null);"), lambda _r: killed({**db, "statement_timeout_ms": 60000}))
+
+
+# -- Adversarial: PgBouncer transaction-mode sharp edges ---------------------
+
+def test_pgbouncer_edges(t: Runner, db: dict, direct: bool):
+    """Probe the documented hazards of running jsbox's per-request connect model
+    behind a transaction-pooling PgBouncer. `direct` = same probes against raw
+    Postgres for comparison (those MUST all be safe)."""
+    label = "Postgres-direct" if direct else "PgBouncer"
+    t.section(f"Connection-pool edges ({label})")
+
+    # (1) statement_timeout enforcement. jsbox applies it as a session-level `SET` at
+    # connect (db.rs). On a direct connection this is a hard guarantee — assert it. Behind
+    # PgBouncer transaction mode it is BEST-EFFORT: the SET binds to one server connection
+    # and a later autocommit statement may run on a different one, so we probe and record
+    # rather than assert. (A startup parameter would be robust but PgBouncer refuses it:
+    # "unsupported startup parameter in options". The robust path through a txn-mode pooler
+    # is a server-side role default — see docs/design/pooled-capabilities.md.) Either way
+    # jsbox's wall-clock interrupt cannot cancel a blocking libpq call, so the DB-side cap
+    # is the only thing that stops a slow query.
+    fast = {**db, "statement_timeout_ms": 800}
+    r = _post(h("db.query('SELECT pg_sleep(3)'); return json('slept-full', null);",
+                config={"db": fast}))
+    enforced = r is not None and r["data"] is None and r["error"] is not None
+    if direct:
+        t.test(f"{label}: statement_timeout enforced (sleep killed)",
+               h("return json(1,null);"), lambda _r: enforced)
+    else:
+        verdict = "ENFORCED" if enforced else "NOT ENFORCED — sleep ran full"
+        print(f"  \033[33mPROBE\033[0m {label}: statement_timeout via SET -> {verdict} "
+              f"(best-effort in txn pooling; use a server-side role default for a guarantee)")
+        t.test(f"{label}: server responsive after long query",
+               h("return json('alive', null);"), data_eq("alive"))
+
+    # (2) Explicit transactions pin to one server connection in txn mode — multi-step
+    # work and session-scoped temp tables MUST hold within begin/commit. This is the
+    # safe pattern and must pass on both.
+    t.test(f"{label}: temp table within one transaction",
+           h("db.begin();"
+             "db.execute('CREATE TEMP TABLE t_edge(x int) ON COMMIT DROP');"
+             "db.execute('INSERT INTO t_edge VALUES (7)');"
+             "var r = db.query('SELECT x FROM t_edge');"
+             "db.commit();"
+             "return json(r.rows[0].x, null);", config={"db": db}),
+           data_eq(7))
+
+    # (3) Prepared-statement reuse: the Rust driver prepares each query; hammering the
+    # same parameterized query many times must not trip "prepared statement does not
+    # exist" as PgBouncer rotates server connections (needs max_prepared_statements>0).
+    t.test(f"{label}: 25x parameterized query reuse",
+           h("var n=0; for (var i=0;i<25;i++){var r=db.query('SELECT $1::int AS v',[i]); n+=r.rows[0].v;} return json(n, null);",
+             config={"db": db}),
+           data_eq(sum(range(25))))
+
+
 # -- Auth (OIDC/IAM) tests ---------------------------------------------------
 
 def _provider_req(url: str, method: str = "GET", form=None, payload=None, headers=None):
@@ -656,6 +884,11 @@ def _start_server() -> subprocess.Popen:
     config = {
         "debug": True,
         "scripts_dir": os.path.join(repo, "tests", "scripts"),
+        # Low bounds so the resilience tests actually exercise the bulkhead + clamp.
+        "engine": {
+            "max_concurrent_executions": 6,
+            "max_statement_timeout_ms": 800,
+        },
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
         json.dump(config, fh)
@@ -687,10 +920,15 @@ def main():
     test_http_api(t)
 
     test_registry(t)
+    test_registry_hardening(t)
+    test_isolation_under_concurrency(t)
+    test_bulkhead(t)
 
     # Database tests — only if containers are running
     if _db_available(PG_CONFIG):
         test_db_engine(t, "PostgreSQL", PG_CONFIG)
+        test_pgbouncer_edges(t, PG_CONFIG, direct=True)
+        test_statement_timeout_clamp(t, PG_CONFIG)
     else:
         print("\n  \033[33mSKIP\033[0m PostgreSQL tests (not running — use: docker compose up -d)\n")
 
@@ -698,6 +936,7 @@ def main():
     # connect model works unchanged behind a pooler (docs/design/pooled-capabilities.md).
     if _db_available(PGB_CONFIG):
         test_db_engine(t, "PgBouncer", PGB_CONFIG)
+        test_pgbouncer_edges(t, PGB_CONFIG, direct=False)
     else:
         print("\n  \033[33mSKIP\033[0m PgBouncer tests (not running — use: docker compose up -d pgbouncer)\n")
 

@@ -13,13 +13,14 @@
 
 use std::error::Error;
 use std::fmt::Display;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rquickjs::{Context, Ctx, Function, Object, Runtime, Value as JsValue};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::runtime::Handle;
 
 use crate::amq;
 use crate::amq::{AmqConfig, AmqMetric};
@@ -52,6 +53,9 @@ const MEMORY_MSG: &str = "memory limit exceeded";
 pub(crate) struct ExecParams<'a> {
     /// The pooled runtime.
     pub(crate) runtime: &'a Runtime,
+    /// Tokio runtime handle — drives async capability I/O (e.g. `db`) from this blocking
+    /// thread via `block_on` (Tier 2, see `docs/design/resilience.md`).
+    pub(crate) tokio_handle: &'a Handle,
     /// JS script source.
     pub(crate) script: &'a str,
     /// Context JSON string.
@@ -295,13 +299,26 @@ fn inject_apis(
 ) -> Result<(), EngineError> {
     if !params.allowed_hosts.is_empty() {
         *collectors.http = Some(
-            http::inject_api(qctx, params.allowed_hosts, params.max_ops, params.allow_private_targets)
-                .map_err(EngineError::internal)?,
+            http::inject_api(
+                qctx,
+                params.allowed_hosts,
+                params.max_ops,
+                params.allow_private_targets,
+            )
+            .map_err(EngineError::internal)?,
         );
     }
     if let Some(db_cfg) = params.db_config {
-        *collectors.db =
-            Some(db::inject_db(qctx, db_cfg, params.max_ops).map_err(map_db_inject_error)?);
+        *collectors.db = Some(
+            db::inject_db(
+                qctx,
+                db_cfg,
+                params.tokio_handle,
+                params.timeout,
+                params.max_ops,
+            )
+            .map_err(map_db_inject_error)?,
+        );
     }
     if let Some(mail_cfg) = params.mail_config {
         *collectors.mail =
@@ -314,8 +331,9 @@ fn inject_apis(
         );
     }
     if let Some(redis_cfg) = params.redis_config {
-        *collectors.redis =
-            Some(kv::inject_redis(qctx, redis_cfg, params.max_ops).map_err(map_redis_inject_error)?);
+        *collectors.redis = Some(
+            kv::inject_redis(qctx, redis_cfg, params.max_ops).map_err(map_redis_inject_error)?,
+        );
     }
     if let Some(amq_cfg) = params.amq_config {
         *collectors.amq =
@@ -342,7 +360,11 @@ fn map_db_inject_error(err: Box<dyn Error + Send + Sync>) -> EngineError {
 /// an engine-setup failure → internal.
 fn map_redis_inject_error(err: Box<dyn Error + Send + Sync>) -> EngineError {
     if kv::is_connect_error(err.as_ref()) {
-        EngineError::capability_inject(ErrorSource::Redis, kv::REDIS_CONNECTION_FAULT, err.to_string())
+        EngineError::capability_inject(
+            ErrorSource::Redis,
+            kv::REDIS_CONNECTION_FAULT,
+            err.to_string(),
+        )
     } else {
         EngineError::internal(err)
     }
@@ -415,12 +437,17 @@ fn classify_eval_error(qctx: &Ctx<'_>) -> EngineError {
 /// error, which correctly attributes it to the developer's code.
 fn classify_throw(qctx: &Ctx<'_>, timed_out: &AtomicBool, timeout: Duration) -> EngineError {
     if timed_out.load(Ordering::Relaxed) {
-        return EngineError::Timeout { limit_ms: timeout.as_millis() };
+        return EngineError::Timeout {
+            limit_ms: timeout.as_millis(),
+        };
     }
 
     let caught = qctx.catch();
     let Some(obj) = caught.as_object() else {
-        return EngineError::Script { message: stringify_value(&caught), stack: None };
+        return EngineError::Script {
+            message: stringify_value(&caught),
+            stack: None,
+        };
     };
 
     let stack = read_str_prop(obj, "stack");
@@ -451,7 +478,11 @@ fn read_capability_tag<'js>(
     let tag: CapabilityTag = serde_json::from_str(&json).ok()?;
 
     let source = ErrorSource::parse(&tag.source)?;
-    let owner = tag.owner.as_deref().and_then(ErrorOwner::parse).unwrap_or(ErrorOwner::Operator);
+    let owner = tag
+        .owner
+        .as_deref()
+        .and_then(ErrorOwner::parse)
+        .unwrap_or(ErrorOwner::Operator);
     Some(CapabilityErr {
         source,
         code: tag.code,
@@ -465,7 +496,9 @@ fn read_capability_tag<'js>(
 
 /// Reads a non-empty string property off a JS object.
 fn read_str_prop(obj: &Object<'_>, key: &str) -> Option<String> {
-    obj.get::<_, String>(key).ok().filter(|text| !text.is_empty())
+    obj.get::<_, String>(key)
+        .ok()
+        .filter(|text| !text.is_empty())
 }
 
 /// Best-effort string for a thrown non-object value (`throw "x"` / `throw 42`).
@@ -494,9 +527,20 @@ fn extract_json_string<'js>(
 // -- Error → envelope assembly ----------------------------------------------
 
 /// Builds a `runtime`-category envelope (source = engine) with a safe message.
-fn runtime_envelope(code: &str, retryable: bool, owner: ErrorOwner, message: String) -> ErrorEnvelope {
-    ErrorEnvelope::new(ErrorCategory::Runtime, ErrorSource::Engine, code.to_owned(), retryable, owner)
-        .with_message(message)
+fn runtime_envelope(
+    code: &str,
+    retryable: bool,
+    owner: ErrorOwner,
+    message: String,
+) -> ErrorEnvelope {
+    ErrorEnvelope::new(
+        ErrorCategory::Runtime,
+        ErrorSource::Engine,
+        code.to_owned(),
+        retryable,
+        owner,
+    )
+    .with_message(message)
 }
 
 /// Builds a `script`-category envelope, attaching the stack when debug is on. The
@@ -582,21 +626,31 @@ impl EngineError {
         let dev = ErrorOwner::Developer;
         match self {
             Self::Syntax(message) => runtime_envelope("SYNTAX_ERROR", false, dev, message),
-            Self::HandlerNotDefined => {
-                runtime_envelope("HANDLER_NOT_DEFINED", false, dev, HANDLER_MISSING_MSG.to_owned())
-            }
+            Self::HandlerNotDefined => runtime_envelope(
+                "HANDLER_NOT_DEFINED",
+                false,
+                dev,
+                HANDLER_MISSING_MSG.to_owned(),
+            ),
             Self::Timeout { limit_ms } => runtime_envelope(
                 "TIMEOUT",
                 false,
                 dev,
                 format!("execution timed out ({limit_ms}ms limit)"),
             ),
-            Self::MemoryLimit => runtime_envelope("MEMORY_LIMIT", false, dev, MEMORY_MSG.to_owned()),
+            Self::MemoryLimit => {
+                runtime_envelope("MEMORY_LIMIT", false, dev, MEMORY_MSG.to_owned())
+            }
             Self::Malformed(message) => runtime_envelope("MALFORMED_RESPONSE", false, dev, message),
             // Generic message + raw cause in gated debug — never leak internal infra
             // detail (hostnames, etc.) in the always-present `message`.
             Self::Internal(raw) => attach_debug(
-                runtime_envelope("INTERNAL", true, ErrorOwner::Operator, "internal error".to_owned()),
+                runtime_envelope(
+                    "INTERNAL",
+                    true,
+                    ErrorOwner::Operator,
+                    "internal error".to_owned(),
+                ),
                 None,
                 Some(raw),
                 error_debug,

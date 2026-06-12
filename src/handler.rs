@@ -3,12 +3,15 @@
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
+use axum::Json;
 use axum::extract::State;
+use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response as AxumResponse};
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use tokio::runtime::Handle;
+use tokio::sync::Semaphore;
 use tokio::task;
 use tracing::warn;
 use uuid::Uuid;
@@ -17,7 +20,7 @@ use crate::amq::{AmqConfig, AmqMetric};
 use crate::auth::{AuthConfig, AuthMetric};
 use crate::db::{DbConfig, DbMetric};
 use crate::engine::{self, EngineError, ExecOutcome, ExecParams, ExecResult};
-use crate::errors::{ErrorCategory, ErrorEnvelope, ErrorOwner, ErrorSource};
+use crate::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
 use crate::http::HttpMetric;
 use crate::kv::{RedisConfig, RedisMetric};
 use crate::mail::{MailConfig, MailMetric};
@@ -27,13 +30,18 @@ use crate::s3::{S3Config, S3Metric};
 use crate::sandbox;
 use crate::sys::SysConfig;
 
-/// Shared application state for the router: the runtime pool + the script registry.
+/// Shared application state for the router: the runtime pool, the script registry, and
+/// the concurrency bulkhead.
 #[derive(Debug, Clone)]
 pub(crate) struct AppState {
     /// Pool of pre-warmed `QuickJS` runtimes.
     pub(crate) pool: JsPool,
     /// Read-only registry of scripts loaded at startup (execute-by-key).
     pub(crate) registry: Arc<ScriptRegistry>,
+    /// Bulkhead bounding concurrent executions: a permit is held across the blocking
+    /// execution span, and acquisition fast-fails (`429 OVERLOADED`) when saturated so a
+    /// slow downstream can't exhaust blocking threads / DB connections.
+    pub(crate) limiter: Arc<Semaphore>,
 }
 
 /// Pre-allocated `Box<RawValue>` for `{}` — used as default context.
@@ -166,7 +174,12 @@ struct Meta {
 
 impl Meta {
     /// Creates a new `Meta` with the given correlation ID, sizes, and empty metrics.
-    const fn new(trace_id: String, script_bytes: usize, context_bytes: usize, exec_time_us: u128) -> Self {
+    const fn new(
+        trace_id: String,
+        script_bytes: usize,
+        context_bytes: usize,
+        exec_time_us: u128,
+    ) -> Self {
         Self {
             trace_id,
             key: None,
@@ -242,11 +255,24 @@ fn raw_null_ref() -> &'static RawValue {
 }
 
 /// Executes a JS `handler(context)` and returns `{data, error, meta}` JSON.
+///
+/// Takes `Result<Json<…>, JsonRejection>` rather than `Json<…>` so a malformed or
+/// type-confused body is handled here as a structured `{data, error, meta}` envelope,
+/// instead of axum short-circuiting with its default plain-text rejection.
 pub(crate) async fn execute(
     State(state): State<AppState>,
-    Json(req): Json<ExecRequest>,
+    payload: Result<Json<ExecRequest>, JsonRejection>,
 ) -> impl IntoResponse {
-    let ExecRequest { script, key, context, config } = req;
+    let req = match payload {
+        Ok(Json(req)) => req,
+        Err(rejection) => return malformed_request_response(&state, &rejection),
+    };
+    let ExecRequest {
+        script,
+        key,
+        context,
+        config,
+    } = req;
     let context_bytes = context.get().len();
 
     let engine_cfg = state.pool.engine_config().clone();
@@ -267,8 +293,10 @@ pub(crate) async fn execute(
 
     // Early validation — reject oversized inputs before spawning a task.
     if let Err((code, message)) = sandbox::validate_input_sizes(
-        script_bytes, context_bytes,
-        engine_cfg.max_script_size, engine_cfg.max_context_size,
+        script_bytes,
+        context_bytes,
+        engine_cfg.max_script_size,
+        engine_cfg.max_context_size,
     ) {
         let meta = Meta::new(trace_id, script_bytes, context_bytes, 0).with_key(key);
         return system_error_response(request_error(code, message), 400, meta);
@@ -276,7 +304,12 @@ pub(crate) async fn execute(
 
     let context_json: String = context.get().into();
     let allowed_hosts = config.allowed_hosts;
-    let db_config = config.db;
+    // Tier 0: clamp the per-request db statement_timeout to the operator ceiling, so
+    // jsbox never issues an unbounded `SET` (see docs/design/resilience.md).
+    let mut db_config = config.db;
+    if let Some(db) = db_config.as_mut() {
+        clamp_statement_timeout(db, engine_cfg.max_statement_timeout_ms);
+    }
     let mail_config = config.mail;
     let s3_config = config.s3;
     let redis_config = config.redis;
@@ -285,12 +318,30 @@ pub(crate) async fn execute(
     let sys_config = config.sys;
 
     let start = Instant::now();
+
+    // Tier 1 bulkhead: hold a permit for the whole blocking execution; fast-fail with
+    // `429 OVERLOADED` when saturated rather than piling onto exhausted threads /
+    // connections (see docs/design/resilience.md).
+    let permit = match Arc::clone(&state.limiter).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_too_busy) => {
+            let meta = Meta::new(trace_id, script_bytes, context_bytes, 0).with_key(key);
+            return overloaded_response(meta);
+        }
+    };
+
     let js_pool = state.pool;
+    // Capture the runtime handle in the async context so the blocking task can drive
+    // async capability I/O (db) via `block_on` (Tier 2).
+    let tokio_handle = Handle::current();
 
     let result = task::spawn_blocking(move || -> Result<ExecResult, EngineError> {
-        let runtime = js_pool.acquire().map_err(|err| EngineError::Internal(err.to_string()))?;
+        let runtime = js_pool
+            .acquire()
+            .map_err(|err| EngineError::Internal(err.to_string()))?;
         let res = engine::run(&ExecParams {
             runtime: &runtime,
+            tokio_handle: &tokio_handle,
             script: source.as_str(),
             context_json: &context_json,
             timeout: engine_cfg.timeout(),
@@ -310,10 +361,21 @@ pub(crate) async fn execute(
     })
     .await;
 
-    let exec_time_us = start.elapsed().as_micros();
-    let base_meta =
-        || Meta::new(trace_id.clone(), script_bytes, context_bytes, exec_time_us).with_key(key.clone());
+    // Execution finished — free the bulkhead permit for the next request.
+    drop(permit);
 
+    let exec_time_us = start.elapsed().as_micros();
+    let base_meta = Meta::new(trace_id, script_bytes, context_bytes, exec_time_us).with_key(key);
+    build_response(result, base_meta, error_debug)
+}
+
+/// Turns the `spawn_blocking` result into the final HTTP response, attaching metrics to
+/// `meta` on success and classifying the error otherwise.
+fn build_response(
+    result: Result<Result<ExecResult, EngineError>, task::JoinError>,
+    base_meta: Meta,
+    error_debug: bool,
+) -> AxumResponse {
     match result {
         Ok(Ok(exec)) => {
             let metrics = ExecMetrics {
@@ -325,20 +387,18 @@ pub(crate) async fn execute(
                 amq: exec.amq_metrics,
                 auth: exec.auth_metrics,
             };
-            let meta = base_meta().with_metrics(metrics);
+            let meta = base_meta.with_metrics(metrics);
             match exec.outcome {
-                ExecOutcome::Success(js_json) => {
-                    success_response(&js_json, meta, error_debug)
-                }
+                ExecOutcome::Success(js_json) => success_response(&js_json, meta, error_debug),
                 ExecOutcome::Error(engine_err) => {
                     engine_error_response(engine_err, meta, error_debug)
                 }
             }
         }
-        Ok(Err(engine_err)) => engine_error_response(engine_err, base_meta(), error_debug),
+        Ok(Err(engine_err)) => engine_error_response(engine_err, base_meta, error_debug),
         Err(join_err) => engine_error_response(
             EngineError::Internal(format!("task panicked: {join_err}")),
-            base_meta(),
+            base_meta,
             error_debug,
         ),
     }
@@ -359,8 +419,10 @@ fn resolve_script(
 ) -> Result<ScriptSource, Box<(u16, ErrorEnvelope)>> {
     match (script, key) {
         (Some(source), None) => Ok(ScriptSource::Inline(source)),
-        (None, Some(requested)) => {
-            registry.get(requested).map(ScriptSource::Registered).ok_or_else(|| {
+        (None, Some(requested)) => registry
+            .get(requested)
+            .map(ScriptSource::Registered)
+            .ok_or_else(|| {
                 Box::new((
                     404,
                     request_error(
@@ -368,8 +430,7 @@ fn resolve_script(
                         format!("no registered script for key `{requested}`"),
                     ),
                 ))
-            })
-        }
+            }),
         (Some(_), Some(_)) | (None, None) => Err(Box::new((
             400,
             request_error(
@@ -378,6 +439,56 @@ fn resolve_script(
             ),
         ))),
     }
+}
+
+/// Builds the structured response for a request body that failed to parse or extract
+/// (bad JSON, wrong field types, oversized body). Returns the same `{data, error, meta}`
+/// envelope as every other error path — never axum's default plain-text rejection — so
+/// a client that always parses the envelope never has to special-case malformed input.
+/// The rejection's own text is surfaced only in gated `debug.raw`.
+fn malformed_request_response(state: &AppState, rejection: &JsonRejection) -> AxumResponse {
+    let trace_id = Uuid::new_v4().to_string();
+    let base = request_error(
+        "MALFORMED_REQUEST",
+        "request body is not valid for /execute".to_owned(),
+    );
+    let envelope = if state.pool.error_debug() {
+        base.with_debug(ErrorDebug {
+            stack: None,
+            raw: Some(rejection.body_text()),
+        })
+    } else {
+        base
+    };
+    system_error_response(envelope, 400, Meta::new(trace_id, 0, 0, 0))
+}
+
+/// Clamps a db config's `statement_timeout_ms` to the operator ceiling (Tier 0). A
+/// ceiling of `0` means "no ceiling" (leave as-is); a request value of `0` ("unlimited")
+/// is raised to the ceiling so jsbox never issues an unbounded `SET`.
+fn clamp_statement_timeout(db: &mut DbConfig, ceiling_ms: u64) {
+    if ceiling_ms == 0 {
+        return;
+    }
+    db.statement_timeout_ms = if db.statement_timeout_ms == 0 {
+        ceiling_ms
+    } else {
+        db.statement_timeout_ms.min(ceiling_ms)
+    };
+}
+
+/// Builds the `429 OVERLOADED` response when the bulkhead is saturated: a runtime-category
+/// envelope, retryable, owned by the operator (capacity, not the caller's request).
+fn overloaded_response(meta: Meta) -> AxumResponse {
+    let envelope = ErrorEnvelope::new(
+        ErrorCategory::Runtime,
+        ErrorSource::Engine,
+        "OVERLOADED".to_owned(),
+        true,
+        ErrorOwner::Operator,
+    )
+    .with_message("server at capacity, retry shortly".to_owned());
+    system_error_response(envelope, 429, meta)
 }
 
 /// Builds a `request`-category envelope (the caller's fault, never retryable).
@@ -403,7 +514,11 @@ fn success_response(js_json: &str, meta: Meta, error_debug: bool) -> AxumRespons
     match serde_json::from_str::<Envelope<'_>>(js_json) {
         Ok(env) => (
             StatusCode::OK,
-            Json(Response { data: env.data, error: env.error, meta }),
+            Json(Response {
+                data: env.data,
+                error: env.error,
+                meta,
+            }),
         )
             .into_response(),
         Err(parse_err) => engine_error_response(
@@ -427,5 +542,13 @@ fn engine_error_response(err: EngineError, meta: Meta, error_debug: bool) -> Axu
 /// Serializes a `{ data: null, error, meta }` response at the given status.
 fn system_error_response(error: ErrorEnvelope, status: u16, meta: Meta) -> AxumResponse {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (code, Json(SystemErrorResponse { data: None, error, meta })).into_response()
+    (
+        code,
+        Json(SystemErrorResponse {
+            data: None,
+            error,
+            meta,
+        }),
+    )
+        .into_response()
 }
