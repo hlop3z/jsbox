@@ -102,6 +102,13 @@ pub(crate) struct AmqMetric {
     published: bool,
 }
 
+impl AmqMetric {
+    /// Operation duration in microseconds (for the per-capability latency histogram).
+    pub(crate) const fn duration_us(&self) -> u128 {
+        self.duration_us
+    }
+}
+
 /// An amq error carrying its classified [`Fault`] plus the raw message.
 #[derive(Debug)]
 struct AmqError {

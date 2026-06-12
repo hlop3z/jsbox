@@ -77,6 +77,13 @@ pub(crate) struct AuthMetric {
     duration_us: u128,
 }
 
+impl AuthMetric {
+    /// Operation duration in microseconds (for the per-capability latency histogram).
+    pub(crate) const fn duration_us(&self) -> u128 {
+        self.duration_us
+    }
+}
+
 /// Endpoints resolved from OIDC discovery (each absent if the issuer omits it).
 #[derive(Debug, Clone)]
 struct Endpoints {

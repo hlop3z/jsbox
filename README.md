@@ -134,6 +134,7 @@ flapping database without parsing logs:
 | `jsbox_bulkhead_permits_available`| gauge   | —                               | Free global bulkhead permits right now.                       |
 | `jsbox_bulkhead_permits_total`    | gauge   | —                               | Configured global bulkhead capacity.                          |
 | `jsbox_execution_duration_seconds`| histogram | `le`                          | Execution wall-clock latency (`_bucket`/`_sum`/`_count`; executions that ran). |
+| `jsbox_capability_op_duration_seconds`| histogram | `capability` (`db`/`http`/`mail`/`s3`/`redis`/`amq`/`auth`), `le` | Per-capability op latency — which downstream is slow, not just total exec time. |
 
 ## JS API
 

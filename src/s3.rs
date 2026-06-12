@@ -196,6 +196,13 @@ pub(crate) struct S3Metric {
     objects: Option<u64>,
 }
 
+impl S3Metric {
+    /// Operation duration in microseconds (for the per-capability latency histogram).
+    pub(crate) const fn duration_us(&self) -> u128 {
+        self.duration_us
+    }
+}
+
 /// Parsed payload for a `presign` operation.
 #[derive(Debug, Deserialize)]
 struct PresignPayload {

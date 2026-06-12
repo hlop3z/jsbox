@@ -723,6 +723,11 @@ def test_metrics(t: Runner):
            lambda _r: body is not None
            and "jsbox_execution_duration_seconds_bucket{le=\"+Inf\"}" in body
            and "jsbox_execution_duration_seconds_count" in body)
+    t.test("/metrics exposes the per-capability latency family",
+           h("return json(1,null);"),
+           lambda _r: body is not None
+           and body.count("# TYPE jsbox_capability_op_duration_seconds histogram") == 1
+           and "jsbox_capability_op_duration_seconds_count{capability=\"db\"}" in body)
 
     success_label = 'jsbox_executions_total{outcome="success"}'
     hist_label = "jsbox_execution_duration_seconds_count"

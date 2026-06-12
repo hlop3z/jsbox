@@ -102,6 +102,13 @@ pub(crate) struct HttpMetric {
     duration_us: u128,
 }
 
+impl HttpMetric {
+    /// Operation duration in microseconds (for the per-capability latency histogram).
+    pub(crate) const fn duration_us(&self) -> u128 {
+        self.duration_us
+    }
+}
+
 /// Injects the `api` global and returns a metrics collector.
 ///
 /// # Errors

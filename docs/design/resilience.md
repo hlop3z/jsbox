@@ -187,8 +187,10 @@ log parsing. Execution wall-clock latency is exposed as a Prometheus histogram
 execution that ran — so SLO latency objectives (p50/p95/p99 via `histogram_quantile`) are
 computed at the dashboard, not pre-baked. The buckets are integer-microsecond comparisons on
 the hot path (no float), and the implicit `+Inf` bucket plus `_sum`/`_count` follow the
-standard exposition. Per-capability latency histograms (extending the per-op `duration_us`
-drain already in `meta`) remain a future addition.
+standard exposition. Per-capability op latency is exposed the same way as a single labeled
+family `jsbox_capability_op_duration_seconds{capability="db"|"http"|"mail"|"s3"|"redis"|"amq"|"auth"}`
+(fed from the per-op `duration_us` already drained into `meta`), so a slow *downstream* is
+attributable — not just a slow total execution.
 
 ## Learning from big companies' async-in-Rust mistakes
 

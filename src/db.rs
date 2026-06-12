@@ -204,6 +204,13 @@ pub(crate) struct DbMetric {
     truncated: bool,
 }
 
+impl DbMetric {
+    /// Operation duration in microseconds (for the per-capability latency histogram).
+    pub(crate) const fn duration_us(&self) -> u128 {
+        self.duration_us
+    }
+}
+
 // -- Public API -------------------------------------------------------------
 
 /// Runtime and resilience dependencies threaded into [`inject_db`]. Grouped so the

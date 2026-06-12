@@ -60,28 +60,130 @@ impl LatencyHistogram {
         let _ = self.sum_us.fetch_add(micros, Ordering::Relaxed);
     }
 
-    /// Renders the full Prometheus histogram family for metric `name` (a `_seconds`
-    /// histogram): cumulative `_bucket{le}` lines, the `+Inf` bucket, `_sum`, `_count`.
-    fn render(&self, name: &str) -> String {
+    /// Renders only the series lines (no `# HELP`/`# TYPE`) for metric `name`, with `extra`
+    /// labels (e.g. `capability="db"`, or empty) carried onto every `_bucket`/`_sum`/
+    /// `_count`. Buckets are accumulated here into the cumulative Prometheus form.
+    fn render_series(&self, name: &str, extra: &str) -> String {
         let total = self.count.load(Ordering::Relaxed);
         let mut cumulative: u64 = 0;
         let mut lines: Vec<String> = Vec::new();
         for (label, counter) in LATENCY_BUCKET_LABELS.iter().zip(self.buckets.iter()) {
             cumulative = cumulative.saturating_add(counter.load(Ordering::Relaxed));
-            lines.push(format!("{name}_bucket{{le=\"{label}\"}} {cumulative}"));
+            lines.push(format!(
+                "{name}_bucket{} {cumulative}",
+                bucket_labels(extra, label)
+            ));
         }
-        lines.push(format!("{name}_bucket{{le=\"+Inf\"}} {total}"));
+        lines.push(format!(
+            "{name}_bucket{} {total}",
+            bucket_labels(extra, "+Inf")
+        ));
+        let suffix = if extra.is_empty() {
+            String::new()
+        } else {
+            format!("{{{extra}}}")
+        };
         let sum_us = self.sum_us.load(Ordering::Relaxed);
         // Seconds, formatted from integer micros (no float): whole.frac, 6-digit fraction.
         let whole = sum_us / 1_000_000;
         let frac = sum_us % 1_000_000;
+        lines.push(format!("{name}_sum{suffix} {whole}.{frac:06}"));
+        lines.push(format!("{name}_count{suffix} {total}"));
+        lines.join("\n")
+    }
+
+    /// Renders the full histogram family (with `# HELP help` / `# TYPE`) for metric `name`.
+    fn render(&self, name: &str, help: &str) -> String {
         format!(
-            "# HELP {name} Execution wall-clock latency.\n\
-             # TYPE {name} histogram\n\
-             {buckets}\n\
-             {name}_sum {whole}.{frac:06}\n\
-             {name}_count {total}\n",
-            buckets = lines.join("\n"),
+            "# HELP {name} {help}\n# TYPE {name} histogram\n{series}\n",
+            series = self.render_series(name, ""),
+        )
+    }
+}
+
+/// Builds the `{...le="<le>"}` label set for a bucket line, merging optional `extra`
+/// labels (e.g. `capability="db"`) ahead of the `le` label.
+fn bucket_labels(extra: &str, le: &str) -> String {
+    if extra.is_empty() {
+        format!("{{le=\"{le}\"}}")
+    } else {
+        format!("{{{extra},le=\"{le}\"}}")
+    }
+}
+
+/// A metered capability, used to route a per-op latency observation to the right
+/// histogram. Mirrors the `meta.<cap>_requests` families.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Capability {
+    /// `db` (Postgres-family).
+    Db,
+    /// `api` (outbound HTTP).
+    Http,
+    /// `mail` (SMTP).
+    Mail,
+    /// `s3` (object-store presign/usage).
+    S3,
+    /// `redis`.
+    Redis,
+    /// `amq` (`RabbitMQ`).
+    Amq,
+    /// `auth` (OIDC/IAM).
+    Auth,
+}
+
+/// Per-capability operation-latency histograms, one per [`Capability`]. Rendered as a
+/// single Prometheus family keyed by a `capability` label.
+#[derive(Debug, Default)]
+struct CapabilityLatencies {
+    /// `db` op latency.
+    db: LatencyHistogram,
+    /// `api` request latency.
+    http: LatencyHistogram,
+    /// `mail` op latency.
+    mail: LatencyHistogram,
+    /// `s3` op latency.
+    s3: LatencyHistogram,
+    /// `redis` op latency.
+    redis: LatencyHistogram,
+    /// `amq` op latency.
+    amq: LatencyHistogram,
+    /// `auth` op latency.
+    auth: LatencyHistogram,
+}
+
+impl CapabilityLatencies {
+    /// The histogram for `cap`.
+    const fn histogram(&self, cap: Capability) -> &LatencyHistogram {
+        match cap {
+            Capability::Db => &self.db,
+            Capability::Http => &self.http,
+            Capability::Mail => &self.mail,
+            Capability::S3 => &self.s3,
+            Capability::Redis => &self.redis,
+            Capability::Amq => &self.amq,
+            Capability::Auth => &self.auth,
+        }
+    }
+
+    /// Renders the single `jsbox_capability_op_duration_seconds` family: one `# HELP`/
+    /// `# TYPE` header then every capability's series carrying a `capability="…"` label.
+    fn render(&self) -> String {
+        let name = "jsbox_capability_op_duration_seconds";
+        let series: Vec<String> = [
+            ("db", &self.db),
+            ("http", &self.http),
+            ("mail", &self.mail),
+            ("s3", &self.s3),
+            ("redis", &self.redis),
+            ("amq", &self.amq),
+            ("auth", &self.auth),
+        ]
+        .into_iter()
+        .map(|(label, hist)| hist.render_series(name, &format!("capability=\"{label}\"")))
+        .collect();
+        format!(
+            "# HELP {name} Per-capability operation latency.\n# TYPE {name} histogram\n{body}\n",
+            body = series.join("\n"),
         )
     }
 }
@@ -111,6 +213,8 @@ pub(crate) struct Metrics {
     overload_partition: AtomicU64,
     /// Wall-clock latency of executions that actually ran (excludes shed/rejected requests).
     exec_latency: LatencyHistogram,
+    /// Per-capability op latency (which downstream is slow, not just total execution time).
+    cap_latency: CapabilityLatencies,
 }
 
 impl Metrics {
@@ -156,6 +260,13 @@ impl Metrics {
             .observe(u64::try_from(micros).unwrap_or(u64::MAX));
     }
 
+    /// Observes one capability operation's latency (microseconds) in `cap`'s histogram.
+    pub(crate) fn observe_op(&self, cap: Capability, micros: u128) {
+        self.cap_latency
+            .histogram(cap)
+            .observe(u64::try_from(micros).unwrap_or(u64::MAX));
+    }
+
     /// Renders the Prometheus text exposition (v0.0.4). `bulkhead_available` /
     /// `bulkhead_total` are the live semaphore permits; `breaker_trips` is the cumulative
     /// circuit-breaker open count (both read at scrape time, not stored here).
@@ -192,7 +303,7 @@ impl Metrics {
              # HELP jsbox_bulkhead_permits_total Configured global bulkhead capacity.\n\
              # TYPE jsbox_bulkhead_permits_total gauge\n\
              jsbox_bulkhead_permits_total {bulkhead_total}\n\
-             {latency}",
+             {latency}{cap_latency}",
             success = load(&self.success),
             script_error = load(&self.script_error),
             capability_error = load(&self.capability_error),
@@ -203,7 +314,11 @@ impl Metrics {
             rejections = load(&self.rejections),
             overload_global = load(&self.overload_global),
             overload_partition = load(&self.overload_partition),
-            latency = self.exec_latency.render("jsbox_execution_duration_seconds"),
+            latency = self.exec_latency.render(
+                "jsbox_execution_duration_seconds",
+                "Execution wall-clock latency."
+            ),
+            cap_latency = self.cap_latency.render(),
         )
     }
 }
@@ -212,7 +327,7 @@ impl Metrics {
 mod tests {
     //! Counter increments and exposition formatting.
 
-    use super::Metrics;
+    use super::{Capability, Metrics};
     use crate::engine::EngineError;
 
     /// A fresh registry renders all-zero counters with the expected metric lines.
@@ -275,5 +390,34 @@ mod tests {
             text.contains("jsbox_execution_duration_seconds_sum 50.083000"),
             "sum rendered as seconds from integer micros"
         );
+    }
+
+    /// Per-capability op observations render as a single labeled histogram family.
+    #[test]
+    fn capability_latency_is_labeled() {
+        let metrics = Metrics::default();
+        metrics.observe_op(Capability::Db, 4_000); // 4ms
+        metrics.observe_op(Capability::Db, 4_000);
+        metrics.observe_op(Capability::Http, 120_000); // 120ms
+        let text = metrics.render(1, 1, 0);
+        // One HELP/TYPE header for the whole family, series carry a `capability` label.
+        assert_eq!(
+            text.matches("# TYPE jsbox_capability_op_duration_seconds histogram")
+                .count(),
+            1,
+            "exactly one TYPE line for the family"
+        );
+        assert!(text.contains(
+            "jsbox_capability_op_duration_seconds_bucket{capability=\"db\",le=\"0.005\"} 2"
+        ));
+        assert!(text.contains("jsbox_capability_op_duration_seconds_count{capability=\"db\"} 2"));
+        assert!(text.contains(
+            "jsbox_capability_op_duration_seconds_bucket{capability=\"http\",le=\"0.1\"} 0"
+        ));
+        assert!(text.contains(
+            "jsbox_capability_op_duration_seconds_bucket{capability=\"http\",le=\"0.25\"} 1"
+        ));
+        // Untouched capabilities still emit a (zeroed) series.
+        assert!(text.contains("jsbox_capability_op_duration_seconds_count{capability=\"auth\"} 0"));
     }
 }

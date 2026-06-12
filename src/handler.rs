@@ -26,7 +26,7 @@ use crate::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorS
 use crate::http::HttpMetric;
 use crate::kv::{RedisConfig, RedisMetric};
 use crate::mail::{MailConfig, MailMetric};
-use crate::metrics::Metrics;
+use crate::metrics::{Capability, Metrics};
 use crate::partition::PartitionLimiter;
 use crate::pool::JsPool;
 use crate::registry::ScriptRegistry;
@@ -443,6 +443,7 @@ fn build_response(
     metrics.observe_execution(base_meta.exec_time_us);
     match result {
         Ok(Ok(exec)) => {
+            record_capability_latencies(metrics, &exec);
             let drained = ExecMetrics {
                 http: exec.http_metrics,
                 db: exec.db_metrics,
@@ -473,6 +474,32 @@ fn build_response(
             metrics.record_engine_error(&engine_err);
             engine_error_response(engine_err, base_meta, error_debug)
         }
+    }
+}
+
+/// Feeds every per-op duration from a finished execution into its capability's latency
+/// histogram, so `/metrics` can show which downstream is slow, not just total exec time.
+fn record_capability_latencies(metrics: &Metrics, exec: &ExecResult) {
+    for metric in &exec.db_metrics {
+        metrics.observe_op(Capability::Db, metric.duration_us());
+    }
+    for metric in &exec.http_metrics {
+        metrics.observe_op(Capability::Http, metric.duration_us());
+    }
+    for metric in &exec.mail_metrics {
+        metrics.observe_op(Capability::Mail, metric.duration_us());
+    }
+    for metric in &exec.s3_metrics {
+        metrics.observe_op(Capability::S3, metric.duration_us());
+    }
+    for metric in &exec.redis_metrics {
+        metrics.observe_op(Capability::Redis, metric.duration_us());
+    }
+    for metric in &exec.amq_metrics {
+        metrics.observe_op(Capability::Amq, metric.duration_us());
+    }
+    for metric in &exec.auth_metrics {
+        metrics.observe_op(Capability::Auth, metric.duration_us());
     }
 }
 
