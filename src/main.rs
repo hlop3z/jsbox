@@ -13,6 +13,7 @@ mod handler;
 mod http;
 mod kv;
 mod mail;
+mod metrics;
 mod partition;
 mod pool;
 mod registry;
@@ -40,6 +41,7 @@ use tracing_subscriber::fmt::init as init_tracing;
 use crate::breaker::{BreakerConfig, CircuitBreaker};
 use crate::config::Config;
 use crate::handler::AppState;
+use crate::metrics::Metrics;
 use crate::partition::PartitionLimiter;
 use crate::pool::JsPool;
 use crate::registry::ScriptRegistry;
@@ -127,10 +129,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         limiter: Arc::new(Semaphore::new(max_concurrent)),
         partition_limiter,
         db_breaker,
+        metrics: Arc::new(Metrics::default()),
+        bulkhead_capacity: max_concurrent,
     };
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/metrics", get(handler::metrics))
         .route("/execute", post(handler::execute))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state);

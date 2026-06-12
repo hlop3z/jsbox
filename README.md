@@ -111,6 +111,29 @@ registry is read-only at runtime: changing scripts means redeploying files (imag
 layer, ConfigMap, mounted volume) and restarting — so N replicas stay trivially
 consistent. Design notes: [`docs/design/script-registry.md`](docs/design/script-registry.md).
 
+### Operational endpoints
+
+Besides `POST /execute`, the server exposes two unauthenticated read-only endpoints for
+liveness and scraping:
+
+```
+GET /health    -> 200 "ok"
+GET /metrics   -> 200 Prometheus text (version 0.0.4)
+```
+
+`/metrics` is dependency-free (no client library) and reports per-outcome execution
+counters plus live resilience signals — so a dashboard or alert can watch shed load and a
+flapping database without parsing logs:
+
+| Metric                            | Type    | Labels                          | Meaning                                                       |
+| --------------------------------- | ------- | ------------------------------- | ------------------------------------------------------------- |
+| `jsbox_executions_total`          | counter | `outcome` (`success`, `script_error`, `capability_error`, `timeout`, `memory_limit`, `malformed_response`, `internal_error`) | Executions by terminal outcome.                               |
+| `jsbox_rejections_total`          | counter | —                               | Requests rejected before execution (bad body, routing, oversized). |
+| `jsbox_overload_total`            | counter | `scope` (`global`, `partition`) | Requests shed by the bulkhead (Tier 1) / partition cap (Tier 5). |
+| `jsbox_db_breaker_trips_total`    | counter | —                               | Cumulative db circuit-breaker open transitions (Tier 3).      |
+| `jsbox_bulkhead_permits_available`| gauge   | —                               | Free global bulkhead permits right now.                       |
+| `jsbox_bulkhead_permits_total`    | gauge   | —                               | Configured global bulkhead capacity.                          |
+
 ## JS API
 
 ### json(data, error)

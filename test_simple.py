@@ -110,6 +110,18 @@ def _parse_response(status: int, raw: bytes) -> dict:
         return {"_http_status": status, "_non_json_body": raw.decode("utf-8", "replace")}
 
 
+def _get_text(path: str) -> tuple[int, str] | None:
+    """GET a plain-text endpoint (e.g. /metrics). Returns (status, body) or None."""
+    req = urllib.request.Request(f"{BASE_URL}{path}")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.getcode(), resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as err:
+        return err.code, err.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
 # -- Script helpers ----------------------------------------------------------
 
 def h(body: str, ctx=None, config=None) -> dict:
@@ -680,6 +692,60 @@ def test_partition_fairness(t: Runner):
            lambda _r: r3 is not None and r3.get("meta", {}).get("partition") == "header-wins")
 
 
+def test_metrics(t: Runner):
+    """The /metrics endpoint exposes Prometheus counters/gauges that move with traffic."""
+    t.section("Observability (/metrics)")
+
+    def _scrape() -> str | None:
+        res = _get_text("/metrics")
+        return res[1] if res is not None and res[0] == 200 else None
+
+    def _counter(text: str | None, needle: str):
+        for line in (text or "").splitlines():
+            if line.startswith(needle):
+                try:
+                    return int(line.rsplit(" ", 1)[1])
+                except Exception:
+                    return None
+        return None
+
+    body = _scrape()
+    t.test("/metrics returns 200 Prometheus text",
+           h("return json(1,null);"),
+           lambda _r: body is not None and "jsbox_executions_total" in body)
+    t.test("/metrics exposes bulkhead + breaker series",
+           h("return json(1,null);"),
+           lambda _r: body is not None
+           and "jsbox_bulkhead_permits_total" in body
+           and "jsbox_db_breaker_trips_total" in body)
+
+    success_label = 'jsbox_executions_total{outcome="success"}'
+    before = _counter(body, success_label)
+    _post(h("return json('ok', null);"))
+    after_text = _scrape()
+    after = _counter(after_text, success_label)
+    t.test("success counter advances after an execution",
+           h("return json(1,null);"),
+           lambda _r: before is not None and after is not None and after > before)
+
+    err_label = 'jsbox_executions_total{outcome="script_error"}'
+    before_err = _counter(after_text, err_label)
+    _post(h("throw new Error('boom');"))
+    err_text = _scrape()
+    after_err = _counter(err_text, err_label)
+    t.test("script_error counter advances after a throw",
+           h("return json(1,null);"),
+           lambda _r: before_err is not None and after_err is not None and after_err > before_err)
+
+    before_rej = _counter(err_text, "jsbox_rejections_total ")
+    _post({"context": {}})  # neither script nor key -> SCRIPT_XOR_KEY rejection
+    rej_text = _scrape()
+    after_rej = _counter(rej_text, "jsbox_rejections_total ")
+    t.test("rejection counter advances after a bad request",
+           h("return json(1,null);"),
+           lambda _r: before_rej is not None and after_rej is not None and after_rej > before_rej)
+
+
 def test_circuit_breaker(t: Runner):
     """Tier 3: repeated connect failures to a dead db target trip the breaker, after which
     requests to that target fast-fail DB_CIRCUIT_OPEN instead of waiting on the timeout —
@@ -1009,6 +1075,7 @@ def main():
     test_isolation_under_concurrency(t)
     test_bulkhead(t)
     test_partition_fairness(t)
+    test_metrics(t)
 
     # Database tests — only if containers are running
     if _db_available(PG_CONFIG):

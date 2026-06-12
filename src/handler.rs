@@ -6,6 +6,7 @@ use std::time::Instant;
 use axum::Json;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,7 @@ use crate::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorS
 use crate::http::HttpMetric;
 use crate::kv::{RedisConfig, RedisMetric};
 use crate::mail::{MailConfig, MailMetric};
+use crate::metrics::Metrics;
 use crate::partition::PartitionLimiter;
 use crate::pool::JsPool;
 use crate::registry::ScriptRegistry;
@@ -51,6 +53,10 @@ pub(crate) struct AppState {
     /// `db` circuit breaker (Tier 3): fast-fails requests to a target that keeps failing
     /// to connect. `None` = disabled. Shared across requests.
     pub(crate) db_breaker: Option<Arc<CircuitBreaker>>,
+    /// Process-wide observability counters, exposed at `GET /metrics`.
+    pub(crate) metrics: Arc<Metrics>,
+    /// Configured global bulkhead capacity, surfaced as the `_total` permit gauge.
+    pub(crate) bulkhead_capacity: usize,
 }
 
 /// Pre-allocated `Box<RawValue>` for `{}` — used as default context.
@@ -289,7 +295,10 @@ pub(crate) async fn execute(
 ) -> impl IntoResponse {
     let req = match payload {
         Ok(Json(req)) => req,
-        Err(rejection) => return malformed_request_response(&state, &rejection),
+        Err(rejection) => {
+            state.metrics.record_rejection();
+            return malformed_request_response(&state, &rejection);
+        }
     };
     let ExecRequest {
         script,
@@ -311,6 +320,7 @@ pub(crate) async fn execute(
     let source = match resolve_script(script, key.as_deref(), &state.registry) {
         Ok(source) => source,
         Err(rejection) => {
+            state.metrics.record_rejection();
             let (status, envelope) = *rejection;
             let meta = Meta::new(trace_id, 0, context_bytes, 0)
                 .with_key(key)
@@ -327,6 +337,7 @@ pub(crate) async fn execute(
         engine_cfg.max_script_size,
         engine_cfg.max_context_size,
     ) {
+        state.metrics.record_rejection();
         let meta = Meta::new(trace_id, script_bytes, context_bytes, 0)
             .with_key(key)
             .with_partition(partition);
@@ -352,16 +363,13 @@ pub(crate) async fn execute(
         key.as_deref(),
         partition.as_deref(),
     );
-    let (partition_permit, permit) = match acquire_permits(&state, partition.as_deref()) {
-        Admission::Granted {
-            partition_permit,
-            global,
-        } => (partition_permit, global),
-        Admission::PartitionBusy => return partition_overloaded_response(busy_meta),
-        Admission::GlobalBusy => return overloaded_response(busy_meta),
+    let (partition_permit, permit) = match admit(&state, partition.as_deref(), busy_meta) {
+        Ok(permits) => permits,
+        Err(shed) => return *shed,
     };
 
     let db_breaker = state.db_breaker.clone();
+    let metrics = Arc::clone(&state.metrics);
     let js_pool = state.pool;
     // Capture the runtime handle in the async context so the blocking task can drive
     // async capability I/O (db) via `block_on` (Tier 2).
@@ -402,7 +410,25 @@ pub(crate) async fn execute(
     let base_meta = Meta::new(trace_id, script_bytes, context_bytes, exec_time_us)
         .with_key(key)
         .with_partition(partition);
-    build_response(result, base_meta, error_debug)
+    build_response(result, base_meta, error_debug, &metrics)
+}
+
+/// `GET /metrics` — Prometheus text exposition of the process-wide counters and live
+/// gauges (bulkhead permits read off the semaphore, breaker trips off the breaker).
+pub(crate) async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let available = state.limiter.available_permits();
+    let trips = state
+        .db_breaker
+        .as_ref()
+        .map_or(0, |breaker| breaker.trips());
+    let body = state
+        .metrics
+        .render(available, state.bulkhead_capacity, trips);
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
+        body,
+    )
 }
 
 /// Turns the `spawn_blocking` result into the final HTTP response, attaching metrics to
@@ -411,10 +437,11 @@ fn build_response(
     result: Result<Result<ExecResult, EngineError>, task::JoinError>,
     base_meta: Meta,
     error_debug: bool,
+    metrics: &Metrics,
 ) -> AxumResponse {
     match result {
         Ok(Ok(exec)) => {
-            let metrics = ExecMetrics {
+            let drained = ExecMetrics {
                 http: exec.http_metrics,
                 db: exec.db_metrics,
                 mail: exec.mail_metrics,
@@ -423,20 +450,27 @@ fn build_response(
                 amq: exec.amq_metrics,
                 auth: exec.auth_metrics,
             };
-            let meta = base_meta.with_metrics(metrics);
+            let meta = base_meta.with_metrics(drained);
             match exec.outcome {
-                ExecOutcome::Success(js_json) => success_response(&js_json, meta, error_debug),
+                ExecOutcome::Success(js_json) => {
+                    metrics.record_success();
+                    success_response(&js_json, meta, error_debug)
+                }
                 ExecOutcome::Error(engine_err) => {
+                    metrics.record_engine_error(&engine_err);
                     engine_error_response(engine_err, meta, error_debug)
                 }
             }
         }
-        Ok(Err(engine_err)) => engine_error_response(engine_err, base_meta, error_debug),
-        Err(join_err) => engine_error_response(
-            EngineError::Internal(format!("task panicked: {join_err}")),
-            base_meta,
-            error_debug,
-        ),
+        Ok(Err(engine_err)) => {
+            metrics.record_engine_error(&engine_err);
+            engine_error_response(engine_err, base_meta, error_debug)
+        }
+        Err(join_err) => {
+            let engine_err = EngineError::Internal(format!("task panicked: {join_err}"));
+            metrics.record_engine_error(&engine_err);
+            engine_error_response(engine_err, base_meta, error_debug)
+        }
     }
 }
 
@@ -556,6 +590,30 @@ enum Admission {
     PartitionBusy,
     /// The global bulkhead is saturated (`429 OVERLOADED`).
     GlobalBusy,
+}
+
+/// Acquires the partition (Tier 5) + global bulkhead (Tier 1) permits, recording the shed
+/// and returning the ready-to-send `429` response when either limit is hit. `Ok` carries
+/// the permits to hold across the execution span. `busy_meta` is consumed only on a shed.
+fn admit(
+    state: &AppState,
+    partition: Option<&str>,
+    busy_meta: Meta,
+) -> Result<(Option<OwnedSemaphorePermit>, OwnedSemaphorePermit), Box<AxumResponse>> {
+    match acquire_permits(state, partition) {
+        Admission::Granted {
+            partition_permit,
+            global,
+        } => Ok((partition_permit, global)),
+        Admission::PartitionBusy => {
+            state.metrics.record_overload_partition();
+            Err(Box::new(partition_overloaded_response(busy_meta)))
+        }
+        Admission::GlobalBusy => {
+            state.metrics.record_overload_global();
+            Err(Box::new(overloaded_response(busy_meta)))
+        }
+    }
 }
 
 /// Acquires the per-partition permit (if a partition is supplied and fairness is on) then the

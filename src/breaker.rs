@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Breaker tunables.
@@ -40,6 +41,8 @@ pub(crate) struct CircuitBreaker {
     config: BreakerConfig,
     /// Target key → state.
     targets: Mutex<HashMap<String, TargetState>>,
+    /// Cumulative count of closed→open transitions across all targets (observability).
+    trips: AtomicU64,
 }
 
 impl CircuitBreaker {
@@ -51,7 +54,13 @@ impl CircuitBreaker {
         Some(Self {
             config,
             targets: Mutex::new(HashMap::new()),
+            trips: AtomicU64::new(0),
         })
+    }
+
+    /// Total number of times any target has tripped open since startup.
+    pub(crate) fn trips(&self) -> u64 {
+        self.trips.load(Ordering::Relaxed)
     }
 
     /// Returns `true` if a call to `target` is allowed (closed, or a half-open probe).
@@ -91,6 +100,10 @@ impl CircuitBreaker {
         } else {
             state.failures = state.failures.saturating_add(1);
             if state.failures >= self.config.threshold {
+                // Count only the closed→open transition, not every failure while already open.
+                if state.open_until.is_none() {
+                    let _ = self.trips.fetch_add(1, Ordering::Relaxed);
+                }
                 state.open_until = Instant::now().checked_add(self.config.cooldown);
             }
         }

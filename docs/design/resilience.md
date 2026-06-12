@@ -1,6 +1,6 @@
 # Design note: resilience for SLO/SLA (timeouts, bulkheads, cancellation)
 
-Status: **Tiers 0, 1, 2, 5 implemented** (2026-06); Tiers 3–4 planned. Companion to
+Status: **Tiers 0, 1, 2, 3, 5 implemented** (2026-06); Tier 4 is operator config. Companion to
 [pooled-capabilities.md](pooled-capabilities.md). Grounded in the code as of `main`.
 
 ## The principle
@@ -31,7 +31,7 @@ killer, and it is independent of the timeout question.
 | 0 | **Server-side ceiling + clamp** | A `statement_timeout` cap the request cannot raise; jsbox never *issues* an unbounded one | **done** (clamp) + operator role-default (docs) |
 | 1 | **Bulkhead (bounded concurrency)** | A slow downstream can't consume all threads/connections; excess load fast-fails 429 | **done** |
 | 2 | **Client deadline + active cancellation** | A hung query is cancelled and its thread/connection freed promptly, independent of any pooler | **done** (async `db`) |
-| 3 | **Circuit breaker** | A struggling DB isn't buried under retries; jsbox stays responsive | planned |
+| 3 | **Circuit breaker** | A struggling DB isn't buried under retries; jsbox stays responsive | **done** (per-target db) |
 | 4 | **Pooler timeouts** | PgBouncer `query_timeout`/`query_wait_timeout` as an independent layer | operator config |
 | 5 | **Per-partition fairness** | One key can't monopolize a pod (per-pod cap; global fairness is the gateway's job) | **done** (per-pod backstop) |
 
@@ -128,12 +128,46 @@ jsbox would require a shared store (Redis) on the hot path — feasible but adds
 dependency, latency, and crash-leak handling; documented as an opt-in path, not the
 default.
 
-### Tier 3–4 — breaker, pooler timeouts (planned)
+### Tier 3 — per-target db circuit breaker (done)
 
-Circuit breaker (trip on DB error/latency, fast-fail retryable during cool-down) and
-PgBouncer's own `query_timeout`. Observability (SLO metrics — latency histograms,
-timeout/cancel/breaker/saturation counters, extending the per-op `duration_us` drain)
-remains planned alongside.
+Tiers 1–2 keep a single hung query from cascading, but a database that's *down* or
+flapping is still a slow-path tax: every request pays the 5 s connect timeout on a
+`spawn_blocking` thread before failing, and N concurrent requests bury the recovering
+target under a thundering herd of reconnects. Tier 3 short-circuits that. A breaker keyed
+per **target** (`host:port`, operator-supplied in `config.db`, so the key set is small and
+bounded) counts consecutive connect failures; at `db_breaker_threshold` it trips **open**
+and fast-fails subsequent calls to that target with a retryable
+`capability/db/DB_CIRCUIT_OPEN` (no connect attempted, no timeout wait) for
+`db_breaker_cooldown_ms`. After the cool-down a single request probes (**half-open**):
+success closes the breaker, failure re-opens it — the `allow()` check re-arms the open
+window so only one caller probes while the rest keep fast-failing. State is a mutex-guarded
+map that **fails open** on lock poisoning (a breaker bug must never wedge the service).
+Opt-in via `db_breaker_threshold` (0 = off, the default). Implementation: `src/breaker.rs`,
+gated in `db::connect_through_breaker`.
+
+This is deliberately a *connect* breaker, not a per-query latency breaker — the failure it
+targets is a dead/unreachable target, where Tier 2's deadline already bounds a *slow* live
+query. It is per-pod like the bulkhead: each replica learns the target's health
+independently, which is the right granularity since connect failures are observed locally.
+
+### Tier 4 — pooler timeouts (operator config)
+
+PgBouncer's own `query_timeout` / `query_wait_timeout` as an independent layer below jsbox,
+configured operator-side (see [pooled-capabilities.md](pooled-capabilities.md)). Nothing to
+build in jsbox.
+
+### Observability — `GET /metrics` (done)
+
+The resilience tiers are only operable if you can *see* them fire. jsbox exposes a
+dependency-free Prometheus text endpoint (`src/metrics.rs`, no client library) with
+process-wide atomic counters incremented on each request's terminal outcome, plus live
+gauges read at scrape time: `jsbox_executions_total{outcome}` (success / script_error /
+capability_error / timeout / memory_limit / malformed_response / internal_error),
+`jsbox_rejections_total`, `jsbox_overload_total{scope}` (global bulkhead vs partition cap),
+`jsbox_db_breaker_trips_total`, and `jsbox_bulkhead_permits_available` / `_total`. So shed
+load (Tier 1/5), breaker trips (Tier 3), and bulkhead headroom are all alertable without
+log parsing. Latency histograms (extending the per-op `duration_us` drain already in
+`meta`) remain a future addition.
 
 ## Learning from big companies' async-in-Rust mistakes
 
