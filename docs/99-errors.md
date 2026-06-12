@@ -132,6 +132,7 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `code`                | retry | owner     | When                                                   |
 | --------------------- | ----- | --------- | ------------------------------------------------------ |
 | `SYNTAX_ERROR`        | no    | developer | The script didn't parse.                               |
+| `MODULE_NOT_FOUND`    | no    | developer | An ES-module handler `import`ed a specifier that isn't a registered module. |
 | `HANDLER_NOT_DEFINED` | no    | developer | No `handler(ctx)` function.                            |
 | `TIMEOUT`             | no    | developer | Ran past the time limit.                               |
 | `MEMORY_LIMIT`        | no    | developer | The context was too big to load into the memory limit. |

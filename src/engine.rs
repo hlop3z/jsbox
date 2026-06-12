@@ -38,6 +38,7 @@ use crate::kv;
 use crate::kv::{RedisConfig, RedisMetric};
 use crate::mail;
 use crate::mail::{MailConfig, MailMetric};
+use crate::modules;
 use crate::s3;
 use crate::s3::{S3Config, S3Metric};
 use crate::sandbox::{self, Collector};
@@ -122,6 +123,8 @@ pub(crate) enum ExecOutcome {
 pub(crate) enum EngineError {
     /// `eval` of the script failed to parse.
     Syntax(String),
+    /// An ES-module handler `import`ed a specifier that isn't a registered module.
+    ModuleNotFound(String),
     /// Script defines no `handler(context)`.
     HandlerNotDefined,
     /// Wall-clock limit hit (detected via the interrupt flag).
@@ -409,8 +412,7 @@ fn sanitize_globals(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
 /// `eval`/`Proxy`-removed execution environment.
 fn resolve_handler<'js>(qctx: &Ctx<'js>, script: &str) -> Result<Function<'js>, ExecOutcome> {
     if is_es_module(script) {
-        let module = eval_module(qctx, script)
-            .map_err(|()| ExecOutcome::Error(classify_eval_error(qctx)))?;
+        let module = eval_module(qctx, script).map_err(ExecOutcome::Error)?;
         sanitize_globals(qctx).map_err(|err| ExecOutcome::Error(EngineError::internal(err)))?;
         module_handler(&module).ok_or(ExecOutcome::Error(EngineError::HandlerNotDefined))
     } else {
@@ -436,13 +438,34 @@ fn is_es_module(script: &str) -> bool {
 
 /// Evaluates the user source as an ES module, settling synchronously: `Promise::finish`
 /// pumps the job queue to completion, and since every jsbox capability is sync FFI a module
-/// never truly suspends. `Err(())` leaves the pending exception set for
-/// [`classify_eval_error`]. Imports resolve through the per-runtime registry loader.
-fn eval_module<'js>(qctx: &Ctx<'js>, script: &str) -> Result<Module<'js, Evaluated>, ()> {
+/// never truly suspends. Imports resolve through the per-runtime registry loader. On failure
+/// the pending exception is classified into a [`EngineError`] (`MODULE_NOT_FOUND` for an
+/// unresolved `import`, else a syntax/top-level error).
+fn eval_module<'js>(qctx: &Ctx<'js>, script: &str) -> Result<Module<'js, Evaluated>, EngineError> {
+    try_eval_module(qctx, script).map_err(|()| classify_module_error(qctx))
+}
+
+/// The raw eval attempt; `Err(())` leaves the pending exception set for classification.
+fn try_eval_module<'js>(qctx: &Ctx<'js>, script: &str) -> Result<Module<'js, Evaluated>, ()> {
     let declared = Module::declare(qctx.clone(), "handler", script).map_err(drop)?;
     let (module, promise) = declared.eval().map_err(drop)?;
     promise.finish::<()>().map_err(drop)?;
     Ok(module)
+}
+
+/// Classifies a module eval failure from the pending exception: the resolver's
+/// [`modules::UNRESOLVED_MARKER`] in the message ⇒ `MODULE_NOT_FOUND` (a bad `import`),
+/// otherwise a syntax / top-level error. Consumes the pending exception.
+fn classify_module_error(qctx: &Ctx<'_>) -> EngineError {
+    let caught = qctx.catch();
+    let message = caught
+        .as_object()
+        .and_then(|obj| read_str_prop(obj, "message"));
+    match message {
+        Some(msg) if msg.contains(modules::UNRESOLVED_MARKER) => EngineError::ModuleNotFound(msg),
+        Some(msg) => EngineError::Syntax(msg),
+        None => EngineError::Syntax("syntax error".to_owned()),
+    }
 }
 
 /// Reads the exported handler from an evaluated module: `export default function handler`
@@ -681,6 +704,7 @@ impl EngineError {
             Self::Internal(_) => 500,
             Self::Script { .. } | Self::Capability(_) => 200,
             Self::Syntax(_)
+            | Self::ModuleNotFound(_)
             | Self::HandlerNotDefined
             | Self::Timeout { .. }
             | Self::MemoryLimit
@@ -693,6 +717,9 @@ impl EngineError {
         let dev = ErrorOwner::Developer;
         match self {
             Self::Syntax(message) => runtime_envelope("SYNTAX_ERROR", false, dev, message),
+            Self::ModuleNotFound(message) => {
+                runtime_envelope("MODULE_NOT_FOUND", false, dev, message)
+            }
             Self::HandlerNotDefined => runtime_envelope(
                 "HANDLER_NOT_DEFINED",
                 false,

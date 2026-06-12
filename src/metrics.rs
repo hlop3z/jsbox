@@ -227,6 +227,7 @@ impl Metrics {
     pub(crate) fn record_engine_error(&self, err: &EngineError) {
         let counter = match *err {
             EngineError::Syntax(_)
+            | EngineError::ModuleNotFound(_)
             | EngineError::HandlerNotDefined
             | EngineError::Script { .. } => &self.script_error,
             EngineError::Capability(_) => &self.capability_error,

@@ -18,6 +18,12 @@ use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use rquickjs::module::Declared;
 use rquickjs::{Ctx, Error as JsError, Module, Result as JsResult};
 
+/// Sentinel embedded in the resolver/loader error message for an unregistered specifier.
+/// The engine matches it on the thrown exception to classify an unresolved `import` as a
+/// dedicated `MODULE_NOT_FOUND` rather than a generic syntax error (see `engine.rs`). Also
+/// reads as a helpful tail on the developer-facing message.
+pub(crate) const UNRESOLVED_MARKER: &str = "module not in registry";
+
 /// Immutable specifier → module-source map, loaded at startup.
 #[derive(Debug, Default)]
 pub(crate) struct ModuleRegistry {
@@ -109,7 +115,11 @@ impl Resolver for RegistryResolver {
         if self.0.contains(name) {
             Ok(name.to_owned())
         } else {
-            Err(JsError::new_resolving(base.to_owned(), name.to_owned()))
+            Err(JsError::new_resolving_message(
+                base.to_owned(),
+                name.to_owned(),
+                UNRESOLVED_MARKER,
+            ))
         }
     }
 }
@@ -128,7 +138,7 @@ impl Loader for RegistryLoader {
         let source = self
             .0
             .source(name)
-            .ok_or_else(|| JsError::new_loading(name.to_owned()))?;
+            .ok_or_else(|| JsError::new_loading_message(name.to_owned(), UNRESOLVED_MARKER))?;
         Module::declare(ctx.clone(), name, source.as_bytes())
     }
 }

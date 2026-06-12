@@ -29,10 +29,11 @@ immediately below; the "Loader API"/`use()` sections are retained as superseded 
 - **Not built:** the `use("name")` synchronous loader. Native `import` made it redundant —
   a handler-module imports directly. The sections below describing `use()` are kept as the
   decision trail, not as the current API.
-- **Known rough edge:** an unresolvable `import` currently surfaces as `SYNTAX_ERROR`
-  (the resolver throws during module eval, classified by the generic eval-error path) rather
-  than a dedicated `MODULE_NOT_FOUND`. Functionally safe (data is null, owner is the
-  developer); a distinct code is a future polish.
+- **`MODULE_NOT_FOUND`:** an unresolvable `import` (unknown specifier, `../`, `/etc/…`) is
+  classified as a dedicated `MODULE_NOT_FOUND` error (owner: developer, not retryable, 422),
+  not a generic syntax error. The resolver/loader embed a sentinel (`modules::UNRESOLVED_MARKER`)
+  in the thrown exception that the engine matches structurally — self-controlled, so it
+  doesn't depend on rquickjs's wording.
 
 ## Idea
 

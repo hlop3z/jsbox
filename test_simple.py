@@ -799,14 +799,14 @@ def test_esm(t: Runner):
 
     # Importing an unregistered specifier fails to resolve — the security property: a script
     # can reach only registered modules, never an arbitrary path.
-    t.test("import of unknown module fails (resolves nothing)",
+    t.test("import of unknown module -> MODULE_NOT_FOUND",
            h_raw("import { x } from 'no/such/module';\n"
                  "export default function handler(ctx){ return json(1, null); }"),
-           data_none_with_error())
-    t.test("import path-traversal specifier fails",
+           lambda r: _err_code(r) == "MODULE_NOT_FOUND")
+    t.test("import path-traversal specifier -> MODULE_NOT_FOUND",
            h_raw("import { x } from '../../../etc/passwd';\n"
                  "export default function handler(ctx){ return json(1, null); }"),
-           data_none_with_error())
+           lambda r: _err_code(r) == "MODULE_NOT_FOUND")
 
     # A module-shaped source with no exported handler is a clear HANDLER_NOT_DEFINED.
     t.test("module without exported handler -> error",
