@@ -189,3 +189,55 @@ requirements, small files, negligible eval cost. Two working rules follow:
 2. Timing: the mechanism is cheap (~script-registry-sized), but per "extract,
    don't speculate", build it when the first 2–3 concrete helpers exist as proven
    snippets — not before.
+
+## Questions for you (these gate whether/when we build it)
+
+> Added 2026-06 while per-capability histograms were being built. Read at your
+> leisure; your answers turn this from a proposal into a yes/no with a scope.
+
+The code is the easy part (~script-registry-sized + ~20 lines of memoization/cycle
+detection). The risk is entirely in the **lifecycle and trust** decisions the
+lessons table warns about. Six questions, roughly in priority order:
+
+1. **Is the trigger met yet?** The doc's own rule is "extract, don't speculate —
+   a module is born when the same pattern shows up in ~3 real scripts." **Do we
+   actually have 2–3 concrete, repeated helper snippets in real customer scripts
+   today?** If not, my recommendation is to *not build it yet* and instead start a
+   one-paragraph "candidate helpers" log; the feature lands the day the third
+   repeat appears. (This is the single most important answer — everything below is
+   moot if the trigger isn't met.)
+
+2. **Confirm the consumer is operator-only.** The plan assumes **internal devs
+   author modules, customers only consume them** (no customer-supplied module
+   registry — that's a much bigger feature with a real trust boundary). Still true?
+
+3. **Confirm the trust model is acceptable for the intended use.** A JS module is
+   **readable and patchable by the customer script it shares a context with** —
+   zero confidentiality, zero integrity (only the tamperer's own request is
+   affected, but still). That's fine for *helpers* (a SQL builder, validators) and
+   fatal for *anything load-bearing* (license checks, hidden pricing, sanitization
+   the platform relies on). Do you agree to the hard rule: **modules are
+   convenience only; anything needing authority or secrecy goes in a Rust
+   capability or a registered script** — and we enforce that socially/in review,
+   not in code (because we can't)?
+
+4. **Loader shape: `use("name")` vs auto-injected globals.** Revision 2 proposes a
+   `use("acme/pricing")` loader (script names its own binding; lazy; `meta.modules`
+   audits what actually loaded) over auto-injecting globals from a config list. Do
+   you endorse the loader shape as the format commitment? (It's the one thing we'd
+   support ~forever; it maps 1:1 to dynamic `import()` if ESM ever happens.)
+
+5. **Transitive `use` in v1: allow or forbid?** Proposed: **allow** modules to call
+   `use`, with memoization for diamonds, cycle detection that throws, and a small
+   depth cap (~8) — the Salesforce/OSGi pain was *versioned package graphs*, not
+   function calls in one operator-owned tree. The conservative alternative is a
+   **flat, no-transitive** v1 (a module may not call `use`) that we relax later.
+   Which risk posture do you want for the first cut?
+
+6. **First proving module.** The doc names a **parameterized SQL builder** (always
+   emits `{text, params}`, no raw-string escape hatch) as the canonical first
+   helper. Is that the one we build alongside the mechanism to validate the design,
+   or do you have a different first candidate in mind?
+
+A "no / not yet" on Q1 is a perfectly good outcome — it just means we log candidates
+and revisit. If Q1 is "yes", answers to 2–6 are enough to start.
