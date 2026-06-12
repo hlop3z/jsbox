@@ -521,7 +521,9 @@ Optional `config.json` in the working directory. All fields have defaults:
     "pool_size": 0,
     "max_script_size": "1mb",
     "max_context_size": 0,
-    "max_ops": 1500
+    "max_ops": 1500,
+    "max_concurrent_executions": 0,
+    "max_statement_timeout_ms": 0
   },
   "scripts_dir": "scripts"
 }
@@ -538,6 +540,8 @@ Optional `config.json` in the working directory. All fields have defaults:
 | `max_script_size`  | `"1mb"`    | Max script source size                                                                                                                 |
 | `max_context_size` | `0` (auto) | Max context JSON size. `0` auto-derives `memory_limit / 8`; explicit values are capped at `memory_limit / 4` (boot fails if exceeded). |
 | `max_ops`          | `1500`     | Max HTTP + DB operations per execution                                                                                                 |
+| `max_concurrent_executions` | `0` (auto) | Bulkhead: max in-flight executions. `0` auto-derives `pool_size × 16`. Excess load fast-fails `429 OVERLOADED`. Tune to your DB/PgBouncer connection budget. |
+| `max_statement_timeout_ms`  | `0` (off)  | Operator ceiling for `db` `statement_timeout`. `0` = no ceiling. Clamps per-request `statement_timeout_ms` (a request `0` becomes this). See [resilience note](docs/design/resilience.md). |
 | `scripts_dir`      | _(unset)_  | Directory of registered scripts for execute-by-key. Unset = inline `script` only; `key` requests answer `SCRIPT_NOT_FOUND`.            |
 
 Size fields accept `"8mb"`, `"256kb"`, `"1gb"`, or plain numbers in bytes.

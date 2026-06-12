@@ -81,6 +81,7 @@ The HTTP status is a quick signal for gateways and load balancers:
 | **400** | your request was bad (`request` type)                                            |
 | **404** | the `key` you asked for isn't registered (`SCRIPT_NOT_FOUND`)                    |
 | **422** | your script can't be processed (typo, timeout, no `handler`)                     |
+| **429** | the robot is at capacity right now (`OVERLOADED`) — back off and retry           |
 | **500** | the robot itself broke (rare!) — safe to retry, someone should look              |
 
 The rule: **5xx means "infrastructure, react!"** Everything else is explained in the
@@ -124,6 +125,7 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `CONTEXT_TOO_LARGE` | no    | caller | Context bigger than `max_context_size`.                             |
 | `SCRIPT_XOR_KEY`    | no    | caller | Request has both `script` and `key`, or neither — send exactly one. |
 | `SCRIPT_NOT_FOUND`  | no    | caller | The `key` isn't in the server's script registry (404).              |
+| `MALFORMED_REQUEST` | no    | caller | Body isn't valid JSON, has wrong field types, or is too large.      |
 
 ### The engine (`type: "runtime"`)
 
@@ -134,6 +136,7 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `TIMEOUT`             | no    | developer | Ran past the time limit.                               |
 | `MEMORY_LIMIT`        | no    | developer | The context was too big to load into the memory limit. |
 | `MALFORMED_RESPONSE`  | no    | developer | Returned something that isn't a `json(...)` answer.    |
+| `OVERLOADED`          | yes   | operator  | Server at capacity (bulkhead full) — back off, retry (429). |
 | `INTERNAL`            | yes   | operator  | The robot's own fault (rare) — a 500.                  |
 
 ### Your script (`type: "script"`)
@@ -151,7 +154,8 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `DB_SERIALIZATION` | yes   | operator  | Serialization failure — retry the transaction.             |
 | `DB_DEADLOCK`      | yes   | operator  | Deadlock — retry.                                          |
 | `DB_CONNECTION`    | yes   | operator  | Couldn't reach the database (drop, or can't connect).      |
-| `DB_CANCELED`      | yes   | operator  | Query canceled / statement timeout.                        |
+| `DB_CANCELED`      | yes   | operator  | Query canceled / server-side statement timeout.            |
+| `DB_TIMEOUT`       | yes   | operator  | Query exceeded the client-side execution deadline (freed the thread even when the server-side timeout was lost through a pooler). |
 | `DB_CONSTRAINT`    | no    | developer | Broke a rule (unique/foreign-key/etc). `details.sqlstate`. |
 | `DB_QUERY`         | no    | developer | Bad SQL.                                                   |
 | `DB_OP_LIMIT`      | no    | developer | Hit `max_ops`.                                             |

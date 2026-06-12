@@ -57,6 +57,17 @@ Each capability is a near-identical module. To add or modify one, follow the exi
 - **`http` (`http.rs`) is SSRF-guarded** because the URL is **script-controlled**: host allowlist (`allowed_hosts`), private/internal IP blocking, redirect re-validation.
 - **`db` (`db.rs`) and `mail` (`mail.rs`) are trusted** because the connection is **operator-supplied** in `config.db` / `config.mail` — they connect to whatever host the config names, **no SSRF block**. This is intentional (internal Postgres / self-hosted SMTP relays must work). A new capability that takes operator config follows the db/mail model; one that takes script-supplied targets must guard like http.
 
+### `db` is async (Tier 2 resilience)
+
+`db.rs` uses **async `tokio-postgres`**, not the sync `postgres` crate: each query runs
+via `handle.block_on(tokio::time::timeout(deadline, fut))` on the `spawn_blocking` thread,
+so a hung query is bounded by the execution wall-clock budget (`DB_TIMEOUT`) even when the
+server-side `statement_timeout` is lost through a transaction-mode pooler. The `block_on`
+**must** run on the blocking thread (never a runtime worker). The string-in/string-out FFI
+contract is unchanged — but `db.rs` is no longer a pure copy of the *sync* capability
+template; other capabilities (`mail`/`s3`/`redis`/`amq`) remain sync. See
+`docs/design/resilience.md`.
+
 ### Numbers / decimals
 
 `db.rs` maps Postgres types to JSON with one rule: values that don't fit a JS number exactly come back as **strings** — `BIGINT` (INT8) and `NUMERIC`/`DECIMAL` are strings; INT2/INT4 and floats are numbers. The `$`/`Decimal` global (`decimal.rs`, backed by `rust_decimal` — the same engine that decodes `NUMERIC`) gives exact in-script math. JS has no operator overloading, so it's method-based (`.add().mul().round()`), not `+ - * /`; `__decimal(op, a, b)` does the work and stays panic-free via `Decimal::checked_*`.
