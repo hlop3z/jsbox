@@ -542,8 +542,8 @@ Optional `config.json` in the working directory. All fields have defaults:
 | `max_ops`          | `1500`     | Max HTTP + DB operations per execution                                                                                                 |
 | `max_concurrent_executions` | `0` (auto) | Bulkhead: max in-flight executions. `0` auto-derives `pool_size × 16`. Excess load fast-fails `429 OVERLOADED`. Tune to your DB/PgBouncer connection budget. |
 | `max_statement_timeout_ms`  | `0` (off)  | Operator ceiling for `db` `statement_timeout`. `0` = no ceiling. Clamps per-request `statement_timeout_ms` (a request `0` becomes this). See [resilience note](docs/design/resilience.md). |
-| `max_concurrent_per_tenant` | `0` (off)  | Per-tenant fairness: max concurrent executions per `X-Tenant-Id` (or `tenant` field). `0` = off. A tenant over its share fast-fails `429 TENANT_OVERLOADED` even when global capacity remains, so one noisy tenant can't starve others. |
-| `tenant_buckets`            | `0` (256)  | Hashed tenant buckets (used only when `max_concurrent_per_tenant > 0`). More buckets = fewer tenant collisions. |
+| `max_concurrent_per_partition` | `0` (off) | Per-partition fairness (per-pod backstop): max concurrent executions per `X-Partition-Key` (or `partition` field). `0` = off. A key over its share fast-fails `429 PARTITION_OVERLOADED` even when global capacity remains, so one noisy key can't monopolize a pod. Not a global guarantee — the gateway owns global fairness. |
+| `partition_buckets`         | `0` (256)  | Hashed partition buckets (used only when `max_concurrent_per_partition > 0`). More buckets = fewer key collisions. |
 | `scripts_dir`      | _(unset)_  | Directory of registered scripts for execute-by-key. Unset = inline `script` only; `key` requests answer `SCRIPT_NOT_FOUND`.            |
 
 Size fields accept `"8mb"`, `"256kb"`, `"1gb"`, or plain numbers in bytes.

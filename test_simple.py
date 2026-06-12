@@ -624,10 +624,10 @@ def test_bulkhead(t: Runner):
            h("return json('alive', null);"), data_eq("alive"))
 
 
-def test_tenant_fairness(t: Runner):
-    """Tier 5: a noisy tenant's flood sheds on its OWN per-tenant cap (TENANT_OVERLOADED)
-    while a well-behaved tenant still gets through — the global bulkhead's blind spot."""
-    t.section("Per-tenant fairness (Tier 5)")
+def test_partition_fairness(t: Runner):
+    """Tier 5: a noisy partition's flood sheds on its OWN per-partition cap
+    (PARTITION_OVERLOADED) while a well-behaved partition still gets through."""
+    t.section("Per-partition fairness (Tier 5)")
     import concurrent.futures
 
     slow = "function handler(ctx){ var x=0; for(var i=0;i<20000000;i++){x+=i;} return json(x>0,null); }"
@@ -636,12 +636,12 @@ def test_tenant_fairness(t: Runner):
 
     def noisy_worker():
         for _ in range(3):
-            noisy_codes.append(_err_code(_post({"script": slow, "tenant": "noisy"})))
+            noisy_codes.append(_err_code(_post({"script": slow, "partition": "noisy"})))
 
     def good_worker():
         time.sleep(0.15)  # let the noisy flood ramp first
         for _ in range(4):
-            r = _post({"script": fast, "tenant": "good"})
+            r = _post({"script": fast, "partition": "good"})
             good_outcomes.append((_err_code(r), r.get("data") if r else None))
             time.sleep(0.1)
 
@@ -652,32 +652,32 @@ def test_tenant_fairness(t: Runner):
             f.result()
         victim.result()
 
-    tenant_shed = sum(1 for c in noisy_codes if c == "TENANT_OVERLOADED")
+    partition_shed = sum(1 for c in noisy_codes if c == "PARTITION_OVERLOADED")
     good_ok = sum(1 for code, data in good_outcomes if code is None and data == "ok")
 
-    # Tier 5 is opt-in; if the server has no per-tenant cap, nothing sheds — probe + skip
+    # Tier 5 is opt-in; if the server has no per-partition cap, nothing sheds — probe + skip
     # the fairness asserts, but still check the meta/header plumbing below.
-    if tenant_shed > 0:
-        t.test("noisy tenant sheds on its own cap (TENANT_OVERLOADED)",
-               h("return json(1,null);"), lambda _r: tenant_shed > 0)
-        t.test("good tenant still gets through under the noisy flood",
+    if partition_shed > 0:
+        t.test("noisy partition sheds on its own cap (PARTITION_OVERLOADED)",
+               h("return json(1,null);"), lambda _r: partition_shed > 0)
+        t.test("good partition still gets through under the noisy flood",
                h("return json(1,null);"), lambda _r: good_ok > 0)
     else:
-        print("  \033[33mPROBE\033[0m Tier 5 not active (no max_concurrent_per_tenant) — fairness asserts skipped\n")
+        print("  \033[33mPROBE\033[0m Tier 5 not active (no max_concurrent_per_partition) — asserts skipped\n")
 
-    # Tenant plumbing works regardless of whether the cap is set:
-    r = _post({"script": fast}, headers={"X-Tenant-Id": "acme"})
-    t.test("X-Tenant-Id header echoed in meta.tenant",
+    # Partition-key plumbing works regardless of whether the cap is set:
+    r = _post({"script": fast}, headers={"X-Partition-Key": "acme"})
+    t.test("X-Partition-Key header echoed in meta.partition",
            h("return json(1,null);"),
-           lambda _r: r is not None and r.get("meta", {}).get("tenant") == "acme")
-    r2 = _post({"script": fast, "tenant": "beta"})
-    t.test("tenant body field echoed in meta.tenant",
+           lambda _r: r is not None and r.get("meta", {}).get("partition") == "acme")
+    r2 = _post({"script": fast, "partition": "beta"})
+    t.test("partition body field echoed in meta.partition",
            h("return json(1,null);"),
-           lambda _r: r2 is not None and r2.get("meta", {}).get("tenant") == "beta")
-    r3 = _post({"script": fast, "tenant": "ignored"}, headers={"X-Tenant-Id": "header-wins"})
-    t.test("header takes precedence over body tenant field",
+           lambda _r: r2 is not None and r2.get("meta", {}).get("partition") == "beta")
+    r3 = _post({"script": fast, "partition": "ignored"}, headers={"X-Partition-Key": "header-wins"})
+    t.test("header takes precedence over body partition field",
            h("return json(1,null);"),
-           lambda _r: r3 is not None and r3.get("meta", {}).get("tenant") == "header-wins")
+           lambda _r: r3 is not None and r3.get("meta", {}).get("partition") == "header-wins")
 
 
 def test_statement_timeout_clamp(t: Runner, db: dict):
@@ -943,7 +943,7 @@ def _start_server() -> subprocess.Popen:
         "engine": {
             "max_concurrent_executions": 6,
             "max_statement_timeout_ms": 800,
-            "max_concurrent_per_tenant": 2,
+            "max_concurrent_per_partition": 2,
         },
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
@@ -979,7 +979,7 @@ def main():
     test_registry_hardening(t)
     test_isolation_under_concurrency(t)
     test_bulkhead(t)
-    test_tenant_fairness(t)
+    test_partition_fairness(t)
 
     # Database tests — only if containers are running
     if _db_available(PG_CONFIG):

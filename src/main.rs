@@ -12,13 +12,13 @@ mod handler;
 mod http;
 mod kv;
 mod mail;
+mod partition;
 mod pool;
 mod registry;
 mod s3;
 mod sandbox;
 mod ssrf;
 mod sys;
-mod tenant;
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -37,9 +37,9 @@ use tracing_subscriber::fmt::init as init_tracing;
 
 use crate::config::Config;
 use crate::handler::AppState;
+use crate::partition::PartitionLimiter;
 use crate::pool::JsPool;
 use crate::registry::ScriptRegistry;
-use crate::tenant::TenantLimiter;
 
 /// Use `mimalloc` as the global allocator for better small-allocation performance.
 /// `QuickJS` benefits significantly (~20-40%) from this via the `rust-alloc` feature.
@@ -97,20 +97,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let max_concurrent = js_pool
         .engine_config()
         .resolved_max_concurrent(js_pool.size());
-    let per_tenant = js_pool.engine_config().max_concurrent_per_tenant;
-    let tenant_buckets = js_pool.engine_config().resolved_tenant_buckets();
+    let per_partition = js_pool.engine_config().max_concurrent_per_partition;
+    let partition_buckets = js_pool.engine_config().resolved_partition_buckets();
     info!("execution bulkhead: {max_concurrent} concurrent");
-    let tenant_limiter = TenantLimiter::new(tenant_buckets, per_tenant);
-    if tenant_limiter.is_some() {
+    let partition_limiter = PartitionLimiter::new(partition_buckets, per_partition);
+    if partition_limiter.is_some() {
         info!(
-            "per-tenant fairness: {per_tenant} concurrent/tenant across {tenant_buckets} buckets"
+            "per-partition fairness: {per_partition} concurrent/partition across {partition_buckets} buckets"
         );
     }
     let state = AppState {
         pool: js_pool,
         registry: Arc::new(script_registry),
         limiter: Arc::new(Semaphore::new(max_concurrent)),
-        tenant_limiter,
+        partition_limiter,
     };
 
     let app = Router::new()

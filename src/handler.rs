@@ -24,12 +24,12 @@ use crate::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorS
 use crate::http::HttpMetric;
 use crate::kv::{RedisConfig, RedisMetric};
 use crate::mail::{MailConfig, MailMetric};
+use crate::partition::PartitionLimiter;
 use crate::pool::JsPool;
 use crate::registry::ScriptRegistry;
 use crate::s3::{S3Config, S3Metric};
 use crate::sandbox;
 use crate::sys::SysConfig;
-use crate::tenant::TenantLimiter;
 
 /// Shared application state for the router: the runtime pool, the script registry, and
 /// the concurrency bulkhead.
@@ -43,10 +43,10 @@ pub(crate) struct AppState {
     /// execution span, and acquisition fast-fails (`429 OVERLOADED`) when saturated so a
     /// slow downstream can't exhaust blocking threads / DB connections.
     pub(crate) limiter: Arc<Semaphore>,
-    /// Per-tenant fairness (Tier 5): caps concurrency per `X-Tenant-Id`. `None` when
-    /// disabled. Acquired *before* the global bulkhead so a noisy tenant fast-fails on its
-    /// own share (`429 TENANT_OVERLOADED`) while global capacity stays free for others.
-    pub(crate) tenant_limiter: Option<TenantLimiter>,
+    /// Per-partition fairness (Tier 5): caps concurrency per `X-Partition-Key`. `None` when
+    /// disabled. Acquired *before* the global bulkhead so a noisy partition fast-fails on its
+    /// own share (`429 PARTITION_OVERLOADED`) while global capacity stays free for others.
+    pub(crate) partition_limiter: Option<PartitionLimiter>,
 }
 
 /// Pre-allocated `Box<RawValue>` for `{}` — used as default context.
@@ -64,10 +64,10 @@ pub(crate) struct ExecRequest {
     script: Option<String>,
     /// Registered-script key to execute (exactly one of `script` / `key`).
     key: Option<String>,
-    /// Tenant id for per-tenant fairness (Tier 5). The `X-Tenant-Id` header takes
-    /// precedence over this field; both are set by the trusted caller, not the script.
+    /// Partition key for per-partition fairness (Tier 5). The `X-Partition-Key` header
+    /// takes precedence over this field; both are set by the trusted caller, not the script.
     #[serde(default)]
-    tenant: Option<String>,
+    partition: Option<String>,
     /// Raw context passed straight to `QuickJS` — never deserialized in Rust.
     #[serde(default = "default_context")]
     context: Box<RawValue>,
@@ -157,9 +157,9 @@ struct Meta {
     /// Registered-script key, echoed back when the request executed by key.
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<String>,
-    /// Tenant id, echoed back when one was supplied (Tier 5 observability).
+    /// Partition key, echoed back when one was supplied (Tier 5 observability).
     #[serde(skip_serializing_if = "Option::is_none")]
-    tenant: Option<String>,
+    partition: Option<String>,
     /// Size of the script in bytes.
     script_bytes: usize,
     /// Size of the context payload in bytes.
@@ -195,7 +195,7 @@ impl Meta {
         Self {
             trace_id,
             key: None,
-            tenant: None,
+            partition: None,
             script_bytes,
             context_bytes,
             total_input_bytes: script_bytes.saturating_add(context_bytes),
@@ -216,9 +216,9 @@ impl Meta {
         self
     }
 
-    /// Attaches the tenant id (echoed back when supplied).
-    fn with_tenant(mut self, tenant: Option<String>) -> Self {
-        self.tenant = tenant;
+    /// Attaches the partition key (echoed back when supplied).
+    fn with_partition(mut self, partition: Option<String>) -> Self {
+        self.partition = partition;
         self
     }
 
@@ -290,12 +290,12 @@ pub(crate) async fn execute(
     let ExecRequest {
         script,
         key,
-        tenant: body_tenant,
+        partition: body_partition,
         context,
         config,
     } = req;
-    // Tenant id (Tier 5): `X-Tenant-Id` header wins over the body field; both are caller-set.
-    let tenant = header_tenant(&headers).or(body_tenant);
+    // Partition key (Tier 5): `X-Partition-Key` header wins over the body field; caller-set.
+    let partition = header_partition(&headers).or(body_partition);
     let context_bytes = context.get().len();
 
     let engine_cfg = state.pool.engine_config().clone();
@@ -310,7 +310,7 @@ pub(crate) async fn execute(
             let (status, envelope) = *rejection;
             let meta = Meta::new(trace_id, 0, context_bytes, 0)
                 .with_key(key)
-                .with_tenant(tenant);
+                .with_partition(partition);
             return system_error_response(envelope, status, meta);
         }
     };
@@ -325,54 +325,36 @@ pub(crate) async fn execute(
     ) {
         let meta = Meta::new(trace_id, script_bytes, context_bytes, 0)
             .with_key(key)
-            .with_tenant(tenant);
+            .with_partition(partition);
         return system_error_response(request_error(code, message), 400, meta);
     }
 
     let context_json: String = context.get().into();
-    let allowed_hosts = config.allowed_hosts;
     // Tier 0: clamp the per-request db statement_timeout to the operator ceiling, so
     // jsbox never issues an unbounded `SET` (see docs/design/resilience.md).
     let mut db_config = config.db;
     if let Some(db) = db_config.as_mut() {
         clamp_statement_timeout(db, engine_cfg.max_statement_timeout_ms);
     }
-    let mail_config = config.mail;
-    let s3_config = config.s3;
-    let redis_config = config.redis;
-    let amq_config = config.amq;
-    let auth_config = config.auth;
-    let sys_config = config.sys;
 
     let start = Instant::now();
 
-    // Acquire the per-tenant permit (Tier 5) then the global bulkhead permit (Tier 1),
-    // both held across the blocking span. A noisy tenant fast-fails on its own share.
-    let (tenant_permit, permit) = match acquire_permits(&state, tenant.as_deref()) {
+    // Acquire the per-partition permit (Tier 5) then the global bulkhead permit (Tier 1),
+    // both held across the blocking span. A noisy partition fast-fails on its own share.
+    let busy_meta = base_error_meta(
+        &trace_id,
+        script_bytes,
+        context_bytes,
+        key.as_deref(),
+        partition.as_deref(),
+    );
+    let (partition_permit, permit) = match acquire_permits(&state, partition.as_deref()) {
         Admission::Granted {
-            tenant_permit,
+            partition_permit,
             global,
-        } => (tenant_permit, global),
-        Admission::TenantBusy => {
-            let meta = base_error_meta(
-                &trace_id,
-                script_bytes,
-                context_bytes,
-                key.as_deref(),
-                tenant.as_deref(),
-            );
-            return tenant_overloaded_response(meta);
-        }
-        Admission::GlobalBusy => {
-            let meta = base_error_meta(
-                &trace_id,
-                script_bytes,
-                context_bytes,
-                key.as_deref(),
-                tenant.as_deref(),
-            );
-            return overloaded_response(meta);
-        }
+        } => (partition_permit, global),
+        Admission::PartitionBusy => return partition_overloaded_response(busy_meta),
+        Admission::GlobalBusy => return overloaded_response(busy_meta),
     };
 
     let js_pool = state.pool;
@@ -390,14 +372,14 @@ pub(crate) async fn execute(
             script: source.as_str(),
             context_json: &context_json,
             timeout: engine_cfg.timeout(),
-            allowed_hosts: &allowed_hosts,
+            allowed_hosts: &config.allowed_hosts,
             db_config: db_config.as_ref(),
-            mail_config: mail_config.as_ref(),
-            s3_config: s3_config.as_ref(),
-            redis_config: redis_config.as_ref(),
-            amq_config: amq_config.as_ref(),
-            auth_config: auth_config.as_ref(),
-            sys_config: sys_config.as_ref(),
+            mail_config: config.mail.as_ref(),
+            s3_config: config.s3.as_ref(),
+            redis_config: config.redis.as_ref(),
+            amq_config: config.amq.as_ref(),
+            auth_config: config.auth.as_ref(),
+            sys_config: config.sys.as_ref(),
             max_ops: engine_cfg.max_ops,
             allow_private_targets,
         });
@@ -406,14 +388,14 @@ pub(crate) async fn execute(
     })
     .await;
 
-    // Execution finished — free the bulkhead + per-tenant permits for the next request.
+    // Execution finished — free the bulkhead + per-partition permits for the next request.
     drop(permit);
-    drop(tenant_permit);
+    drop(partition_permit);
 
     let exec_time_us = start.elapsed().as_micros();
     let base_meta = Meta::new(trace_id, script_bytes, context_bytes, exec_time_us)
         .with_key(key)
-        .with_tenant(tenant);
+        .with_partition(partition);
     build_response(result, base_meta, error_debug)
 }
 
@@ -539,44 +521,45 @@ fn overloaded_response(meta: Meta) -> AxumResponse {
     system_error_response(envelope, 429, meta)
 }
 
-/// Builds the `429 TENANT_OVERLOADED` response (Tier 5): this tenant exceeded its
-/// concurrency share while global capacity may remain — the caller (that tenant) should
+/// Builds the `429 PARTITION_OVERLOADED` response (Tier 5): this partition exceeded its
+/// concurrency share while global capacity may remain — the caller (that partition) should
 /// back off, so it's owned by the caller, retryable.
-fn tenant_overloaded_response(meta: Meta) -> AxumResponse {
+fn partition_overloaded_response(meta: Meta) -> AxumResponse {
     let envelope = ErrorEnvelope::new(
         ErrorCategory::Runtime,
         ErrorSource::Engine,
-        "TENANT_OVERLOADED".to_owned(),
+        "PARTITION_OVERLOADED".to_owned(),
         true,
         ErrorOwner::Caller,
     )
-    .with_message("tenant concurrency limit reached, retry shortly".to_owned());
+    .with_message("partition concurrency limit reached, retry shortly".to_owned());
     system_error_response(envelope, 429, meta)
 }
 
-/// Outcome of acquiring the per-tenant (Tier 5) + global bulkhead (Tier 1) permits.
+/// Outcome of acquiring the per-partition (Tier 5) + global bulkhead (Tier 1) permits.
 enum Admission {
-    /// Both granted — hold for the execution. `tenant_permit` is `None` when no tenant
+    /// Both granted — hold for the execution. `partition_permit` is `None` when no partition
     /// was supplied or fairness is disabled.
     Granted {
-        /// Per-tenant permit (Tier 5).
-        tenant_permit: Option<OwnedSemaphorePermit>,
+        /// Per-partition permit (Tier 5).
+        partition_permit: Option<OwnedSemaphorePermit>,
         /// Global bulkhead permit (Tier 1).
         global: OwnedSemaphorePermit,
     },
-    /// The tenant exceeded its per-tenant share (`429 TENANT_OVERLOADED`).
-    TenantBusy,
+    /// The partition exceeded its per-partition share (`429 PARTITION_OVERLOADED`).
+    PartitionBusy,
     /// The global bulkhead is saturated (`429 OVERLOADED`).
     GlobalBusy,
 }
 
-/// Acquires the per-tenant permit (if a tenant is supplied and fairness is on) then the
-/// global bulkhead permit. Per-tenant first, so a noisy tenant fast-fails on its own
+/// Acquires the per-partition permit (if a partition is supplied and fairness is on) then the
+/// global bulkhead permit. Per-partition first, so a noisy partition fast-fails on its own
 /// share before consuming a global slot.
-fn acquire_permits(state: &AppState, tenant: Option<&str>) -> Admission {
-    let tenant_permit = if let (Some(limiter), Some(id)) = (&state.tenant_limiter, tenant) {
+fn acquire_permits(state: &AppState, partition: Option<&str>) -> Admission {
+    let partition_permit = if let (Some(limiter), Some(id)) = (&state.partition_limiter, partition)
+    {
         let Some(permit) = limiter.try_acquire(id) else {
-            return Admission::TenantBusy;
+            return Admission::PartitionBusy;
         };
         Some(permit)
     } else {
@@ -584,7 +567,7 @@ fn acquire_permits(state: &AppState, tenant: Option<&str>) -> Admission {
     };
     match Arc::clone(&state.limiter).try_acquire_owned() {
         Ok(global) => Admission::Granted {
-            tenant_permit,
+            partition_permit,
             global,
         },
         Err(_too_busy) => Admission::GlobalBusy,
@@ -598,18 +581,18 @@ fn base_error_meta(
     script_bytes: usize,
     context_bytes: usize,
     key: Option<&str>,
-    tenant: Option<&str>,
+    partition: Option<&str>,
 ) -> Meta {
     Meta::new(trace_id.to_owned(), script_bytes, context_bytes, 0)
         .with_key(key.map(str::to_owned))
-        .with_tenant(tenant.map(str::to_owned))
+        .with_partition(partition.map(str::to_owned))
 }
 
-/// Reads the tenant id from the `X-Tenant-Id` header (trimmed, non-empty). Takes
-/// precedence over the request body's `tenant` field.
-fn header_tenant(headers: &HeaderMap) -> Option<String> {
+/// Reads the partition key from the `X-Partition-Key` header (trimmed, non-empty). Takes
+/// precedence over the request body's `partition` field.
+fn header_partition(headers: &HeaderMap) -> Option<String> {
     headers
-        .get("x-tenant-id")
+        .get("x-partition-key")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|id| !id.is_empty())

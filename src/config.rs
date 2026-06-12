@@ -34,9 +34,9 @@ const CONTEXT_LIMIT_DIVISOR: usize = 8;
 /// (~512) so a slow downstream can't exhaust the runtime (see `docs/design/resilience.md`).
 const AUTO_CONCURRENCY_FACTOR: usize = 16;
 
-/// Default number of hashed tenant buckets when `tenant_buckets` is left at `0`. Enough
-/// that distinct tenants rarely collide while keeping the semaphore array small.
-const DEFAULT_TENANT_BUCKETS: usize = 256;
+/// Default number of hashed partition buckets when `partition_buckets` is left at `0`.
+/// Enough that distinct keys rarely collide while keeping the semaphore array small.
+const DEFAULT_PARTITION_BUCKETS: usize = 256;
 
 /// Top-level configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -113,14 +113,15 @@ pub(crate) struct EngineConfig {
     /// rather than exhausting blocking threads / DB connections under a slow downstream
     /// (see `docs/design/resilience.md`). Tune to the downstream connection budget.
     pub(crate) max_concurrent_executions: usize,
-    /// Per-tenant fairness (Tier 5): max concurrent executions per tenant
-    /// (`X-Tenant-Id` header / `tenant` field). `0` = off (no per-tenant cap). A tenant
-    /// over its share fast-fails `429 TENANT_OVERLOADED` even when global capacity
-    /// remains, so one noisy tenant can't starve others (see `docs/design/resilience.md`).
-    pub(crate) max_concurrent_per_tenant: usize,
-    /// Number of hashed tenant buckets (only used when `max_concurrent_per_tenant > 0`).
-    /// More buckets = fewer tenant collisions, more semaphores. `0` = default 256.
-    pub(crate) tenant_buckets: usize,
+    /// Per-partition fairness (Tier 5): max concurrent executions per partition key
+    /// (`X-Partition-Key` header / `partition` field). `0` = off. A key over its share
+    /// fast-fails `429 PARTITION_OVERLOADED` even when global capacity remains, so one
+    /// noisy key can't monopolize this pod. Per-pod backstop, not a global guarantee
+    /// (the gateway owns global per-partition fairness — see `docs/design/resilience.md`).
+    pub(crate) max_concurrent_per_partition: usize,
+    /// Number of hashed partition buckets, used only when per-partition fairness is on.
+    /// More buckets = fewer key collisions, more semaphores. `0` = default 256.
+    pub(crate) partition_buckets: usize,
     /// Operator ceiling (ms) for the `db` `statement_timeout`. `0` = no ceiling. A
     /// per-request `config.db.statement_timeout_ms` is clamped to this, and a request
     /// value of `0` ("unlimited") becomes this ceiling — so jsbox never issues an
@@ -168,17 +169,17 @@ impl Default for ServerConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            memory_limit: 32 * 1024 * 1024, // 32mb
-            max_stack_size: 512 * 1024,     // 512kb
-            timeout_ms: 4000,               // 4s balanced default
-            pool_size: 0,                   // Auto
-            max_script_size: 1024 * 1024,   // 1mb
-            max_context_size: 0,            // 0 = auto: memory_limit / CONTEXT_LIMIT_DIVISOR
-            max_ops: 1500,                  // safe cap for API workloads
-            max_concurrent_executions: 0,   // 0 = auto: pool_size * AUTO_CONCURRENCY_FACTOR
-            max_statement_timeout_ms: 0,    // 0 = no operator ceiling (opt-in)
-            max_concurrent_per_tenant: 0,   // 0 = per-tenant fairness off (opt-in)
-            tenant_buckets: 0,              // 0 = default DEFAULT_TENANT_BUCKETS
+            memory_limit: 32 * 1024 * 1024,  // 32mb
+            max_stack_size: 512 * 1024,      // 512kb
+            timeout_ms: 4000,                // 4s balanced default
+            pool_size: 0,                    // Auto
+            max_script_size: 1024 * 1024,    // 1mb
+            max_context_size: 0,             // 0 = auto: memory_limit / CONTEXT_LIMIT_DIVISOR
+            max_ops: 1500,                   // safe cap for API workloads
+            max_concurrent_executions: 0,    // 0 = auto: pool_size * AUTO_CONCURRENCY_FACTOR
+            max_statement_timeout_ms: 0,     // 0 = no operator ceiling (opt-in)
+            max_concurrent_per_partition: 0, // 0 = per-partition fairness off (opt-in)
+            partition_buckets: 0,            // 0 = default DEFAULT_PARTITION_BUCKETS
         }
     }
 }
@@ -207,13 +208,13 @@ impl EngineConfig {
         if auto > 0 { auto } else { 1 }
     }
 
-    /// Resolves the tenant-bucket count: the configured value, or `DEFAULT_TENANT_BUCKETS`
-    /// when left at `0`.
-    pub(crate) const fn resolved_tenant_buckets(&self) -> usize {
-        if self.tenant_buckets > 0 {
-            self.tenant_buckets
+    /// Resolves the partition-bucket count: the configured value, or
+    /// `DEFAULT_PARTITION_BUCKETS` when left at `0`.
+    pub(crate) const fn resolved_partition_buckets(&self) -> usize {
+        if self.partition_buckets > 0 {
+            self.partition_buckets
         } else {
-            DEFAULT_TENANT_BUCKETS
+            DEFAULT_PARTITION_BUCKETS
         }
     }
 

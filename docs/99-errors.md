@@ -81,7 +81,7 @@ The HTTP status is a quick signal for gateways and load balancers:
 | **400** | your request was bad (`request` type)                                            |
 | **404** | the `key` you asked for isn't registered (`SCRIPT_NOT_FOUND`)                    |
 | **422** | your script can't be processed (typo, timeout, no `handler`)                     |
-| **429** | at capacity (`OVERLOADED`) or your tenant hit its share (`TENANT_OVERLOADED`) — back off, retry |
+| **429** | at capacity (`OVERLOADED`) or your partition hit its share (`PARTITION_OVERLOADED`) — back off, retry |
 | **500** | the robot itself broke (rare!) — safe to retry, someone should look              |
 
 The rule: **5xx means "infrastructure, react!"** Everything else is explained in the
@@ -137,7 +137,7 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `MEMORY_LIMIT`        | no    | developer | The context was too big to load into the memory limit. |
 | `MALFORMED_RESPONSE`  | no    | developer | Returned something that isn't a `json(...)` answer.    |
 | `OVERLOADED`          | yes   | operator  | Server at capacity (bulkhead full) — back off, retry (429). |
-| `TENANT_OVERLOADED`   | yes   | caller    | This tenant hit its concurrency share (per-tenant fairness) — back off, retry (429). |
+| `PARTITION_OVERLOADED` | yes  | caller    | This partition key hit its concurrency share (per-partition fairness) — back off, retry (429). |
 | `INTERNAL`            | yes   | operator  | The robot's own fault (rare) — a 500.                  |
 
 ### Your script (`type: "script"`)

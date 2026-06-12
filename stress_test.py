@@ -42,20 +42,20 @@ DB_CONFIG = {"host": PGB_HOST, "port": PGB_PORT, "user": "test",
 
 # The load: a slow DB query (simulates a degraded database / saturated pool). Each
 # request holds a connection for SLEEP_S server-side.
-# The flood is tagged tenant "noisy"; the victim "good" — so with Tier 5 enabled (variant
-# B) the noisy tenant sheds on its own cap and the good tenant keeps its share.
+# The flood is tagged partition "noisy"; the victim "good" — so with Tier 5 enabled
+# (variant B) the noisy partition sheds on its own cap and the good one keeps its share.
 WORK_BODY = {
     "script": f"function handler(ctx) {{ db.query('SELECT pg_sleep({SLEEP_S})'); return json('ok', null); }}",
     "config": {"db": DB_CONFIG},
-    "tenant": "noisy",
+    "partition": "noisy",
 }
 TRIVIAL_BODY = {"script": "function handler(ctx) { return json(1, null); }"}
-# A well-behaved tenant's normal, fast query — interleaved during the overload to measure
-# noisy-neighbor impact (does the slow-query flood drag down a good request?).
+# A well-behaved partition's normal, fast query — interleaved during the overload to
+# measure noisy-neighbor impact (does the slow-query flood drag down a good request?).
 VICTIM_BODY = {
     "script": "function handler(ctx) { var r = db.query('SELECT 1 AS ok'); return json(r.rows[0].ok, null); }",
     "config": {"db": DB_CONFIG},
-    "tenant": "good",
+    "partition": "good",
 }
 
 
@@ -144,7 +144,7 @@ def run_load(concurrency: int, duration: float) -> dict:
             local.append(_post_timed(WORK_BODY))
         return local
 
-    victim = []  # (latency, status, code) — the well-behaved tenant under the flood
+    victim = []  # (latency, status, code) — the well-behaved partition under the flood
 
     def victim_prober():
         # Let the flood ramp first, then probe every ~250ms.
@@ -222,12 +222,12 @@ def report(a: dict, b: dict):
               f"({a['p99'] / max(b['p99'], 1e-3):.0f}x lower under overload)")
     if b["shed_429"] > 0 and a["shed_429"] == 0:
         print(f"    Tier 1 ✓  B fails fast — sheds {b['shed_pct']:.0f}% as 429s; A queues (none shed)")
-    print(f"    Noisy neighbor  victim (tenant 'good')  A succeeded {a['vic_ok']}  vs  B succeeded {b['vic_ok']}")
+    print(f"    Noisy neighbor  victim (partition 'good')  A succeeded {a['vic_ok']}  vs  B succeeded {b['vic_ok']}")
     if b["vic_ok"] > 0:
-        print(f"    Tier 5 ✓  the good tenant keeps its share — {b['vic_ok']} victim requests got")
+        print(f"    Tier 5 ✓  the good partition keeps its share — {b['vic_ok']} victim requests got")
         print(f"              through under the flood (A: {a['vic_ok']}, dragged to p99 {a['vic_p99']:.2f}s).")
     elif b["vic_shed"] > 0:
-        print("    Tier 5 gap: the good tenant was shed too — is max_concurrent_per_tenant set?")
+        print("    Tier 5 gap: the good partition was shed too — is max_concurrent_per_partition set?")
     print()
 
 
@@ -251,7 +251,7 @@ def main():
     a = experiment("A baseline", {"max_concurrent_executions": 1000, "max_statement_timeout_ms": 0})
     # B: Tier 1 bulkhead + Tier 0 clamp.
     b = experiment("B resilient", {"max_concurrent_executions": 8, "max_statement_timeout_ms": 1000,
-                                    "max_concurrent_per_tenant": 4})
+                                    "max_concurrent_per_partition": 4})
     report(a, b)
 
 

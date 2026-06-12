@@ -33,7 +33,7 @@ killer, and it is independent of the timeout question.
 | 2 | **Client deadline + active cancellation** | A hung query is cancelled and its thread/connection freed promptly, independent of any pooler | **done** (async `db`) |
 | 3 | **Circuit breaker** | A struggling DB isn't buried under retries; jsbox stays responsive | planned |
 | 4 | **Pooler timeouts** | PgBouncer `query_timeout`/`query_wait_timeout` as an independent layer | operator config |
-| 5 | **Per-tenant fairness** | One tenant can't starve another (per-tenant concurrency cap) | **done**; observability/metrics still planned |
+| 5 | **Per-partition fairness** | One key can't monopolize a pod (per-pod cap; global fairness is the gateway's job) | **done** (per-pod backstop) |
 
 ### Tier 0 — server-side ceiling + clamp (done + operator action)
 
@@ -101,13 +101,39 @@ multi-thread runtime drives the connection task on a worker while the blocking t
 parked in `block_on`; and the CPU-bound `QuickJS` execution stays on `spawn_blocking`
 (the JS context never crosses an `.await`).
 
-### Tier 3–5 — breaker, pooler timeouts, observability + fairness (planned)
+### Tier 5 — per-partition fairness (done; a per-pod backstop)
 
-Circuit breaker (trip on DB error/latency, fast-fail retryable during cool-down);
-PgBouncer's own `query_timeout`; SLO metrics (latency histograms, timeout/cancel/
-breaker/saturation counters — extend the existing per-op `duration_us` drain); and
-per-tenant concurrency quotas so one customer can't starve another (a hard requirement
-for big-company multi-tenancy, not a nice-to-have).
+The global bulkhead (Tier 1) protects a pod but sheds load *indiscriminately* — the A/B
+harness measured a good tenant being rejected alongside a noisy one (victim 0 succeeded).
+Tier 5 adds a per-key concurrency cap underneath the global one: a request carries a
+**partition key** (`X-Partition-Key` header, or a `partition` body field — header wins;
+both caller-set, never script-set), and a key over its share fast-fails
+`429 PARTITION_OVERLOADED` *even when global capacity remains*. The key is whatever the
+operator/gateway chooses to isolate on — a tenant, an API key, a route. Implementation:
+keys hash into a fixed array of semaphores (`PartitionLimiter`), so memory is constant and
+there's no per-key lifecycle — and a single pod never has more than the bulkhead's worth
+of *concurrent* keys, so collisions stay rare no matter how many keys exist overall.
+Opt-in via `max_concurrent_per_partition` (0 = off).
+
+**Crucially, this is a *per-pod* control, not a global guarantee.** Under k8s with N
+replicas behind a load balancer, the effective ceiling is per-pod × N, and it drifts as
+the HPA scales. **Global per-partition fairness belongs at the gateway** — the one
+component with the fleet-wide view of a key, and the place built for millions of tenants
+(rate limiting, often Redis-backed). jsbox's role is local self-protection: the global
+bulkhead stops the pod falling over; the per-partition cap stops one key monopolizing a
+*single* pod under sticky routing, hot-key skew, or a gateway gap. So the reference
+deployment is: **gateway = global per-key policy (rejects over-quota before fan-out);
+jsbox = per-pod bulkhead + per-pod partition backstop.** A true global limit enforced *in*
+jsbox would require a shared store (Redis) on the hot path — feasible but adds a
+dependency, latency, and crash-leak handling; documented as an opt-in path, not the
+default.
+
+### Tier 3–4 — breaker, pooler timeouts (planned)
+
+Circuit breaker (trip on DB error/latency, fast-fail retryable during cool-down) and
+PgBouncer's own `query_timeout`. Observability (SLO metrics — latency histograms,
+timeout/cancel/breaker/saturation counters, extending the per-op `duration_us` drain)
+remains planned alongside.
 
 ## Learning from big companies' async-in-Rust mistakes
 
@@ -140,7 +166,7 @@ The Tier 2 refactor is where teams get hurt. Rules we adopt up front:
 We do not trust the model on reasoning alone; we measure it. `stress_test.py` manages
 the server lifecycle itself (one variant at a time, so config is the only variable),
 floods `/execute` with concurrent slow queries through PgBouncer, and interleaves a
-"victim" — a well-behaved tenant's normal fast query — to measure noisy-neighbor impact.
+"victim" — a well-behaved partition's normal fast query — to measure noisy-neighbor impact.
 
 ### Measured (2026-06; 40 concurrent, `pg_sleep(2)` via PgBouncer, ~8 s)
 
@@ -149,24 +175,24 @@ floods `/execute` with concurrent slow queries through PgBouncer, and interleave
 | flood latency p99 | **8.01 s** | **0.04 s** (228× lower) |
 | shed as 429 | 0% (queues into the pool) | 100% (fails fast) |
 | flood outcomes | 28 OK, 48 `DB_TIMEOUT`, 9 `DB_CANCELED` | 5 OK, 54 `DB_CANCELED`, rest `OVERLOADED` |
-| victim (good tenant) p99 | 5.56 s | 0.03 s |
+| victim (good partition) p99 | 5.56 s | 0.03 s |
 | victim succeeded / shed | 0 / 0 (dragged into the queue) | 0 / 28 (shed by the global bulkhead) |
 
 Reading it: under overload A piles every request into the saturated PgBouncer pool —
 tail latency climbs to 8 s (worse than the 4 s engine timeout, because even *connecting*
 queues) and most requests time out. B sheds the excess as instant 429s and holds p99 at
 40 ms. **But** the victim result (measured against the Tier 0+1-only build) exposed a real
-gap: that bulkhead is *global*, so it rejected the good tenant alongside the flood (0
+gap: that bulkhead is *global*, so it rejected the good partition alongside the flood (0
 succeeded, 28 shed) — bounding the victim's latency but not letting it through. That
-number was the concrete motivation for **Tier 5 (per-tenant fairness), now implemented**.
+number was the concrete motivation for **Tier 5 (per-partition fairness), now implemented**.
 
-**Tier 5 closes the gap (measured).** The harness tags the flood as tenant `noisy` and the
-victim as `good`; with `max_concurrent_per_tenant` set, the noisy tenant sheds on its *own*
-cap (`TENANT_OVERLOADED`) while the good tenant keeps its share. Re-running the same
-scenario with Tier 5 enabled: **victim requests succeeded — A: 0, B: 18** (A drags the
-good tenant to p99 5.6 s and 0 get through; B lets 18 through at p99 0.09 s). The
-integration suite asserts the same mechanism (a noisy tenant sheds `TENANT_OVERLOADED`
-while a good tenant gets through).
+**Tier 5 closes the gap (measured).** The harness tags the flood as partition `noisy` and
+the victim as `good`; with `max_concurrent_per_partition` set, the noisy partition sheds on
+its *own* cap (`PARTITION_OVERLOADED`) while the good one keeps its share. Re-running the
+same scenario with Tier 5 enabled: **victim requests succeeded — A: 0, B: 18** (A drags the
+good partition to p99 5.6 s and 0 get through; B lets 18 through at p99 0.09 s). The
+integration suite asserts the same mechanism (a noisy partition sheds `PARTITION_OVERLOADED`
+while a good one gets through).
 
 ### The plan (variants, knobs, hypotheses)
 
