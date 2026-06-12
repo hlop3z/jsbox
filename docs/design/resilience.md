@@ -1,8 +1,7 @@
 # Design note: resilience for SLO/SLA (timeouts, bulkheads, cancellation)
 
-Status: **Tier 0 + Tier 1 + Tier 2 implemented** (2026-06); Tiers 3–5 planned.
-Companion to [pooled-capabilities.md](pooled-capabilities.md). Grounded in the code as
-of `main`.
+Status: **Tiers 0, 1, 2, 5 implemented** (2026-06); Tiers 3–4 planned. Companion to
+[pooled-capabilities.md](pooled-capabilities.md). Grounded in the code as of `main`.
 
 ## The principle
 
@@ -34,7 +33,7 @@ killer, and it is independent of the timeout question.
 | 2 | **Client deadline + active cancellation** | A hung query is cancelled and its thread/connection freed promptly, independent of any pooler | **done** (async `db`) |
 | 3 | **Circuit breaker** | A struggling DB isn't buried under retries; jsbox stays responsive | planned |
 | 4 | **Pooler timeouts** | PgBouncer `query_timeout`/`query_wait_timeout` as an independent layer | operator config |
-| 5 | **Observability + per-tenant fairness** | SLOs are measurable; one tenant can't starve another | partial (metrics) → planned |
+| 5 | **Per-tenant fairness** | One tenant can't starve another (per-tenant concurrency cap) | **done**; observability/metrics still planned |
 
 ### Tier 0 — server-side ceiling + clamp (done + operator action)
 

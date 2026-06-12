@@ -6,12 +6,12 @@ use std::time::Instant;
 use axum::Json;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task;
 use tracing::warn;
 use uuid::Uuid;
@@ -29,6 +29,7 @@ use crate::registry::ScriptRegistry;
 use crate::s3::{S3Config, S3Metric};
 use crate::sandbox;
 use crate::sys::SysConfig;
+use crate::tenant::TenantLimiter;
 
 /// Shared application state for the router: the runtime pool, the script registry, and
 /// the concurrency bulkhead.
@@ -42,6 +43,10 @@ pub(crate) struct AppState {
     /// execution span, and acquisition fast-fails (`429 OVERLOADED`) when saturated so a
     /// slow downstream can't exhaust blocking threads / DB connections.
     pub(crate) limiter: Arc<Semaphore>,
+    /// Per-tenant fairness (Tier 5): caps concurrency per `X-Tenant-Id`. `None` when
+    /// disabled. Acquired *before* the global bulkhead so a noisy tenant fast-fails on its
+    /// own share (`429 TENANT_OVERLOADED`) while global capacity stays free for others.
+    pub(crate) tenant_limiter: Option<TenantLimiter>,
 }
 
 /// Pre-allocated `Box<RawValue>` for `{}` — used as default context.
@@ -59,6 +64,10 @@ pub(crate) struct ExecRequest {
     script: Option<String>,
     /// Registered-script key to execute (exactly one of `script` / `key`).
     key: Option<String>,
+    /// Tenant id for per-tenant fairness (Tier 5). The `X-Tenant-Id` header takes
+    /// precedence over this field; both are set by the trusted caller, not the script.
+    #[serde(default)]
+    tenant: Option<String>,
     /// Raw context passed straight to `QuickJS` — never deserialized in Rust.
     #[serde(default = "default_context")]
     context: Box<RawValue>,
@@ -148,6 +157,9 @@ struct Meta {
     /// Registered-script key, echoed back when the request executed by key.
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<String>,
+    /// Tenant id, echoed back when one was supplied (Tier 5 observability).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant: Option<String>,
     /// Size of the script in bytes.
     script_bytes: usize,
     /// Size of the context payload in bytes.
@@ -183,6 +195,7 @@ impl Meta {
         Self {
             trace_id,
             key: None,
+            tenant: None,
             script_bytes,
             context_bytes,
             total_input_bytes: script_bytes.saturating_add(context_bytes),
@@ -200,6 +213,12 @@ impl Meta {
     /// Attaches the registered-script key (echoed back on key-mode requests).
     fn with_key(mut self, key: Option<String>) -> Self {
         self.key = key;
+        self
+    }
+
+    /// Attaches the tenant id (echoed back when supplied).
+    fn with_tenant(mut self, tenant: Option<String>) -> Self {
+        self.tenant = tenant;
         self
     }
 
@@ -261,6 +280,7 @@ fn raw_null_ref() -> &'static RawValue {
 /// instead of axum short-circuiting with its default plain-text rejection.
 pub(crate) async fn execute(
     State(state): State<AppState>,
+    headers: HeaderMap,
     payload: Result<Json<ExecRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = match payload {
@@ -270,9 +290,12 @@ pub(crate) async fn execute(
     let ExecRequest {
         script,
         key,
+        tenant: body_tenant,
         context,
         config,
     } = req;
+    // Tenant id (Tier 5): `X-Tenant-Id` header wins over the body field; both are caller-set.
+    let tenant = header_tenant(&headers).or(body_tenant);
     let context_bytes = context.get().len();
 
     let engine_cfg = state.pool.engine_config().clone();
@@ -285,7 +308,9 @@ pub(crate) async fn execute(
         Ok(source) => source,
         Err(rejection) => {
             let (status, envelope) = *rejection;
-            let meta = Meta::new(trace_id, 0, context_bytes, 0).with_key(key);
+            let meta = Meta::new(trace_id, 0, context_bytes, 0)
+                .with_key(key)
+                .with_tenant(tenant);
             return system_error_response(envelope, status, meta);
         }
     };
@@ -298,7 +323,9 @@ pub(crate) async fn execute(
         engine_cfg.max_script_size,
         engine_cfg.max_context_size,
     ) {
-        let meta = Meta::new(trace_id, script_bytes, context_bytes, 0).with_key(key);
+        let meta = Meta::new(trace_id, script_bytes, context_bytes, 0)
+            .with_key(key)
+            .with_tenant(tenant);
         return system_error_response(request_error(code, message), 400, meta);
     }
 
@@ -319,13 +346,31 @@ pub(crate) async fn execute(
 
     let start = Instant::now();
 
-    // Tier 1 bulkhead: hold a permit for the whole blocking execution; fast-fail with
-    // `429 OVERLOADED` when saturated rather than piling onto exhausted threads /
-    // connections (see docs/design/resilience.md).
-    let permit = match Arc::clone(&state.limiter).try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_too_busy) => {
-            let meta = Meta::new(trace_id, script_bytes, context_bytes, 0).with_key(key);
+    // Acquire the per-tenant permit (Tier 5) then the global bulkhead permit (Tier 1),
+    // both held across the blocking span. A noisy tenant fast-fails on its own share.
+    let (tenant_permit, permit) = match acquire_permits(&state, tenant.as_deref()) {
+        Admission::Granted {
+            tenant_permit,
+            global,
+        } => (tenant_permit, global),
+        Admission::TenantBusy => {
+            let meta = base_error_meta(
+                &trace_id,
+                script_bytes,
+                context_bytes,
+                key.as_deref(),
+                tenant.as_deref(),
+            );
+            return tenant_overloaded_response(meta);
+        }
+        Admission::GlobalBusy => {
+            let meta = base_error_meta(
+                &trace_id,
+                script_bytes,
+                context_bytes,
+                key.as_deref(),
+                tenant.as_deref(),
+            );
             return overloaded_response(meta);
         }
     };
@@ -361,11 +406,14 @@ pub(crate) async fn execute(
     })
     .await;
 
-    // Execution finished — free the bulkhead permit for the next request.
+    // Execution finished — free the bulkhead + per-tenant permits for the next request.
     drop(permit);
+    drop(tenant_permit);
 
     let exec_time_us = start.elapsed().as_micros();
-    let base_meta = Meta::new(trace_id, script_bytes, context_bytes, exec_time_us).with_key(key);
+    let base_meta = Meta::new(trace_id, script_bytes, context_bytes, exec_time_us)
+        .with_key(key)
+        .with_tenant(tenant);
     build_response(result, base_meta, error_debug)
 }
 
@@ -489,6 +537,83 @@ fn overloaded_response(meta: Meta) -> AxumResponse {
     )
     .with_message("server at capacity, retry shortly".to_owned());
     system_error_response(envelope, 429, meta)
+}
+
+/// Builds the `429 TENANT_OVERLOADED` response (Tier 5): this tenant exceeded its
+/// concurrency share while global capacity may remain — the caller (that tenant) should
+/// back off, so it's owned by the caller, retryable.
+fn tenant_overloaded_response(meta: Meta) -> AxumResponse {
+    let envelope = ErrorEnvelope::new(
+        ErrorCategory::Runtime,
+        ErrorSource::Engine,
+        "TENANT_OVERLOADED".to_owned(),
+        true,
+        ErrorOwner::Caller,
+    )
+    .with_message("tenant concurrency limit reached, retry shortly".to_owned());
+    system_error_response(envelope, 429, meta)
+}
+
+/// Outcome of acquiring the per-tenant (Tier 5) + global bulkhead (Tier 1) permits.
+enum Admission {
+    /// Both granted — hold for the execution. `tenant_permit` is `None` when no tenant
+    /// was supplied or fairness is disabled.
+    Granted {
+        /// Per-tenant permit (Tier 5).
+        tenant_permit: Option<OwnedSemaphorePermit>,
+        /// Global bulkhead permit (Tier 1).
+        global: OwnedSemaphorePermit,
+    },
+    /// The tenant exceeded its per-tenant share (`429 TENANT_OVERLOADED`).
+    TenantBusy,
+    /// The global bulkhead is saturated (`429 OVERLOADED`).
+    GlobalBusy,
+}
+
+/// Acquires the per-tenant permit (if a tenant is supplied and fairness is on) then the
+/// global bulkhead permit. Per-tenant first, so a noisy tenant fast-fails on its own
+/// share before consuming a global slot.
+fn acquire_permits(state: &AppState, tenant: Option<&str>) -> Admission {
+    let tenant_permit = if let (Some(limiter), Some(id)) = (&state.tenant_limiter, tenant) {
+        let Some(permit) = limiter.try_acquire(id) else {
+            return Admission::TenantBusy;
+        };
+        Some(permit)
+    } else {
+        None
+    };
+    match Arc::clone(&state.limiter).try_acquire_owned() {
+        Ok(global) => Admission::Granted {
+            tenant_permit,
+            global,
+        },
+        Err(_too_busy) => Admission::GlobalBusy,
+    }
+}
+
+/// Builds a zero-timing `Meta` for an early error return, cloning the correlation fields
+/// (which the caller still needs on the continuing path).
+fn base_error_meta(
+    trace_id: &str,
+    script_bytes: usize,
+    context_bytes: usize,
+    key: Option<&str>,
+    tenant: Option<&str>,
+) -> Meta {
+    Meta::new(trace_id.to_owned(), script_bytes, context_bytes, 0)
+        .with_key(key.map(str::to_owned))
+        .with_tenant(tenant.map(str::to_owned))
+}
+
+/// Reads the tenant id from the `X-Tenant-Id` header (trimmed, non-empty). Takes
+/// precedence over the request body's `tenant` field.
+fn header_tenant(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-tenant-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
 }
 
 /// Builds a `request`-category envelope (the caller's fault, never retryable).

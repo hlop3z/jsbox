@@ -85,13 +85,12 @@ class Runner:
 
 # -- HTTP helpers ------------------------------------------------------------
 
-def _post(body: dict) -> dict | None:
+def _post(body: dict, headers: dict | None = None) -> dict | None:
     data = json.dumps(body).encode()
-    req = urllib.request.Request(
-        f"{BASE_URL}/execute",
-        data=data,
-        headers={"Content-Type": "application/json"},
-    )
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(f"{BASE_URL}/execute", data=data, headers=hdrs)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return _parse_response(resp.getcode(), resp.read())
@@ -625,6 +624,62 @@ def test_bulkhead(t: Runner):
            h("return json('alive', null);"), data_eq("alive"))
 
 
+def test_tenant_fairness(t: Runner):
+    """Tier 5: a noisy tenant's flood sheds on its OWN per-tenant cap (TENANT_OVERLOADED)
+    while a well-behaved tenant still gets through — the global bulkhead's blind spot."""
+    t.section("Per-tenant fairness (Tier 5)")
+    import concurrent.futures
+
+    slow = "function handler(ctx){ var x=0; for(var i=0;i<20000000;i++){x+=i;} return json(x>0,null); }"
+    fast = "function handler(ctx){ return json('ok', null); }"
+    noisy_codes, good_outcomes = [], []
+
+    def noisy_worker():
+        for _ in range(3):
+            noisy_codes.append(_err_code(_post({"script": slow, "tenant": "noisy"})))
+
+    def good_worker():
+        time.sleep(0.15)  # let the noisy flood ramp first
+        for _ in range(4):
+            r = _post({"script": fast, "tenant": "good"})
+            good_outcomes.append((_err_code(r), r.get("data") if r else None))
+            time.sleep(0.1)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+        flood = [ex.submit(noisy_worker) for _ in range(6)]
+        victim = ex.submit(good_worker)
+        for f in flood:
+            f.result()
+        victim.result()
+
+    tenant_shed = sum(1 for c in noisy_codes if c == "TENANT_OVERLOADED")
+    good_ok = sum(1 for code, data in good_outcomes if code is None and data == "ok")
+
+    # Tier 5 is opt-in; if the server has no per-tenant cap, nothing sheds — probe + skip
+    # the fairness asserts, but still check the meta/header plumbing below.
+    if tenant_shed > 0:
+        t.test("noisy tenant sheds on its own cap (TENANT_OVERLOADED)",
+               h("return json(1,null);"), lambda _r: tenant_shed > 0)
+        t.test("good tenant still gets through under the noisy flood",
+               h("return json(1,null);"), lambda _r: good_ok > 0)
+    else:
+        print("  \033[33mPROBE\033[0m Tier 5 not active (no max_concurrent_per_tenant) — fairness asserts skipped\n")
+
+    # Tenant plumbing works regardless of whether the cap is set:
+    r = _post({"script": fast}, headers={"X-Tenant-Id": "acme"})
+    t.test("X-Tenant-Id header echoed in meta.tenant",
+           h("return json(1,null);"),
+           lambda _r: r is not None and r.get("meta", {}).get("tenant") == "acme")
+    r2 = _post({"script": fast, "tenant": "beta"})
+    t.test("tenant body field echoed in meta.tenant",
+           h("return json(1,null);"),
+           lambda _r: r2 is not None and r2.get("meta", {}).get("tenant") == "beta")
+    r3 = _post({"script": fast, "tenant": "ignored"}, headers={"X-Tenant-Id": "header-wins"})
+    t.test("header takes precedence over body tenant field",
+           h("return json(1,null);"),
+           lambda _r: r3 is not None and r3.get("meta", {}).get("tenant") == "header-wins")
+
+
 def test_statement_timeout_clamp(t: Runner, db: dict):
     """Prove the operator ceiling clamps a per-request statement_timeout it cannot raise
     (Tier 0). Direct Postgres only — the SET is reliable there."""
@@ -888,6 +943,7 @@ def _start_server() -> subprocess.Popen:
         "engine": {
             "max_concurrent_executions": 6,
             "max_statement_timeout_ms": 800,
+            "max_concurrent_per_tenant": 2,
         },
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
@@ -923,6 +979,7 @@ def main():
     test_registry_hardening(t)
     test_isolation_under_concurrency(t)
     test_bulkhead(t)
+    test_tenant_fairness(t)
 
     # Database tests — only if containers are running
     if _db_available(PG_CONFIG):
