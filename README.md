@@ -55,14 +55,15 @@ POST /execute
 }
 ```
 
-| Field                  | Required | Description                                                             |
-| ---------------------- | -------- | ----------------------------------------------------------------------- |
-| `script`               | yes      | JS source defining a `handler(ctx)` function                            |
-| `context`              | no       | JSON object passed as `ctx` to the handler                              |
-| `config.allowed_hosts` | no       | Hosts the script can reach via `api.*` (`["*"]` = any, `[]` = disabled) |
-| `config.db`            | no       | PostgreSQL/CockroachDB connection (omit to disable `db.*`)              |
-| `config.mail`          | no       | SMTP relay connection (omit to disable `mail.*`)                        |
-| `config.s3`            | no       | S3/R2/MinIO connection for presigned URLs (omit to disable `s3.*`)      |
+| Field                  | Required | Description                                                              |
+| ---------------------- | -------- | ------------------------------------------------------------------------ |
+| `script`               | one of   | JS source defining a `handler(ctx)` function                             |
+| `key`                  | one of   | Registered-script key (see [Registered scripts](#registered-scripts))    |
+| `context`              | no       | JSON object passed as `ctx` to the handler                               |
+| `config.allowed_hosts` | no       | Hosts the script can reach via `api.*` (`["*"]` = any, `[]` = disabled)  |
+| `config.db`            | no       | PostgreSQL/CockroachDB connection (omit to disable `db.*`)               |
+| `config.mail`          | no       | SMTP relay connection (omit to disable `mail.*`)                         |
+| `config.s3`            | no       | S3/R2/MinIO connection for presigned URLs (omit to disable `s3.*`)       |
 | `config.auth`          | no       | OIDC/IAM issuer for `auth.*` token validation (omit to disable `auth.*`) |
 
 ### Response
@@ -90,6 +91,25 @@ bridge. On a **system-generated** failure, `error` is a structured envelope —
 `{ type, source, code, message, retryable, owner, details?, debug? }` — that a client can
 branch on without parsing strings; `meta.trace_id` correlates it with server logs. See
 [`docs/99-errors.md`](docs/99-errors.md) for the full contract.
+
+### Registered scripts
+
+Instead of sending source on every call, deploy scripts as files and execute them by
+key. Point `scripts_dir` (in `config.json`) at a directory; every `*.js` file under it
+is loaded **once at startup**, keyed by its relative path without the extension
+(`acme/billing/pricing.js` → `acme/billing/pricing`):
+
+```json
+{ "key": "acme/billing/pricing", "context": { "qty": 3, "price": 5 } }
+```
+
+A request must carry **exactly one** of `script` / `key` (400 `SCRIPT_XOR_KEY`
+otherwise); an unknown key is a 404 `SCRIPT_NOT_FOUND`. Both modes execute through the
+identical engine path — same sandbox, same fresh context per request, and `config`
+stays per-request either way. Key-mode responses echo the key back in `meta.key`. The
+registry is read-only at runtime: changing scripts means redeploying files (image
+layer, ConfigMap, mounted volume) and restarting — so N replicas stay trivially
+consistent. Design notes: [`docs/design/script-registry.md`](docs/design/script-registry.md).
 
 ## JS API
 
@@ -374,10 +394,10 @@ Key/value access against an operator-supplied Redis (`config.redis`, trusted lik
 ```js
 function handler(ctx) {
   redis.set("user:1", JSON.stringify({ id: 1 }), { ttl: 60 }); // ttl seconds, optional
-  var raw = redis.get("user:1");        // string | null (null if missing)
-  var n = redis.incr("visits");          // number (new value)
-  redis.expire("user:1", 120);           // bool (true if the key existed)
-  redis.del("user:1");                   // number (keys removed)
+  var raw = redis.get("user:1"); // string | null (null if missing)
+  var n = redis.incr("visits"); // number (new value)
+  redis.expire("user:1", 120); // bool (true if the key existed)
+  redis.del("user:1"); // number (keys removed)
   return json({ user: JSON.parse(raw), visits: n }, null);
 }
 ```
@@ -400,15 +420,14 @@ function handler(ctx) {
   var published = amq.send([
     ["user.created", { id: 1 }],
     ["user.created", { id: 2 }],
-  ]);                                     // → 2
+  ]); // → 2
   return json({ published: published }, null);
 }
 ```
 
 The message **body is the JSON of each `payload`**; `routingKey` is the queue name for the
 default exchange (override with `config.amq.exchange`). The **whole batch is one op**
-against `max_ops` (a batch ≈ one round trip); a batch over `config.amq.max_batch` (default
-100) is rejected with `AMQ_BATCH_TOO_LARGE`. A broker outage → retryable
+against `max_ops` (a batch ≈ one round trip); a batch over `config.amq.max_batch` (default 100) is rejected with `AMQ_BATCH_TOO_LARGE`. A broker outage → retryable
 `capability/amq/AMQ_CONNECTION` (HTTP 200).
 
 Config: `{ "amq": { "host": "...", "port": 5672, "username": "guest", "password": "guest",
@@ -472,7 +491,7 @@ function handler(ctx) {
 }
 ```
 
-**Hybrid error surface:** an invalid/expired/under-scoped token is the *caller's* business
+**Hybrid error surface:** an invalid/expired/under-scoped token is the _caller's_ business
 flow, so it returns **in-band** (`{ ok:false, status, code:"AUTH_INVALID_TOKEN" }`, never
 thrown — like `api`). Infra failures the handler can't act on (issuer down → retryable
 `AUTH_UNAVAILABLE`; misconfig → `AUTH_REQUEST`) **throw** a tagged capability error (like
@@ -503,25 +522,27 @@ Optional `config.json` in the working directory. All fields have defaults:
     "max_script_size": "1mb",
     "max_context_size": 0,
     "max_ops": 1500
-  }
+  },
+  "scripts_dir": "scripts"
 }
 ```
 
 | Field              | Default    | Description                                                                                                                            |
 | ------------------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------- |
 | `debug`            | `false`    | **Dev only.** Relaxes the SSRF private-IP block for `s3`/`api` so localhost/LAN targets (e.g. MinIO) work. Never enable in production. |
-| `error_debug`      | `true`     | Include `error.debug` (stack traces) in system-error responses. Set `false` at an exposed edge to omit them.                          |
+| `error_debug`      | `true`     | Include `error.debug` (stack traces) in system-error responses. Set `false` at an exposed edge to omit them.                           |
 | `memory_limit`     | `"32mb"`   | Max JS heap per execution                                                                                                              |
 | `max_stack_size`   | `"512kb"`  | Max native call stack (recursion depth)                                                                                                |
 | `timeout_ms`       | `4000`     | Max wall-clock execution time                                                                                                          |
 | `pool_size`        | `0` (auto) | QuickJS runtime pool size (0 = CPU cores)                                                                                              |
 | `max_script_size`  | `"1mb"`    | Max script source size                                                                                                                 |
-| `max_context_size` | `0` (auto) | Max context JSON size. `0` auto-derives `memory_limit / 8`; explicit values are capped at `memory_limit / 4` (boot fails if exceeded).                                                                                                                  |
+| `max_context_size` | `0` (auto) | Max context JSON size. `0` auto-derives `memory_limit / 8`; explicit values are capped at `memory_limit / 4` (boot fails if exceeded). |
 | `max_ops`          | `1500`     | Max HTTP + DB operations per execution                                                                                                 |
+| `scripts_dir`      | _(unset)_  | Directory of registered scripts for execute-by-key. Unset = inline `script` only; `key` requests answer `SCRIPT_NOT_FOUND`.            |
 
 Size fields accept `"8mb"`, `"256kb"`, `"1gb"`, or plain numbers in bytes.
 
-**Context vs. memory.** Parsing a JSON context into JS objects costs ~4× its text size in heap, and a typical transform needs ~6×. So `max_context_size` is tied to `memory_limit`: leave it `0` and it auto-derives `memory_limit / 8` (room to parse *and* process the input), while any explicit value is hard-capped at `memory_limit / 4` — the point past which a context can't even be parsed. Change `memory_limit` and the context limit follows; to handle larger contexts, raise `memory_limit` rather than lifting the context cap alone.
+**Context vs. memory.** Parsing a JSON context into JS objects costs ~4× its text size in heap, and a typical transform needs ~6×. So `max_context_size` is tied to `memory_limit`: leave it `0` and it auto-derives `memory_limit / 8` (room to parse _and_ process the input), while any explicit value is hard-capped at `memory_limit / 4` — the point past which a context can't even be parsed. Change `memory_limit` and the context limit follows; to handle larger contexts, raise `memory_limit` rather than lifting the context cap alone.
 
 ## Sandbox
 
@@ -539,10 +560,10 @@ Every execution runs in an isolated QuickJS context with:
 ## Testing
 
 ```sh
-# Start databases (PostgreSQL + CockroachDB)
+# Start backing services (PostgreSQL, PgBouncer, CockroachDB, local httpbin, …)
 docker compose up -d
 
-# Run all 87 tests
+# Run the test suite (starts the server itself if one isn't running)
 python test_simple.py
 
 # Stop databases

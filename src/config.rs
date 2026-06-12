@@ -9,7 +9,7 @@
 use std::error::Error;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -44,6 +44,11 @@ pub(crate) struct Config {
     pub(crate) server: ServerConfig,
     /// JS engine sandbox limits.
     pub(crate) engine: EngineConfig,
+    /// Directory of registered scripts (`*.js`), loaded once at startup; a script's
+    /// key is its relative path without the extension (`acme/billing/pricing.js` →
+    /// `acme/billing/pricing`). Omit to disable execute-by-key (`key` requests then
+    /// fail with `SCRIPT_NOT_FOUND`).
+    pub(crate) scripts_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -53,6 +58,7 @@ impl Default for Config {
             error_debug: true,
             server: ServerConfig::default(),
             engine: EngineConfig::default(),
+            scripts_dir: None,
         }
     }
 }

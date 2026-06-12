@@ -85,7 +85,10 @@ function handler(ctx) {
     amq.send([["jobs", { task: "resize", file: ctx.file }]]);
     return json({ queued: true }, null);
   } catch (e) {
-    return json(null, { message: "could not queue the job", detail: e.message });
+    return json(null, {
+      message: "could not queue the job",
+      detail: e.message,
+    });
   }
 }
 ```

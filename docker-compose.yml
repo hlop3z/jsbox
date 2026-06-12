@@ -13,6 +13,48 @@ services:
       timeout: 5s
       retries: 10
 
+  # PgBouncer in transaction-pooling mode in front of `postgres` — the adopted answer
+  # to per-execution connection churn (see docs/design/pooled-capabilities.md). jsbox
+  # needs no code changes: point `config.db` at host port 6432 instead of 5432. The
+  # integration suite runs the full db section through it to prove the per-request
+  # connect model works unchanged behind a transaction-mode pooler.
+  # AUTH_TYPE scram-sha-256 keeps the userlist password in a form that can answer the
+  # SCRAM challenge both ways (client → pgbouncer, pgbouncer → postgres 17).
+  # MAX_PREPARED_STATEMENTS > 0 lets the Rust driver's named prepared statements work
+  # across pooled server connections (PgBouncer ≥ 1.21 tracks them protocol-level).
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: test
+      DB_PASSWORD: test
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: transaction
+      MAX_PREPARED_STATEMENTS: "200"
+      MAX_CLIENT_CONN: "200"
+      DEFAULT_POOL_SIZE: "10"
+    ports:
+      - "6432:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 5432"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # Local httpbin clone for the HTTP `api` tests — keeps the suite hermetic instead of
+  # depending on httpbin.org uptime. Note go-httpbin echoes headers/args as ARRAYS of
+  # strings (the tests index [0]), and the server must run with `debug: true` to reach
+  # a localhost/LAN target (SSRF private-IP block) — the harness-generated test config
+  # sets it. In-network URL: http://httpbin:8080, host: http://localhost:8095.
+  httpbin:
+    image: mccutchen/go-httpbin
+    ports:
+      - "8095:8080"
+
   redis:
     image: redis:7-alpine
     ports:

@@ -9,8 +9,27 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from urllib.parse import urlparse
 
-BASE_URL = "http://127.0.0.1:3000"
+BASE_URL = os.environ.get("JSBOX_URL", "http://127.0.0.1:3000")
+
+# -- Database endpoints (override via env when the server runs in-network/CI) ---------
+# Defaults match `docker compose up` on the host. PGBOUNCER is the transaction-mode
+# pooler in front of postgres (see docs/design/pooled-capabilities.md).
+PG_HOST = os.environ.get("PG_HOST", "localhost")
+PG_PORT = int(os.environ.get("PG_PORT", "5432"))
+PGBOUNCER_HOST = os.environ.get("PGBOUNCER_HOST", "localhost")
+PGBOUNCER_PORT = int(os.environ.get("PGBOUNCER_PORT", "6432"))
+CR_HOST = os.environ.get("CR_HOST", "localhost")
+CR_PORT = int(os.environ.get("CR_PORT", "26257"))
+
+# Local httpbin clone (`httpbin` service in docker-compose) — the HTTP `api` tests run
+# against it so the suite never depends on httpbin.org uptime. go-httpbin echoes
+# headers/args as ARRAYS of strings, hence the [0] indexing in assertions. Reaching a
+# localhost/LAN target needs the server started with `debug: true` (SSRF private-IP
+# block) — the harness-generated config sets it.
+HTTPBIN_URL = os.environ.get("HTTPBIN_URL", "http://localhost:8095").rstrip("/")
+HTTPBIN_HOST = urlparse(HTTPBIN_URL).hostname or "localhost"
 
 # -- Identity providers for the `auth` capability (override via env for CI/in-network) --
 # Defaults match `docker compose up` on the host (Keycloak :8081, ZITADEL :8082).
@@ -188,8 +207,9 @@ def test_meta(t: Runner):
 def test_http_api(t: Runner):
     t.section("HTTP api")
     wildcard = {"allowed_hosts": ["*"]}
-    httpbin  = {"allowed_hosts": ["httpbin.org"]}
+    httpbin  = {"allowed_hosts": [HTTPBIN_HOST]}
     blocked  = {"allowed_hosts": ["example.com"]}
+    url = HTTPBIN_URL
 
     t.test("disabled when no config",
            h("return json(typeof api, null);"),
@@ -198,40 +218,41 @@ def test_http_api(t: Runner):
            h("return json(typeof api, null);", config=wildcard),
            data_eq("object"))
     t.test("get with wildcard",
-           h("var r = api.get('https://httpbin.org/get', {foo:'bar'}); return json({status:r.status, ok:r.data!==null}, null);", config=wildcard),
+           h(f"var r = api.get('{url}/get', {{foo:'bar'}}); return json({{status:r.status, ok:r.data!==null}}, null);", config=wildcard),
            lambda r: r["data"]["status"] == 200 and r["data"]["ok"] is True)
     t.test("get with specific host",
-           h("var r = api.get('https://httpbin.org/get'); return json(r.status, null);", config=httpbin),
+           h(f"var r = api.get('{url}/get'); return json(r.status, null);", config=httpbin),
            data_eq(200))
     t.test("get blocked by host",
-           h("var r = api.get('https://httpbin.org/get'); return json(r, null);", config=blocked),
+           h(f"var r = api.get('{url}/get'); return json(r, null);", config=blocked),
            lambda r: r["data"]["status"] == 0)
     t.test("post with body",
-           h('var r = api.post("https://httpbin.org/post", {hello:"world"}); return json(r.status, null);', config=httpbin),
+           h(f'var r = api.post("{url}/post", {{hello:"world"}}); return json(r.status, null);', config=httpbin),
            data_eq(200))
     t.test("delete works",
-           h("var r = api.delete('https://httpbin.org/delete'); return json(r.status, null);", config=httpbin),
+           h(f"var r = api.delete('{url}/delete'); return json(r.status, null);", config=httpbin),
            data_eq(200))
 
-    # Headers
+    # Headers (go-httpbin echoes header values as arrays of strings)
     t.test("get with auth header",
-           h("var r = api.get('https://httpbin.org/get', null, {'Authorization': 'Bearer test123'}); return json(r.data.headers.Authorization, null);", config=httpbin),
+           h(f"var r = api.get('{url}/get', null, {{'Authorization': 'Bearer test123'}}); return json(r.data.headers.Authorization[0], null);", config=httpbin),
            data_eq("Bearer test123"))
     t.test("post with custom header",
-           h('var r = api.post("https://httpbin.org/post", {a:1}, {"X-Custom": "foo"}); return json(r.data.headers["X-Custom"], null);', config=httpbin),
+           h(f'var r = api.post("{url}/post", {{a:1}}, {{"X-Custom": "foo"}}); return json(r.data.headers["X-Custom"][0], null);', config=httpbin),
            data_eq("foo"))
     t.test("content-type cannot be overridden",
-           h('var r = api.post("https://httpbin.org/post", {a:1}, {"Content-Type": "text/plain"}); return json(r.data.headers["Content-Type"], null);', config=httpbin),
+           h(f'var r = api.post("{url}/post", {{a:1}}, {{"Content-Type": "text/plain"}}); return json(r.data.headers["Content-Type"][0], null);', config=httpbin),
            data_eq("application/json"))
     t.test("delete with header",
-           h("var r = api.delete('https://httpbin.org/delete', {'X-Req-Id': '42'}); return json(r.data.headers['X-Req-Id'], null);", config=httpbin),
+           h(f"var r = api.delete('{url}/delete', {{'X-Req-Id': '42'}}); return json(r.data.headers['X-Req-Id'][0], null);", config=httpbin),
            data_eq("42"))
 
 
 # -- Database tests ----------------------------------------------------------
 
-PG_CONFIG = {"host": "localhost", "port": 5432, "user": "test", "password": "test", "database": "testdb"}
-CR_CONFIG = {"host": "localhost", "port": 26257, "user": "root", "password": "", "database": "testdb"}
+PG_CONFIG = {"host": PG_HOST, "port": PG_PORT, "user": "test", "password": "test", "database": "testdb"}
+PGB_CONFIG = {"host": PGBOUNCER_HOST, "port": PGBOUNCER_PORT, "user": "test", "password": "test", "database": "testdb"}
+CR_CONFIG = {"host": CR_HOST, "port": CR_PORT, "user": "root", "password": "", "database": "testdb"}
 
 SETUP_SQL = """
     DROP TABLE IF EXISTS test_types;
@@ -410,6 +431,46 @@ def test_db_engine(t: Runner, label: str, db: dict):
     _post(h("db.execute('DROP TABLE IF EXISTS test_types'); db.execute('DROP TABLE IF EXISTS test_txn'); return json('ok', null);", config={"db": db}))
 
 
+# -- Script registry (execute by key) ----------------------------------------
+
+def test_registry(t: Runner):
+    """Exercise `key` mode: XOR validation always; execution if the registry is loaded."""
+    t.section("Script registry (execute by key)")
+
+    # Request-shape validation works regardless of how the server was started.
+    t.test("script+key rejected (400 SCRIPT_XOR_KEY)",
+           {"script": "function handler(ctx) { return json(1, null); }", "key": "greet"},
+           lambda r: r["error"]["code"] == "SCRIPT_XOR_KEY")
+    t.test("neither script nor key rejected",
+           {"context": {"a": 1}},
+           lambda r: r["error"]["code"] == "SCRIPT_XOR_KEY")
+    t.test("unknown key -> SCRIPT_NOT_FOUND",
+           {"key": "no/such/script"},
+           lambda r: r["error"]["code"] == "SCRIPT_NOT_FOUND")
+
+    # Key-mode execution needs the server started with scripts_dir=tests/scripts
+    # (the harness-started server is; an externally started one may not be).
+    probe = _post({"key": "greet"})
+    if probe is not None and probe.get("data") == "hello world":
+        t.test("execute by key",
+               {"key": "greet", "context": {"name": "Alice"}},
+               data_eq("hello Alice"))
+        t.test("nested key",
+               {"key": "acme/billing/pricing", "context": {"qty": 3, "price": 5}},
+               lambda r: r["data"]["total"] == 15)
+        t.test("key-mode config still per-request (db disabled)",
+               {"key": "greet"},
+               lambda r: r["error"] is None)
+        t.test("meta echoes key + resolved script_bytes",
+               {"key": "greet"},
+               lambda r: r["meta"]["key"] == "greet" and r["meta"]["script_bytes"] > 0)
+        t.test("inline requests carry no meta.key",
+               h("return json(1, null);"),
+               lambda r: "key" not in r["meta"])
+    else:
+        print("\n  \033[33mSKIP\033[0m registry execution tests (server not started with scripts_dir=tests/scripts)\n")
+
+
 # -- Auth (OIDC/IAM) tests ---------------------------------------------------
 
 def _provider_req(url: str, method: str = "GET", form=None, payload=None, headers=None):
@@ -580,12 +641,35 @@ def _wait_for_server() -> bool:
     return False
 
 
+def _start_server() -> subprocess.Popen:
+    """Start `cargo run` from .test-run/ with a config that loads tests/scripts.
+
+    The server reads `config.json` from its cwd, so the harness generates one in a
+    scratch dir (gitignored) — this turns on the script registry for the run without
+    committing a config.json that would change `task run` behavior.
+    """
+    repo = os.path.dirname(os.path.abspath(__file__))
+    run_dir = os.path.join(repo, ".test-run")
+    os.makedirs(run_dir, exist_ok=True)
+    # debug=true relaxes the SSRF private-IP block so the `api` tests can reach the
+    # local `httpbin` compose service (its documented local-testing purpose).
+    config = {
+        "debug": True,
+        "scripts_dir": os.path.join(repo, "tests", "scripts"),
+    }
+    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
+        json.dump(config, fh)
+    # cargo walks up from cwd to find the workspace Cargo.toml.
+    return subprocess.Popen(["cargo", "run"], cwd=run_dir,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def main():
     server_proc = None
 
     if not _wait_for_server():
         print("Starting server...")
-        server_proc = subprocess.Popen(["cargo", "run"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        server_proc = _start_server()
         time.sleep(4)
         if not _wait_for_server():
             print("ERROR: Server failed to start")
@@ -602,11 +686,20 @@ def main():
     test_meta(t)
     test_http_api(t)
 
+    test_registry(t)
+
     # Database tests — only if containers are running
     if _db_available(PG_CONFIG):
         test_db_engine(t, "PostgreSQL", PG_CONFIG)
     else:
         print("\n  \033[33mSKIP\033[0m PostgreSQL tests (not running — use: docker compose up -d)\n")
+
+    # Same db suite through PgBouncer (transaction pooling) — proves the per-request
+    # connect model works unchanged behind a pooler (docs/design/pooled-capabilities.md).
+    if _db_available(PGB_CONFIG):
+        test_db_engine(t, "PgBouncer", PGB_CONFIG)
+    else:
+        print("\n  \033[33mSKIP\033[0m PgBouncer tests (not running — use: docker compose up -d pgbouncer)\n")
 
     if _db_available(CR_CONFIG):
         test_db_engine(t, "CockroachDB", CR_CONFIG)

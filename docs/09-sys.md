@@ -71,12 +71,12 @@ $sys.crypto.hex.encode("AB"); // "4142"
 $sys.crypto.url.encode("a b&c"); // "a%20b%26c"  (safe to drop in a URL)
 ```
 
-| Encoder            | For…                              |
-| ------------------ | --------------------------------- |
-| `base64`           | general "make it text" packing    |
-| `base64url`        | IDs/tokens that go **in a URL**   |
-| `hex`              | fingerprints, byte-ish values     |
-| `url`              | escaping a value for a URL/query  |
+| Encoder     | For…                             |
+| ----------- | -------------------------------- |
+| `base64`    | general "make it text" packing   |
+| `base64url` | IDs/tokens that go **in a URL**  |
+| `hex`       | fingerprints, byte-ish values    |
+| `url`       | escaping a value for a URL/query |
 
 ---
 

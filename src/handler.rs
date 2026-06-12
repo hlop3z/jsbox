@@ -1,6 +1,6 @@
 //! HTTP handler for the `/execute` endpoint.
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use axum::extract::State;
@@ -22,9 +22,19 @@ use crate::http::HttpMetric;
 use crate::kv::{RedisConfig, RedisMetric};
 use crate::mail::{MailConfig, MailMetric};
 use crate::pool::JsPool;
+use crate::registry::ScriptRegistry;
 use crate::s3::{S3Config, S3Metric};
 use crate::sandbox;
 use crate::sys::SysConfig;
+
+/// Shared application state for the router: the runtime pool + the script registry.
+#[derive(Debug, Clone)]
+pub(crate) struct AppState {
+    /// Pool of pre-warmed `QuickJS` runtimes.
+    pub(crate) pool: JsPool,
+    /// Read-only registry of scripts loaded at startup (execute-by-key).
+    pub(crate) registry: Arc<ScriptRegistry>,
+}
 
 /// Pre-allocated `Box<RawValue>` for `{}` — used as default context.
 static DEFAULT_CONTEXT: LazyLock<Box<RawValue>> =
@@ -37,14 +47,35 @@ static RAW_NULL: LazyLock<Box<RawValue>> =
 /// Request body for script execution.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ExecRequest {
-    /// The JavaScript source code to evaluate.
-    script: String,
+    /// Inline JavaScript source to evaluate (exactly one of `script` / `key`).
+    script: Option<String>,
+    /// Registered-script key to execute (exactly one of `script` / `key`).
+    key: Option<String>,
     /// Raw context passed straight to `QuickJS` — never deserialized in Rust.
     #[serde(default = "default_context")]
     context: Box<RawValue>,
     /// Per-request configuration.
     #[serde(default)]
     config: RequestConfig,
+}
+
+/// Resolved script source — inline from the request body or shared from the registry.
+#[derive(Debug)]
+enum ScriptSource {
+    /// Inline `script` field.
+    Inline(String),
+    /// Registered script resolved from `key`.
+    Registered(Arc<str>),
+}
+
+impl ScriptSource {
+    /// The script text.
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Inline(source) => source.as_str(),
+            Self::Registered(source) => source.as_ref(),
+        }
+    }
 }
 
 /// Per-request configuration sent by the caller.
@@ -106,6 +137,9 @@ struct Meta {
     /// Correlation ID — also logged server-side with the raw cause, so support can grep
     /// one ID across the mesh. Present on every response (success and error).
     trace_id: String,
+    /// Registered-script key, echoed back when the request executed by key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
     /// Size of the script in bytes.
     script_bytes: usize,
     /// Size of the context payload in bytes.
@@ -135,6 +169,7 @@ impl Meta {
     const fn new(trace_id: String, script_bytes: usize, context_bytes: usize, exec_time_us: u128) -> Self {
         Self {
             trace_id,
+            key: None,
             script_bytes,
             context_bytes,
             total_input_bytes: script_bytes.saturating_add(context_bytes),
@@ -147,6 +182,12 @@ impl Meta {
             amq_requests: Vec::new(),
             auth_requests: Vec::new(),
         }
+    }
+
+    /// Attaches the registered-script key (echoed back on key-mode requests).
+    fn with_key(mut self, key: Option<String>) -> Self {
+        self.key = key;
+        self
     }
 
     /// Attaches HTTP, DB, mail, S3, Redis, and `RabbitMQ` metrics to this metadata.
@@ -202,51 +243,55 @@ fn raw_null_ref() -> &'static RawValue {
 
 /// Executes a JS `handler(context)` and returns `{data, error, meta}` JSON.
 pub(crate) async fn execute(
-    State(js_pool): State<JsPool>,
+    State(state): State<AppState>,
     Json(req): Json<ExecRequest>,
 ) -> impl IntoResponse {
-    let script_bytes = req.script.len();
-    let context_bytes = req.context.get().len();
+    let ExecRequest { script, key, context, config } = req;
+    let context_bytes = context.get().len();
 
-    let engine_cfg = js_pool.engine_config().clone();
-    let error_debug = js_pool.error_debug();
+    let engine_cfg = state.pool.engine_config().clone();
+    let error_debug = state.pool.error_debug();
+    let allow_private_targets = state.pool.debug();
     let trace_id = Uuid::new_v4().to_string();
+
+    // Resolve exactly one of `script` / `key` into the source to execute.
+    let source = match resolve_script(script, key.as_deref(), &state.registry) {
+        Ok(source) => source,
+        Err(rejection) => {
+            let (status, envelope) = *rejection;
+            let meta = Meta::new(trace_id, 0, context_bytes, 0).with_key(key);
+            return system_error_response(envelope, status, meta);
+        }
+    };
+    let script_bytes = source.as_str().len();
 
     // Early validation — reject oversized inputs before spawning a task.
     if let Err((code, message)) = sandbox::validate_input_sizes(
         script_bytes, context_bytes,
         engine_cfg.max_script_size, engine_cfg.max_context_size,
     ) {
-        let envelope = ErrorEnvelope::new(
-            ErrorCategory::Request,
-            ErrorSource::Request,
-            code.to_owned(),
-            false,
-            ErrorOwner::Caller,
-        )
-        .with_message(message);
-        return system_error_response(envelope, 400, Meta::new(trace_id, script_bytes, context_bytes, 0));
+        let meta = Meta::new(trace_id, script_bytes, context_bytes, 0).with_key(key);
+        return system_error_response(request_error(code, message), 400, meta);
     }
 
-    let script = req.script;
-    let context_json: String = req.context.get().into();
-    let allowed_hosts = req.config.allowed_hosts;
-    let db_config = req.config.db;
-    let mail_config = req.config.mail;
-    let s3_config = req.config.s3;
-    let redis_config = req.config.redis;
-    let amq_config = req.config.amq;
-    let auth_config = req.config.auth;
-    let sys_config = req.config.sys;
+    let context_json: String = context.get().into();
+    let allowed_hosts = config.allowed_hosts;
+    let db_config = config.db;
+    let mail_config = config.mail;
+    let s3_config = config.s3;
+    let redis_config = config.redis;
+    let amq_config = config.amq;
+    let auth_config = config.auth;
+    let sys_config = config.sys;
 
     let start = Instant::now();
-    let allow_private_targets = js_pool.debug();
+    let js_pool = state.pool;
 
     let result = task::spawn_blocking(move || -> Result<ExecResult, EngineError> {
         let runtime = js_pool.acquire().map_err(|err| EngineError::Internal(err.to_string()))?;
         let res = engine::run(&ExecParams {
             runtime: &runtime,
-            script: &script,
+            script: source.as_str(),
             context_json: &context_json,
             timeout: engine_cfg.timeout(),
             allowed_hosts: &allowed_hosts,
@@ -266,7 +311,8 @@ pub(crate) async fn execute(
     .await;
 
     let exec_time_us = start.elapsed().as_micros();
-    let base_meta = || Meta::new(trace_id.clone(), script_bytes, context_bytes, exec_time_us);
+    let base_meta =
+        || Meta::new(trace_id.clone(), script_bytes, context_bytes, exec_time_us).with_key(key.clone());
 
     match result {
         Ok(Ok(exec)) => {
@@ -296,6 +342,54 @@ pub(crate) async fn execute(
             error_debug,
         ),
     }
+}
+
+/// Resolves the script source for a request: exactly one of `script` / `key` must be
+/// present; a `key` is looked up in the registry.
+///
+/// # Errors
+///
+/// Returns the HTTP status + envelope for the violation (boxed — the happy path
+/// shouldn't carry the envelope's size): 400 `SCRIPT_XOR_KEY` when not exactly one of
+/// the two is present, 404 `SCRIPT_NOT_FOUND` for an unknown key.
+fn resolve_script(
+    script: Option<String>,
+    key: Option<&str>,
+    registry: &ScriptRegistry,
+) -> Result<ScriptSource, Box<(u16, ErrorEnvelope)>> {
+    match (script, key) {
+        (Some(source), None) => Ok(ScriptSource::Inline(source)),
+        (None, Some(requested)) => {
+            registry.get(requested).map(ScriptSource::Registered).ok_or_else(|| {
+                Box::new((
+                    404,
+                    request_error(
+                        "SCRIPT_NOT_FOUND",
+                        format!("no registered script for key `{requested}`"),
+                    ),
+                ))
+            })
+        }
+        (Some(_), Some(_)) | (None, None) => Err(Box::new((
+            400,
+            request_error(
+                "SCRIPT_XOR_KEY",
+                "request must include exactly one of `script` or `key`".to_owned(),
+            ),
+        ))),
+    }
+}
+
+/// Builds a `request`-category envelope (the caller's fault, never retryable).
+fn request_error(code: &str, message: String) -> ErrorEnvelope {
+    ErrorEnvelope::new(
+        ErrorCategory::Request,
+        ErrorSource::Request,
+        code.to_owned(),
+        false,
+        ErrorOwner::Caller,
+    )
+    .with_message(message)
 }
 
 /// Builds the success response, or a `MALFORMED_RESPONSE` error if the JS envelope

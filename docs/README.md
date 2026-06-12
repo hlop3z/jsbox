@@ -43,16 +43,16 @@ Read these in order. Each one is short.
 Your robot starts with **no** super-powers. You turn each one on by adding a
 little `config` to your message. That keeps things safe.
 
-| Super-power | What it does           | Turn it on with        |
-| ----------- | ---------------------- | ---------------------- |
-| `api`       | Talk to other websites | `config.allowed_hosts` |
-| `db`        | Talk to a database     | `config.db`            |
-| `mail`      | Send email             | `config.mail`          |
-| `s3`        | Signed upload links    | `config.s3`            |
-| `redis`     | A super-fast notebook  | `config.redis`         |
-| `amq`       | Send messages to a queue | `config.amq`         |
-| `auth`      | Check a login token    | `config.auth`          |
-| `$sys.env` / `.secrets` | Settings + use-only secrets | `config.sys` |
+| Super-power             | What it does                | Turn it on with        |
+| ----------------------- | --------------------------- | ---------------------- |
+| `api`                   | Talk to other websites      | `config.allowed_hosts` |
+| `db`                    | Talk to a database          | `config.db`            |
+| `mail`                  | Send email                  | `config.mail`          |
+| `s3`                    | Signed upload links         | `config.s3`            |
+| `redis`                 | A super-fast notebook       | `config.redis`         |
+| `amq`                   | Send messages to a queue    | `config.amq`           |
+| `auth`                  | Check a login token         | `config.auth`          |
+| `$sys.env` / `.secrets` | Settings + use-only secrets | `config.sys`           |
 
 (`$` — exact decimal math — and **`$sys.crypto` / `$sys.date`** are the exceptions:
 they're **always on**, no config. Only `$sys.env` / `$sys.secrets` need `config.sys`.)

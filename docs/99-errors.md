@@ -41,25 +41,25 @@ So `error` is `null` when all is well, **your shape** when you set it, or the ro
 You never have to read the message text to know what happened — every field is there
 so a **program** can decide what to do:
 
-| Field       | What it tells you                                                                  |
-| ----------- | ---------------------------------------------------------------------------------- |
-| `type`      | the big bucket: `request`, `runtime`, `script`, or `capability` (see below)        |
+| Field       | What it tells you                                                                              |
+| ----------- | ---------------------------------------------------------------------------------------------- |
+| `type`      | the big bucket: `request`, `runtime`, `script`, or `capability` (see below)                    |
 | `source`    | who it came from: `engine`, `handler`, or a tool (`db`/`mail`/`s3`/`api`/`redis`/`amq`/`auth`) |
-| `code`      | a stable label you can switch on, like `DB_CONSTRAINT`. Never changes meaning.     |
-| `message`   | a short, safe sentence for humans. (Secrets/PII never go here.)                    |
-| `retryable` | `true` = trying again might help; `false` = it won't, don't bother                  |
-| `owner`     | **who should fix it**: `caller`, `developer`, or `operator`                        |
-| `details`   | extra machine-readable bits, like `{ "sqlstate": "23505" }`                        |
-| `debug`     | the nerdy stuff (stack trace + raw text) — only when turned on (see the bottom)    |
+| `code`      | a stable label you can switch on, like `DB_CONSTRAINT`. Never changes meaning.                 |
+| `message`   | a short, safe sentence for humans. (Secrets/PII never go here.)                                |
+| `retryable` | `true` = trying again might help; `false` = it won't, don't bother                             |
+| `owner`     | **who should fix it**: `caller`, `developer`, or `operator`                                    |
+| `details`   | extra machine-readable bits, like `{ "sqlstate": "23505" }`                                    |
+| `debug`     | the nerdy stuff (stack trace + raw text) — only when turned on (see the bottom)                |
 
 ## The four buckets (`type`) 🪣
 
-| `type`       | Means                                                                        | What you do                                          |
-| ------------ | ---------------------------------------------------------------------------- | ---------------------------------------------------- |
-| `request`    | the **message** you sent was bad (too big)                                   | fix the request                                      |
-| `runtime`    | the **engine** couldn't run your script (typo, ran too long, no `handler`)   | fix the script                                       |
-| `script`     | your code **threw** an error (`throw`, or a bug like a `TypeError`)          | fix the script; `message` is your error's own text   |
-| `capability` | a **tool** failed (database down, email bounced)                            | if `retryable`, try again; otherwise look closer     |
+| `type`       | Means                                                                      | What you do                                        |
+| ------------ | -------------------------------------------------------------------------- | -------------------------------------------------- |
+| `request`    | the **message** you sent was bad (too big)                                 | fix the request                                    |
+| `runtime`    | the **engine** couldn't run your script (typo, ran too long, no `handler`) | fix the script                                     |
+| `script`     | your code **threw** an error (`throw`, or a bug like a `TypeError`)        | fix the script; `message` is your error's own text |
+| `capability` | a **tool** failed (database down, email bounced)                           | if `retryable`, try again; otherwise look closer   |
 
 ## Who should fix it? (`owner`) 🧑‍🔧
 
@@ -75,12 +75,13 @@ So a dead database pages the ops team, but your `TypeError` doesn't. 🙂
 
 The HTTP status is a quick signal for gateways and load balancers:
 
-| You get | Means                                                                          |
-| ------- | ------------------------------------------------------------------------------ |
+| You get | Means                                                                            |
+| ------- | -------------------------------------------------------------------------------- |
 | **200** | the robot ran fine; if there's an `error` it's an app/tool issue (read the body) |
-| **400** | your request was bad (`request` type)                                          |
-| **422** | your script can't be processed (typo, timeout, no `handler`)                   |
-| **500** | the robot itself broke (rare!) — safe to retry, someone should look            |
+| **400** | your request was bad (`request` type)                                            |
+| **404** | the `key` you asked for isn't registered (`SCRIPT_NOT_FOUND`)                    |
+| **422** | your script can't be processed (typo, timeout, no `handler`)                     |
+| **500** | the robot itself broke (rare!) — safe to retry, someone should look              |
 
 The rule: **5xx means "infrastructure, react!"** Everything else is explained in the
 body, so a gateway never retries things it shouldn't.
@@ -117,99 +118,101 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 
 ### Your request (`type: "request"`)
 
-| `code`              | retry | owner    | When                              |
-| ------------------- | ----- | -------- | --------------------------------- |
-| `SCRIPT_TOO_LARGE`  | no    | caller   | Script bigger than `max_script_size`.  |
-| `CONTEXT_TOO_LARGE` | no    | caller   | Context bigger than `max_context_size`. |
+| `code`              | retry | owner  | When                                                                |
+| ------------------- | ----- | ------ | ------------------------------------------------------------------- |
+| `SCRIPT_TOO_LARGE`  | no    | caller | Script bigger than `max_script_size`.                               |
+| `CONTEXT_TOO_LARGE` | no    | caller | Context bigger than `max_context_size`.                             |
+| `SCRIPT_XOR_KEY`    | no    | caller | Request has both `script` and `key`, or neither — send exactly one. |
+| `SCRIPT_NOT_FOUND`  | no    | caller | The `key` isn't in the server's script registry (404).              |
 
 ### The engine (`type: "runtime"`)
 
-| `code`                | retry | owner     | When                                                            |
-| --------------------- | ----- | --------- | -------------------------------------------------------------- |
-| `SYNTAX_ERROR`        | no    | developer | The script didn't parse.                                       |
-| `HANDLER_NOT_DEFINED` | no    | developer | No `handler(ctx)` function.                                    |
-| `TIMEOUT`             | no    | developer | Ran past the time limit.                                       |
-| `MEMORY_LIMIT`        | no    | developer | The context was too big to load into the memory limit.         |
-| `MALFORMED_RESPONSE`  | no    | developer | Returned something that isn't a `json(...)` answer.            |
-| `INTERNAL`            | yes   | operator  | The robot's own fault (rare) — a 500.                          |
+| `code`                | retry | owner     | When                                                   |
+| --------------------- | ----- | --------- | ------------------------------------------------------ |
+| `SYNTAX_ERROR`        | no    | developer | The script didn't parse.                               |
+| `HANDLER_NOT_DEFINED` | no    | developer | No `handler(ctx)` function.                            |
+| `TIMEOUT`             | no    | developer | Ran past the time limit.                               |
+| `MEMORY_LIMIT`        | no    | developer | The context was too big to load into the memory limit. |
+| `MALFORMED_RESPONSE`  | no    | developer | Returned something that isn't a `json(...)` answer.    |
+| `INTERNAL`            | yes   | operator  | The robot's own fault (rare) — a 500.                  |
 
 ### Your script (`type: "script"`)
 
-| `code`         | retry | owner     | When                                                            |
-| -------------- | ----- | --------- | -------------------------------------------------------------- |
+| `code`         | retry | owner     | When                                                                     |
+| -------------- | ----- | --------- | ------------------------------------------------------------------------ |
 | `SCRIPT_ERROR` | no    | developer | Your code threw an error (or hit a bug). `message` is your error's text. |
 
 ### Tools (`type: "capability"`)
 
 **`db`** (from the database's `SqlState`):
 
-| `code`             | retry | owner     | When                                                  |
-| ------------------ | ----- | --------- | ---------------------------------------------------- |
-| `DB_SERIALIZATION` | yes   | operator  | Serialization failure — retry the transaction.      |
-| `DB_DEADLOCK`      | yes   | operator  | Deadlock — retry.                                    |
-| `DB_CONNECTION`    | yes   | operator  | Couldn't reach the database (drop, or can't connect). |
-| `DB_CANCELED`      | yes   | operator  | Query canceled / statement timeout.                  |
+| `code`             | retry | owner     | When                                                       |
+| ------------------ | ----- | --------- | ---------------------------------------------------------- |
+| `DB_SERIALIZATION` | yes   | operator  | Serialization failure — retry the transaction.             |
+| `DB_DEADLOCK`      | yes   | operator  | Deadlock — retry.                                          |
+| `DB_CONNECTION`    | yes   | operator  | Couldn't reach the database (drop, or can't connect).      |
+| `DB_CANCELED`      | yes   | operator  | Query canceled / statement timeout.                        |
 | `DB_CONSTRAINT`    | no    | developer | Broke a rule (unique/foreign-key/etc). `details.sqlstate`. |
-| `DB_QUERY`         | no    | developer | Bad SQL.                                             |
-| `DB_OP_LIMIT`      | no    | developer | Hit `max_ops`.                                       |
-| `DB_ERROR`         | yes   | operator  | Anything else (fallback).                            |
+| `DB_QUERY`         | no    | developer | Bad SQL.                                                   |
+| `DB_OP_LIMIT`      | no    | developer | Hit `max_ops`.                                             |
+| `DB_ERROR`         | yes   | operator  | Anything else (fallback).                                  |
 
 **`mail`** (from the SMTP reply):
 
-| `code`           | retry | owner     | When                                        |
-| ---------------- | ----- | --------- | ------------------------------------------- |
-| `MAIL_TRANSIENT` | yes   | operator  | 4xx reply (greylisting, mailbox busy).      |
-| `MAIL_PERMANENT` | no    | developer | 5xx reply (rejected, bad address).          |
-| `MAIL_OP_LIMIT`  | no    | developer | Hit `max_ops`.                              |
+| `code`           | retry | owner     | When                                         |
+| ---------------- | ----- | --------- | -------------------------------------------- |
+| `MAIL_TRANSIENT` | yes   | operator  | 4xx reply (greylisting, mailbox busy).       |
+| `MAIL_PERMANENT` | no    | developer | 5xx reply (rejected, bad address).           |
+| `MAIL_OP_LIMIT`  | no    | developer | Hit `max_ops`.                               |
 | `MAIL_ERROR`     | yes   | operator  | Anything else, incl. connect/TLS (fallback). |
 
 **`s3`:**
 
-| `code`         | retry | owner     | When                                          |
-| -------------- | ----- | --------- | --------------------------------------------- |
+| `code`         | retry | owner     | When                                                                        |
+| -------------- | ----- | --------- | --------------------------------------------------------------------------- |
 | `S3_UPSTREAM`  | yes   | operator  | Store errored or was unreachable (`usage`/`delete`). `details.http_status`. |
-| `S3_OP_LIMIT`  | no    | developer | Hit `max_ops` while listing.                  |
-| `S3_FORBIDDEN` | no    | operator  | `delete` without `config.s3.allow_delete`.    |
-| `S3_ERROR`     | no    | developer | Bad key/config / signing (fallback).          |
+| `S3_OP_LIMIT`  | no    | developer | Hit `max_ops` while listing.                                                |
+| `S3_FORBIDDEN` | no    | operator  | `delete` without `config.s3.allow_delete`.                                  |
+| `S3_ERROR`     | no    | developer | Bad key/config / signing (fallback).                                        |
 
 **`api`** (returned **in-band** as `{ status: 0, error }`, never thrown):
 
-| `code`                | retry | owner     | When                                    |
-| --------------------- | ----- | --------- | --------------------------------------- |
-| `HTTP_TIMEOUT`        | yes   | operator  | Request timed out.                      |
-| `HTTP_CONNECT`        | yes   | operator  | TCP/TLS/DNS connect failure.            |
-| `HTTP_SSRF_BLOCKED`   | no    | developer | URL/host wasn't allowed.                |
-| `HTTP_BODY_TOO_LARGE` | no    | developer | Response was over the size cap.         |
-| `HTTP_OP_LIMIT`       | no    | developer | Hit `max_ops`.                          |
-| `HTTP_ERROR`          | yes   | operator  | Anything else (fallback).               |
+| `code`                | retry | owner     | When                            |
+| --------------------- | ----- | --------- | ------------------------------- |
+| `HTTP_TIMEOUT`        | yes   | operator  | Request timed out.              |
+| `HTTP_CONNECT`        | yes   | operator  | TCP/TLS/DNS connect failure.    |
+| `HTTP_SSRF_BLOCKED`   | no    | developer | URL/host wasn't allowed.        |
+| `HTTP_BODY_TOO_LARGE` | no    | developer | Response was over the size cap. |
+| `HTTP_OP_LIMIT`       | no    | developer | Hit `max_ops`.                  |
+| `HTTP_ERROR`          | yes   | operator  | Anything else (fallback).       |
 
 **`redis`:**
 
-| `code`             | retry | owner     | When                                   |
-| ------------------ | ----- | --------- | -------------------------------------- |
-| `REDIS_CONNECTION` | yes   | operator  | Couldn't reach Redis (or it dropped).  |
-| `REDIS_TIMEOUT`    | yes   | operator  | A command timed out.                   |
-| `REDIS_OP_LIMIT`   | no    | developer | Hit `max_ops`.                         |
-| `REDIS_ERROR`      | yes   | operator  | Anything else (fallback).              |
+| `code`             | retry | owner     | When                                  |
+| ------------------ | ----- | --------- | ------------------------------------- |
+| `REDIS_CONNECTION` | yes   | operator  | Couldn't reach Redis (or it dropped). |
+| `REDIS_TIMEOUT`    | yes   | operator  | A command timed out.                  |
+| `REDIS_OP_LIMIT`   | no    | developer | Hit `max_ops`.                        |
+| `REDIS_ERROR`      | yes   | operator  | Anything else (fallback).             |
 
 **`amq`** (RabbitMQ producer):
 
-| `code`                | retry | owner     | When                                       |
-| --------------------- | ----- | --------- | ------------------------------------------ |
-| `AMQ_CONNECTION`      | yes   | operator  | Couldn't reach the broker.                 |
-| `AMQ_BATCH_TOO_LARGE` | no    | developer | Batch bigger than `config.amq.max_batch`.  |
-| `AMQ_OP_LIMIT`        | no    | developer | Hit `max_ops`.                             |
-| `AMQ_ERROR`           | yes   | operator  | Publish/protocol error (fallback).         |
+| `code`                | retry | owner     | When                                      |
+| --------------------- | ----- | --------- | ----------------------------------------- |
+| `AMQ_CONNECTION`      | yes   | operator  | Couldn't reach the broker.                |
+| `AMQ_BATCH_TOO_LARGE` | no    | developer | Batch bigger than `config.amq.max_batch`. |
+| `AMQ_OP_LIMIT`        | no    | developer | Hit `max_ops`.                            |
+| `AMQ_ERROR`           | yes   | operator  | Publish/protocol error (fallback).        |
 
 **`auth`** (OIDC/IAM identity). An invalid token is **not** an error — it comes back
 **in-band** as `{ ok: false, status, code: "AUTH_INVALID_TOKEN" }` (like `api`, never
 thrown). These codes are only for the failures `auth` **throws**:
 
-| `code`            | retry | owner     | When                                                         |
-| ----------------- | ----- | --------- | ----------------------------------------------------------- |
-| `AUTH_UNAVAILABLE`| yes   | operator  | Identity server unreachable / 5xx / timeout. `details.http_status`. |
-| `AUTH_REQUEST`    | no    | operator  | Misconfig: bad endpoint, discovery failed, `introspect` without client creds. |
-| `AUTH_OP_LIMIT`   | no    | developer | Hit `max_ops`.                                              |
+| `code`             | retry | owner     | When                                                                          |
+| ------------------ | ----- | --------- | ----------------------------------------------------------------------------- |
+| `AUTH_UNAVAILABLE` | yes   | operator  | Identity server unreachable / 5xx / timeout. `details.http_status`.           |
+| `AUTH_REQUEST`     | no    | operator  | Misconfig: bad endpoint, discovery failed, `introspect` without client creds. |
+| `AUTH_OP_LIMIT`    | no    | developer | Hit `max_ops`.                                                                |
 
 > New codes can show up over time, but they **never change meaning** and never move to a
 > different `type` — so it's always safe to switch on `code`.

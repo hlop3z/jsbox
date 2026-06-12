@@ -13,6 +13,7 @@ mod http;
 mod kv;
 mod mail;
 mod pool;
+mod registry;
 mod s3;
 mod sandbox;
 mod ssrf;
@@ -20,6 +21,7 @@ mod sys;
 
 use std::error::Error;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
@@ -32,7 +34,9 @@ use tracing::info;
 use tracing_subscriber::fmt::init as init_tracing;
 
 use crate::config::Config;
+use crate::handler::AppState;
 use crate::pool::JsPool;
+use crate::registry::ScriptRegistry;
 
 /// Use `mimalloc` as the global allocator for better small-allocation performance.
 /// `QuickJS` benefits significantly (~20-40%) from this via the `rust-alloc` feature.
@@ -69,16 +73,26 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         info!("DEBUG MODE: SSRF private-IP block relaxed (local testing only — do not use in production)");
     }
 
+    // Load the read-only script registry before the engine config moves into the pool.
+    let script_registry = config.scripts_dir.as_deref().map_or_else(
+        || Ok(ScriptRegistry::default()),
+        |dir| ScriptRegistry::load(dir, config.engine.max_script_size),
+    )?;
+    if script_registry.count() > 0 {
+        info!("script registry: {} scripts loaded", script_registry.count());
+    }
+
     let js_pool = JsPool::new(config.engine, config.debug, config.error_debug)?;
     info!("JS runtime pool: {} slots", js_pool.size());
 
     let body_limit = js_pool.engine_config().max_body_size();
+    let state = AppState { pool: js_pool, registry: Arc::new(script_registry) };
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/execute", post(handler::execute))
         .layer(DefaultBodyLimit::max(body_limit))
-        .with_state(js_pool);
+        .with_state(state);
 
     let addr = config.server.addr();
     info!("listening on {addr}");

@@ -53,8 +53,8 @@ All `redis` calls are **synchronous** (no `await`), just like `db` and `$`.
 ### `redis.set(key, value, opts?)` — write a note
 
 ```js
-redis.set("greeting", "hello");              // remember forever
-redis.set("otp:42", "123456", { ttl: 60 });  // remember for 60 seconds, then forget
+redis.set("greeting", "hello"); // remember forever
+redis.set("otp:42", "123456", { ttl: 60 }); // remember for 60 seconds, then forget
 ```
 
 `ttl` is **time-to-live in seconds** — optional. After it runs out, the note vanishes
@@ -64,7 +64,7 @@ on its own. Perfect for codes, sessions, and caches.
 
 ```js
 var v = redis.get("greeting"); // "hello"
-var m = redis.get("nope");     // null  (no note under that name)
+var m = redis.get("nope"); // null  (no note under that name)
 ```
 
 A missing key gives you **`null`**.
