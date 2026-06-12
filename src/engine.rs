@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use rquickjs::{Context, Ctx, Function, Object, Runtime, Value as JsValue};
+use rquickjs::module::Evaluated;
+use rquickjs::{Context, Ctx, Function, Module, Object, Runtime, Value as JsValue};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::runtime::Handle;
@@ -221,11 +222,17 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         decimal::inject_decimal(&qctx).map_err(EngineError::internal)?;
         sys::inject_sys(&qctx, params.sys_config).map_err(EngineError::internal)?;
         inject_apis(&qctx, params, &mut collectors)?;
-        if eval_script(&qctx, params.script).is_err() {
-            return Ok(ExecOutcome::Error(classify_eval_error(&qctx)));
-        }
-        sanitize_globals(&qctx).map_err(EngineError::internal)?;
-        call_handler(&qctx, params.context_json, &timed_out, params.timeout)
+        let handler = match resolve_handler(&qctx, params.script) {
+            Ok(func) => func,
+            Err(outcome) => return Ok(outcome),
+        };
+        invoke_handler(
+            &qctx,
+            &handler,
+            params.context_json,
+            &timed_out,
+            params.timeout,
+        )
     });
 
     // Cleanup: clear interrupt handler so pooled runtime is clean.
@@ -393,11 +400,68 @@ fn sanitize_globals(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     Ok(())
 }
 
+/// Evaluates the user source (ES module or classic script), sanitizes globals, and returns
+/// the handler function. On failure returns the classified error outcome to short-circuit:
+/// a syntax/import error, or `HANDLER_NOT_DEFINED` when no handler is exported/defined.
+///
+/// Module vs script is detected by a top-level `export` ([`is_es_module`]); the handler
+/// body runs *after* `sanitize_globals` either way, so the two modes share the same
+/// `eval`/`Proxy`-removed execution environment.
+fn resolve_handler<'js>(qctx: &Ctx<'js>, script: &str) -> Result<Function<'js>, ExecOutcome> {
+    if is_es_module(script) {
+        let module = eval_module(qctx, script)
+            .map_err(|()| ExecOutcome::Error(classify_eval_error(qctx)))?;
+        sanitize_globals(qctx).map_err(|err| ExecOutcome::Error(EngineError::internal(err)))?;
+        module_handler(&module).ok_or(ExecOutcome::Error(EngineError::HandlerNotDefined))
+    } else {
+        eval_script(qctx, script).map_err(|_err| ExecOutcome::Error(classify_eval_error(qctx)))?;
+        sanitize_globals(qctx).map_err(|err| ExecOutcome::Error(EngineError::internal(err)))?;
+        qctx.globals()
+            .get::<_, Function<'js>>("handler")
+            .map_err(|_err| ExecOutcome::Error(EngineError::HandlerNotDefined))
+    }
+}
+
+/// Best-effort detection of ES-module source by a top-level `export` — the syntax a
+/// handler-module must use to export its handler. A miss is self-correcting: script-mode
+/// on a real module fails to parse (a syntax error), module-mode on a plain script finds
+/// no exported handler (`HANDLER_NOT_DEFINED`) — never a silent wrong result.
+fn is_es_module(script: &str) -> bool {
+    script.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("export")
+            .is_some_and(|rest| rest.starts_with([' ', '\t', '{', '*']))
+    })
+}
+
+/// Evaluates the user source as an ES module, settling synchronously: `Promise::finish`
+/// pumps the job queue to completion, and since every jsbox capability is sync FFI a module
+/// never truly suspends. `Err(())` leaves the pending exception set for
+/// [`classify_eval_error`]. Imports resolve through the per-runtime registry loader.
+fn eval_module<'js>(qctx: &Ctx<'js>, script: &str) -> Result<Module<'js, Evaluated>, ()> {
+    let declared = Module::declare(qctx.clone(), "handler", script).map_err(drop)?;
+    let (module, promise) = declared.eval().map_err(drop)?;
+    promise.finish::<()>().map_err(drop)?;
+    Ok(module)
+}
+
+/// Reads the exported handler from an evaluated module: `export default function handler`
+/// (namespace `default`) is preferred, then `export function handler` (namespace `handler`).
+/// `None` if neither names an exported function.
+fn module_handler<'js>(module: &Module<'js, Evaluated>) -> Option<Function<'js>> {
+    let namespace = module.namespace().ok()?;
+    namespace
+        .get::<_, Function<'js>>("default")
+        .ok()
+        .or_else(|| namespace.get::<_, Function<'js>>("handler").ok())
+}
+
 // -- Handler invocation + classification ------------------------------------
 
-/// Calls the user's `handler(context)` and classifies the outcome.
-fn call_handler(
-    qctx: &Ctx<'_>,
+/// Calls the resolved `handler(context)` and classifies the outcome.
+fn invoke_handler<'js>(
+    qctx: &Ctx<'js>,
+    handler: &Function<'js>,
     context_json: &str,
     timed_out: &AtomicBool,
     timeout: Duration,
@@ -413,11 +477,6 @@ fn call_handler(
             drop(qctx.catch()); // consume the pending exception before returning
             return Ok(ExecOutcome::Error(EngineError::MemoryLimit));
         }
-    };
-
-    let handler = match qctx.globals().get::<_, Function<'_>>("handler") {
-        Ok(func) => func,
-        Err(_err) => return Ok(ExecOutcome::Error(EngineError::HandlerNotDefined)),
     };
 
     match handler.call::<_, JsValue<'_>>((parsed_ctx,)) {

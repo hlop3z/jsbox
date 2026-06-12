@@ -111,6 +111,33 @@ registry is read-only at runtime: changing scripts means redeploying files (imag
 layer, ConfigMap, mounted volume) and restarting — so N replicas stay trivially
 consistent. Design notes: [`docs/design/script-registry.md`](docs/design/script-registry.md).
 
+### ES modules (`import` / `export`)
+
+A handler may be authored as a native **ES module** — `export` its handler and `import`
+shared helper modules:
+
+```js
+import { quote, withTax } from "acme/pricing";
+
+export default function handler(ctx) {
+  return json(withTax(quote(ctx.items, ctx.unit)), null);
+}
+```
+
+Both `export default function handler` and `export function handler` (named) are accepted.
+The mode is auto-detected: a source with a top-level `export` runs as a module, anything
+else runs as a classic script (`function handler(ctx) { … }` keeps working unchanged).
+
+**Importable modules** are operator-authored libraries under `modules_dir` (in
+`config.json`): every `*.js` / `*.mjs` file is loaded **once at startup**, with a specifier
+that is its relative path without the extension (`acme/pricing.mjs` → `acme/pricing`). A
+handler `import`s by that specifier. Resolution is a pure in-memory lookup with **no
+filesystem access** — a script can `import` only registered modules; an unknown or
+traversal specifier (`../`, `/etc/…`) never resolves. Modules run in the same sandbox as
+the handler (same memory/timeout/`max_ops` budget) and are read-only at runtime, like the
+script registry. Author them with any bundler (`esbuild --bundle --format=esm`) and drop
+the output in. Design notes: [`docs/design/injectable-modules.md`](docs/design/injectable-modules.md).
+
 ### Operational endpoints
 
 Besides `POST /execute`, the server exposes two unauthenticated read-only endpoints for

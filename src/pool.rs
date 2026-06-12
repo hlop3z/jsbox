@@ -13,6 +13,7 @@ use crossbeam_queue::ArrayQueue;
 use rquickjs::Runtime;
 
 use crate::config::EngineConfig;
+use crate::modules::{ModuleRegistry, RegistryLoader, RegistryResolver};
 
 /// A pool of pre-configured `QuickJS` runtimes.
 #[derive(Debug, Clone)]
@@ -27,6 +28,8 @@ pub(crate) struct JsPool {
     debug: bool,
     /// Include `error.debug` (stack traces) in responses when `true`.
     error_debug: bool,
+    /// Injectable ES modules, wired as the per-runtime `import` loader.
+    modules: Arc<ModuleRegistry>,
 }
 
 impl JsPool {
@@ -39,6 +42,7 @@ impl JsPool {
         engine_config: EngineConfig,
         debug: bool,
         error_debug: bool,
+        modules: Arc<ModuleRegistry>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let size = if engine_config.pool_size > 0 {
             engine_config.pool_size
@@ -49,7 +53,7 @@ impl JsPool {
         let queue = ArrayQueue::new(size);
 
         for _ in 0..size {
-            let runtime = create_runtime(&engine_config)?;
+            let runtime = create_runtime(&engine_config, &modules)?;
             queue
                 .push(runtime)
                 .map_err(|_err| "pool queue full during init")?;
@@ -61,6 +65,7 @@ impl JsPool {
             engine_config,
             debug,
             error_debug,
+            modules,
         })
     }
 
@@ -72,7 +77,7 @@ impl JsPool {
     pub(crate) fn acquire(&self) -> Result<Runtime, Box<dyn Error + Send + Sync>> {
         self.inner
             .pop()
-            .map_or_else(|| create_runtime(&self.engine_config), Ok)
+            .map_or_else(|| create_runtime(&self.engine_config, &self.modules), Ok)
     }
 
     /// Returns a runtime to the pool. Drops it if the pool is full.
@@ -102,10 +107,19 @@ impl JsPool {
     }
 }
 
-/// Creates a new runtime with sandbox limits from config.
-fn create_runtime(config: &EngineConfig) -> Result<Runtime, Box<dyn Error + Send + Sync>> {
+/// Creates a new runtime with sandbox limits from config and the module loader wired in
+/// (so a handler can `import` registered modules). The loader holds an `Arc` to the shared
+/// immutable registry, so every pooled runtime resolves `import` against the same modules.
+fn create_runtime(
+    config: &EngineConfig,
+    modules: &Arc<ModuleRegistry>,
+) -> Result<Runtime, Box<dyn Error + Send + Sync>> {
     let runtime = Runtime::new()?;
     runtime.set_memory_limit(config.memory_limit);
     runtime.set_max_stack_size(config.max_stack_size);
+    runtime.set_loader(
+        RegistryResolver(Arc::clone(modules)),
+        RegistryLoader(Arc::clone(modules)),
+    );
     Ok(runtime)
 }

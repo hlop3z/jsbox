@@ -1,14 +1,38 @@
 # Design note: injectable modules (operator-authored JS libraries)
 
-Status: **proposal — not implemented, planning only.** Companion to
-[script-registry.md](script-registry.md) and
+Status: **native ESM implemented (2026-06); `use()` loader not built (superseded).**
+Companion to [script-registry.md](script-registry.md) and
 [pooled-capabilities.md](pooled-capabilities.md).
 Revision 2: the loader-function shape (`use("name")`) replaced auto-injected
 globals as the proposed Phase A — see "Loader API" below for why.
 Revision 3 (explored 2026-06): **native ES modules are feasible** — this reverses
 the earlier "ESM out of scope" call. rquickjs ships the full module loader, and a
 spike proved synchronous `import`/`export` in jsbox's pooled `spawn_blocking` model.
-See "Native ESM" below; the `use()`-vs-ESM decision is now a live design choice.
+Revision 4 (built 2026-06): shipped **Shape B** — the handler is authored as an ES
+module (`export default function handler`), `import`s registered modules from
+`modules_dir`, and the `use()` bridge was dropped as unnecessary. See "Implementation"
+immediately below; the "Loader API"/`use()` sections are retained as superseded rationale.
+
+## Implementation (Revision 4 — what shipped)
+
+- **`modules_dir`** (`config.json`) loads `*.js` / `*.mjs` into an immutable
+  `ModuleRegistry` (`src/modules.rs`), specifier = relative path without extension — the
+  exact `ScriptRegistry` shape, including the in-memory-lookup / no-traversal safety.
+- **`RegistryResolver` + `RegistryLoader`** (`src/modules.rs`) wire that registry into each
+  pooled `Runtime` via `Runtime::set_loader` (the `loader` feature). Resolution is a pure
+  `HashMap` hit: a bare specifier resolves **iff** registered; `../`, `/etc/…`, and unknown
+  names fail — a script reaches only registered modules, never the filesystem.
+- **Handler-as-module** (`src/engine.rs`): `resolve_handler` detects a top-level `export`
+  ([`is_es_module`]), and in module mode `Module::declare(...).eval()` + `Promise::finish()`
+  settles synchronously, then the handler is read from the namespace (`default`, else
+  `handler`). Classic `function handler(ctx)` scripts keep running unchanged (script mode).
+- **Not built:** the `use("name")` synchronous loader. Native `import` made it redundant —
+  a handler-module imports directly. The sections below describing `use()` are kept as the
+  decision trail, not as the current API.
+- **Known rough edge:** an unresolvable `import` currently surfaces as `SYNTAX_ERROR`
+  (the resolver throws during module eval, classified by the generic eval-error path) rather
+  than a dedicated `MODULE_NOT_FOUND`. Functionally safe (data is null, owner is the
+  developer); a distinct code is a future polish.
 
 ## Idea
 

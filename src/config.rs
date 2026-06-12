@@ -62,6 +62,11 @@ pub(crate) struct Config {
     /// `acme/billing/pricing`). Omit to disable execute-by-key (`key` requests then
     /// fail with `SCRIPT_NOT_FOUND`).
     pub(crate) scripts_dir: Option<PathBuf>,
+    /// Directory of injectable ES modules (`*.js` / `*.mjs`), loaded once at startup; a
+    /// module's specifier is its relative path without the extension (`acme/pricing.mjs`
+    /// → `acme/pricing`). A handler `import`s them by that specifier. Omit to disable
+    /// `import` (any `import` of a module then fails to resolve).
+    pub(crate) modules_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -72,6 +77,7 @@ impl Default for Config {
             server: ServerConfig::default(),
             engine: EngineConfig::default(),
             scripts_dir: None,
+            modules_dir: None,
         }
     }
 }

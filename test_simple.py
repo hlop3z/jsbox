@@ -762,6 +762,58 @@ def test_metrics(t: Runner):
            lambda _r: before_rej is not None and after_rej is not None and after_rej > before_rej)
 
 
+def test_esm(t: Runner):
+    """ES-module handlers: a handler authored with `export` (default or named) and a handler
+    that `import`s a registered module. Backed by tests/modules/acme/pricing.mjs."""
+    t.section("ES modules (export / import)")
+
+    # A classic script handler still works (script-mode is detected by the absence of a
+    # top-level `export`) — the back-compat guarantee.
+    t.test("classic script handler still runs",
+           h_raw("function handler(ctx){ return json(ctx.a * 2, null); }", {"a": 21}),
+           data_eq(42))
+
+    # `export default function handler` — the canonical ESM shape.
+    t.test("export default handler",
+           h_raw("export default function handler(ctx){ return json('hi:'+ctx.name, null); }",
+                 {"name": "Ada"}),
+           data_eq("hi:Ada"))
+
+    # `export function handler` — named export also resolves.
+    t.test("named export handler",
+           h_raw("export function handler(ctx){ return json('named', null); }"),
+           data_eq("named"))
+
+    # A handler `import`s a registered module and uses its exports.
+    t.test("handler imports a registry module",
+           h_raw("import { quote, withTax } from 'acme/pricing';\n"
+                 "export default function handler(ctx){ return json(withTax(quote(ctx.n, 10)), null); }",
+                 {"n": 5}),
+           data_eq(55))
+
+    # Named + default + value imports all bind.
+    t.test("module exports a constant",
+           h_raw("import { TAX_RATE } from 'acme/pricing';\n"
+                 "export default function handler(ctx){ return json(TAX_RATE, null); }"),
+           data_eq(0.1))
+
+    # Importing an unregistered specifier fails to resolve — the security property: a script
+    # can reach only registered modules, never an arbitrary path.
+    t.test("import of unknown module fails (resolves nothing)",
+           h_raw("import { x } from 'no/such/module';\n"
+                 "export default function handler(ctx){ return json(1, null); }"),
+           data_none_with_error())
+    t.test("import path-traversal specifier fails",
+           h_raw("import { x } from '../../../etc/passwd';\n"
+                 "export default function handler(ctx){ return json(1, null); }"),
+           data_none_with_error())
+
+    # A module-shaped source with no exported handler is a clear HANDLER_NOT_DEFINED.
+    t.test("module without exported handler -> error",
+           h_raw("export const notHandler = 1;"),
+           lambda r: _err_code(r) == "HANDLER_NOT_DEFINED")
+
+
 def test_circuit_breaker(t: Runner):
     """Tier 3: repeated connect failures to a dead db target trip the breaker, after which
     requests to that target fast-fail DB_CIRCUIT_OPEN instead of waiting on the timeout —
@@ -1078,6 +1130,7 @@ def _start_server() -> subprocess.Popen:
     config = {
         "debug": True,
         "scripts_dir": os.path.join(repo, "tests", "scripts"),
+        "modules_dir": os.path.join(repo, "tests", "modules"),
         # Low bounds so the resilience tests actually exercise the bulkhead + clamp.
         "engine": {
             "max_concurrent_executions": 6,
@@ -1121,6 +1174,7 @@ def main():
     test_bulkhead(t)
     test_partition_fairness(t)
     test_metrics(t)
+    test_esm(t)
 
     # Database tests — only if containers are running
     if _db_available(PG_CONFIG):

@@ -14,6 +14,7 @@ mod http;
 mod kv;
 mod mail;
 mod metrics;
+mod modules;
 mod partition;
 mod pool;
 mod registry;
@@ -42,6 +43,7 @@ use crate::breaker::{BreakerConfig, CircuitBreaker};
 use crate::config::Config;
 use crate::handler::AppState;
 use crate::metrics::Metrics;
+use crate::modules::ModuleRegistry;
 use crate::partition::PartitionLimiter;
 use crate::pool::JsPool;
 use crate::registry::ScriptRegistry;
@@ -95,7 +97,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         );
     }
 
-    let js_pool = JsPool::new(config.engine, config.debug, config.error_debug)?;
+    // Load the injectable ES-module registry (handlers `import` from it).
+    let module_registry = config.modules_dir.as_deref().map_or_else(
+        || Ok(ModuleRegistry::default()),
+        |dir| ModuleRegistry::load(dir, config.engine.max_script_size),
+    )?;
+    if module_registry.count() > 0 {
+        info!(
+            "module registry: {} modules loaded",
+            module_registry.count()
+        );
+    }
+    let modules = Arc::new(module_registry);
+
+    let js_pool = JsPool::new(config.engine, config.debug, config.error_debug, modules)?;
     info!("JS runtime pool: {} slots", js_pool.size());
 
     let body_limit = js_pool.engine_config().max_body_size();
