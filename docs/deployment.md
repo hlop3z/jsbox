@@ -8,8 +8,11 @@ this page is the "what to actually set, and why" synthesis.
 
 > **TL;DR checklist** (each expanded below)
 >
+> - [ ] `access_token` set (or `allow_unauthenticated: true` if auth is genuinely terminated upstream) — jsbox refuses to start on a non-loopback bind otherwise.
 > - [ ] `debug: false` in production config (it relaxes the SSRF guard — local-testing only).
-> - [ ] `error_debug: false` at an internet-facing edge (strips stack/raw from responses).
+> - [ ] `error_debug` left `false` (default) at an internet-facing edge (keeps stack/raw out of responses).
+> - [ ] `allow_wildcard_hosts` left `false` unless a caller genuinely needs `allowed_hosts: ["*"]` (it collapses the host allowlist to the IP filter alone).
+> - [ ] `max_output_size` set in an untrusted-script deployment (caps the handler's returned JSON).
 > - [ ] `/metrics` and `/health` reachable only from the pod/mesh, never the public internet.
 > - [ ] Bulkhead (`max_concurrent_executions`) set to bound DB connections + blocking threads.
 > - [ ] `max_statement_timeout_ms` set **and** a server-side `statement_timeout` role default.
@@ -22,17 +25,26 @@ this page is the "what to actually set, and why" synthesis.
 
 ## 1. Before you expose it (the non-negotiable gates)
 
-These three are the difference between "internal demo" and "safe to point traffic at."
+These are the difference between "internal demo" and "safe to point traffic at."
 
+- **Authenticate `/execute` (fail-closed).** The `/execute` caller is fully trusted — it
+  supplies the credentials (`config.db`/`mail`/…) and arbitrary JS — so an unauthenticated
+  reachable port is a full compromise (SSRF pivot, mail relay, credential use). jsbox
+  **refuses to start** on a non-loopback bind unless you either set `access_token` (a shared
+  secret; requests must send `Authorization: Bearer <token>`, constant-time compared) or
+  explicitly set `allow_unauthenticated: true` to assert auth is terminated upstream
+  (gateway/mesh). `/health` and `/metrics` stay open for probes/scrape. This is defense in
+  depth *behind* the gateway, not a replacement for it.
 - **`debug: false`.** `debug: true` relaxes the SSRF private-IP block so `api`/`s3` can reach
   localhost/LAN targets — it exists for local testing only. In production it would let a
   script-controlled URL reach your internal network. The default is already `false`; just
   make sure no production `config.json` sets it `true`.
-- **`error_debug` at the edge.** `error_debug` (default `true`) includes stack traces and raw
-  driver causes in the error envelope's gated `debug` block. That's useful for an internal
-  service; set it `false` if `/execute` is exposed to untrusted callers so internal detail
-  (hostnames, driver messages) never leaves the boundary. The `trace_id` is always present, so
-  support can still correlate with server logs (which always capture the raw cause).
+- **`error_debug` at the edge.** `error_debug` (default `false`, secure by default) gates
+  whether stack traces and raw driver causes appear in the error envelope's `debug` block.
+  Leave it off at any exposed edge so internal detail (hostnames, driver messages) never
+  leaves the boundary; set it `true` only on a purely internal service where you want that
+  detail inline. The `trace_id` is always present and the raw cause is always logged
+  server-side, so support can correlate either way.
 - **Scope `/metrics` and `/health`.** Both are unauthenticated, read-only GET endpoints
   (`/metrics` is Prometheus text; see §8). Expose them only to the scrape path / mesh —
   a `NetworkPolicy`, a sidecar, or binding the scrape to the pod IP. Never route them from a
@@ -76,6 +88,7 @@ it's pooler config.
 | `max_stack_size`                       | Per-execution stack cap.                                        | Guards runaway recursion.                                                                                                                                                                                                                    |
 | `max_script_size` / `max_context_size` | Max bytes for the script and the context payload.               | Validated before execution. `max_context_size` left at `0` auto-derives to `memory_limit / 8`; an explicit value is **capped at `memory_limit / 4`** (the ~4× JSON-parse heap cost), so a max-size context always parses instead of OOM-ing. |
 | `max_ops`                              | Cap on total external operations (db/api/mail/…) per execution. | Bounds a handler's downstream fan-out.                                                                                                                                                                                                       |
+| `max_output_size`                      | Max bytes of JSON the handler may return.                       | `0` = off (bounded by `memory_limit`). Set it for untrusted scripts so one handler can't return a `memory_limit`-sized blob; over-cap fails `OUTPUT_TOO_LARGE` (422).                                                                         |
 
 Sizes accept human-readable byte strings (`"32mb"`, `"1mb"`). The body limit is derived from
 `max_script_size + max_context_size`.
@@ -93,6 +106,14 @@ All three reuse the single process-wide `aws-lc-rs` rustls provider — no secon
 For an internal CA / self-signed cert, the platform trust store applies; mount your CA bundle
 into the image's trust path. (`api`/`s3` are SSRF-guarded because their URLs are
 script-controlled — see [resilience.md](design/resilience.md) on the two trust models.)
+
+**The `api` host allowlist.** A request's `allowed_hosts` names the hosts the `api` client may
+reach; the SSRF guard additionally blocks any host that resolves to a private/internal IP
+(IPv4 **and** IPv6 — loopback, RFC1918, link-local incl. cloud-metadata, ULA, and private v4
+smuggled via 6to4/NAT64). The wildcard `allowed_hosts: ["*"]` collapses the allowlist to that
+IP filter alone, so it is **ignored unless** `allow_wildcard_hosts: true` is set (and never
+honored in `debug` mode). Prefer an explicit host list; reach for the wildcard only when a
+trusted caller genuinely needs open egress.
 
 ## 5. Multi-tenant fairness under k8s
 

@@ -72,6 +72,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let config_path = PathBuf::from("config.json");
     let config = Config::load(&config_path)?;
 
+    // Fail closed: refuse an exposed bind with no `/execute` auth gate (see config.rs).
+    config.check_exposure()?;
+
     info!(
         memory_limit = config.engine.memory_limit,
         max_stack_size = config.engine.max_stack_size,
@@ -110,6 +113,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let modules = Arc::new(module_registry);
 
+    // Capture the `/execute` bearer token before the engine config moves into the pool.
+    let access_token: Option<Arc<str>> = config.access_token.clone().map(Arc::from);
+    info!(
+        execute_auth = access_token.is_some(),
+        "/execute bearer auth"
+    );
+
     let js_pool = JsPool::new(config.engine, config.debug, config.error_debug, modules)?;
     info!("JS runtime pool: {} slots", js_pool.size());
 
@@ -146,6 +156,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         db_breaker,
         metrics: Arc::new(Metrics::default()),
         bulkhead_capacity: max_concurrent,
+        access_token,
     };
 
     let app = Router::new()

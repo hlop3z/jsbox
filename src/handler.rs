@@ -6,7 +6,7 @@ use std::time::Instant;
 use axum::Json;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,9 @@ pub(crate) struct AppState {
     pub(crate) metrics: Arc<Metrics>,
     /// Configured global bulkhead capacity, surfaced as the `_total` permit gauge.
     pub(crate) bulkhead_capacity: usize,
+    /// Shared-secret bearer token gating `/execute`. `None` = no in-process auth (the
+    /// operator either bound loopback or opted out via `allow_unauthenticated`).
+    pub(crate) access_token: Option<Arc<str>>,
 }
 
 /// Pre-allocated `Box<RawValue>` for `{}` — used as default context.
@@ -293,6 +296,11 @@ pub(crate) async fn execute(
     headers: HeaderMap,
     payload: Result<Json<ExecRequest>, JsonRejection>,
 ) -> impl IntoResponse {
+    // Auth gate (defense in depth) — reject before any body work.
+    if let Some(rejected) = enforce_auth(&state, &headers) {
+        return rejected;
+    }
+
     let req = match payload {
         Ok(Json(req)) => req,
         Err(rejection) => {
@@ -345,17 +353,12 @@ pub(crate) async fn execute(
     }
 
     let context_json: String = context.get().into();
-    // Tier 0: clamp the per-request db statement_timeout to the operator ceiling, so
-    // jsbox never issues an unbounded `SET` (see docs/design/resilience.md).
-    let mut db_config = config.db;
-    if let Some(db) = db_config.as_mut() {
-        clamp_statement_timeout(db, engine_cfg.max_statement_timeout_ms);
-    }
+    // Tier 0: clamp the per-request db statement_timeout to the operator ceiling.
+    let db_config = clamp_db(config.db, engine_cfg.max_statement_timeout_ms);
 
     let start = Instant::now();
 
-    // Acquire the per-partition permit (Tier 5) then the global bulkhead permit (Tier 1),
-    // both held across the blocking span. A noisy partition fast-fails on its own share.
+    // Acquire the per-partition (Tier 5) then global bulkhead (Tier 1) permits.
     let busy_meta = base_error_meta(
         &trace_id,
         script_bytes,
@@ -368,21 +371,18 @@ pub(crate) async fn execute(
         Err(shed) => return *shed,
     };
 
-    let db_breaker = state.db_breaker.clone();
-    let metrics = Arc::clone(&state.metrics);
-    let js_pool = state.pool;
-    // Capture the runtime handle in the async context so the blocking task can drive
-    // async capability I/O (db) via `block_on` (Tier 2).
+    // Handle for the blocking task to drive async capability I/O (db) via `block_on` (Tier 2).
     let tokio_handle = Handle::current();
 
     let result = task::spawn_blocking(move || -> Result<ExecResult, EngineError> {
-        let runtime = js_pool
+        let runtime = state
+            .pool
             .acquire()
             .map_err(|err| EngineError::Internal(err.to_string()))?;
         let res = engine::run(&ExecParams {
             runtime: &runtime,
             tokio_handle: &tokio_handle,
-            db_breaker: db_breaker.as_deref(),
+            db_breaker: state.db_breaker.as_deref(),
             script: source.as_str(),
             context_json: &context_json,
             timeout: engine_cfg.timeout(),
@@ -395,9 +395,12 @@ pub(crate) async fn execute(
             auth_config: config.auth.as_ref(),
             sys_config: config.sys.as_ref(),
             max_ops: engine_cfg.max_ops,
+            max_output_size: engine_cfg.max_output_size,
             allow_private_targets,
+            // `*` honored only as explicit opt-in, never in SSRF-relaxed debug mode.
+            wildcard_hosts_allowed: engine_cfg.allow_wildcard_hosts && !allow_private_targets,
         });
-        js_pool.release(runtime);
+        state.pool.release(runtime);
         res
     })
     .await;
@@ -410,7 +413,7 @@ pub(crate) async fn execute(
     let base_meta = Meta::new(trace_id, script_bytes, context_bytes, exec_time_us)
         .with_key(key)
         .with_partition(partition);
-    build_response(result, base_meta, error_debug, &metrics)
+    build_response(result, base_meta, error_debug, &state.metrics)
 }
 
 /// `GET /metrics` — Prometheus text exposition of the process-wide counters and live
@@ -692,6 +695,63 @@ fn header_partition(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Enforces the optional `/execute` bearer gate. Returns `Some(401)` when a token is
+/// configured and the request doesn't present a matching one; `None` when auth passes or no
+/// token is configured (auth handled upstream / loopback bind).
+fn enforce_auth(state: &AppState, headers: &HeaderMap) -> Option<AxumResponse> {
+    let expected = state.access_token.as_deref()?;
+    if request_authorized(headers, expected) {
+        return None;
+    }
+    state.metrics.record_rejection();
+    Some(unauthorized_response())
+}
+
+/// Applies the Tier 0 statement-timeout clamp to a request's db config (if present), so jsbox
+/// never issues an unbounded `SET` (see `docs/design/resilience.md`).
+fn clamp_db(mut db: Option<DbConfig>, ceiling_ms: u64) -> Option<DbConfig> {
+    if let Some(cfg) = db.as_mut() {
+        clamp_statement_timeout(cfg, ceiling_ms);
+    }
+    db
+}
+
+/// Returns `true` if the request carries a valid `Authorization: Bearer <token>` matching
+/// `expected`. The token is compared in constant time so a timing side-channel can't recover
+/// it byte by byte.
+fn request_authorized(headers: &HeaderMap, expected: &str) -> bool {
+    let Some(value) = headers.get(AUTHORIZATION).and_then(|raw| raw.to_str().ok()) else {
+        return false;
+    };
+    let Some(token) = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+    else {
+        return false;
+    };
+    ct_eq(token.trim().as_bytes(), expected.as_bytes())
+}
+
+/// Constant-time byte-slice equality. Length difference returns early (a token's length is
+/// not the secret); equal-length inputs are compared without an early exit.
+fn ct_eq(lhs: &[u8], rhs: &[u8]) -> bool {
+    if lhs.len() != rhs.len() {
+        return false;
+    }
+    let mut acc = 0_u8;
+    for (left, right) in lhs.iter().zip(rhs.iter()) {
+        acc |= left ^ right;
+    }
+    acc == 0
+}
+
+/// Builds the `401 UNAUTHORIZED` response for a missing/invalid bearer token.
+fn unauthorized_response() -> AxumResponse {
+    let trace_id = Uuid::new_v4().to_string();
+    let envelope = request_error("UNAUTHORIZED", "missing or invalid bearer token".to_owned());
+    system_error_response(envelope, 401, Meta::new(trace_id, 0, 0, 0))
+}
+
 /// Builds a `request`-category envelope (the caller's fault, never retryable).
 fn request_error(code: &str, message: String) -> ErrorEnvelope {
     ErrorEnvelope::new(
@@ -752,4 +812,70 @@ fn system_error_response(error: ErrorEnvelope, status: u16, meta: Meta) -> AxumR
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    //! `/execute` bearer-auth gate: constant-time compare + `Authorization` header parsing.
+
+    use super::{ct_eq, request_authorized};
+    use axum::http::HeaderMap;
+    use axum::http::HeaderValue;
+    use axum::http::header::AUTHORIZATION;
+
+    /// A `HeaderMap` carrying a single `Authorization` header value.
+    fn with_auth(value: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        drop(headers.insert(AUTHORIZATION, HeaderValue::from_static(value)));
+        headers
+    }
+
+    /// Constant-time compare is true only for byte-identical inputs (incl. equal length).
+    #[test]
+    fn ct_eq_matches_only_identical_bytes() {
+        assert!(ct_eq(b"s3cret-token", b"s3cret-token"), "identical matches");
+        assert!(
+            !ct_eq(b"s3cret-token", b"s3cret-tokeX"),
+            "same length, one byte off"
+        );
+        assert!(
+            !ct_eq(b"short", b"longer-token"),
+            "different length differs"
+        );
+        assert!(ct_eq(b"", b""), "empty equals empty");
+    }
+
+    /// A matching bearer token authorizes, case-insensitively on the scheme.
+    #[test]
+    fn authorized_accepts_matching_bearer() {
+        assert!(
+            request_authorized(&with_auth("Bearer s3cret"), "s3cret"),
+            "exact match authorizes"
+        );
+        assert!(
+            request_authorized(&with_auth("bearer s3cret"), "s3cret"),
+            "lowercase scheme authorizes"
+        );
+    }
+
+    /// A wrong, prefix-less, empty, or absent token is rejected.
+    #[test]
+    fn authorized_rejects_bad_or_missing() {
+        assert!(
+            !request_authorized(&with_auth("Bearer wrong"), "s3cret"),
+            "wrong token rejected"
+        );
+        assert!(
+            !request_authorized(&with_auth("s3cret"), "s3cret"),
+            "missing Bearer prefix rejected"
+        );
+        assert!(
+            !request_authorized(&HeaderMap::new(), "s3cret"),
+            "absent header rejected"
+        );
+        assert!(
+            !request_authorized(&with_auth("Bearer "), "s3cret"),
+            "empty token rejected"
+        );
+    }
 }

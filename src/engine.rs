@@ -85,8 +85,14 @@ pub(crate) struct ExecParams<'a> {
     pub(crate) sys_config: Option<&'a SysConfig>,
     /// Max operations per execution.
     pub(crate) max_ops: usize,
+    /// Max bytes the handler may return (`0` = off, bounded only by `memory_limit`).
+    pub(crate) max_output_size: usize,
     /// Debug mode: relax the SSRF private-IP block (`api`/`s3`) for local testing.
     pub(crate) allow_private_targets: bool,
+    /// Whether the `api` client honors an `allowed_hosts: ["*"]` wildcard. Resolved in the
+    /// handler as `allow_wildcard_hosts && !debug` — a wildcard is never honored in the
+    /// SSRF-relaxed debug mode.
+    pub(crate) wildcard_hosts_allowed: bool,
 }
 
 /// Result of a script execution: the outcome plus the drained per-capability metrics.
@@ -136,6 +142,13 @@ pub(crate) enum EngineError {
     MemoryLimit,
     /// `handler` returned something that isn't a `{data,error}` envelope.
     Malformed(String),
+    /// The handler's returned JSON exceeded `max_output_size`.
+    OutputTooLarge {
+        /// Actual size produced.
+        size: usize,
+        /// Configured ceiling.
+        limit: usize,
+    },
     /// Our fault: context creation, capability injection, or a task panic.
     Internal(String),
     /// Uncaught `throw` from the handler (an explicit `throw` or a script bug).
@@ -241,7 +254,10 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
     // Cleanup: clear interrupt handler so pooled runtime is clean.
     params.runtime.set_interrupt_handler(None);
 
-    let outcome = js_result.unwrap_or_else(ExecOutcome::Error);
+    let outcome = enforce_output_cap(
+        js_result.unwrap_or_else(ExecOutcome::Error),
+        params.max_output_size,
+    );
 
     Ok(ExecResult {
         outcome,
@@ -253,6 +269,26 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         amq_metrics: sandbox::drain(amq_collector.as_ref()),
         auth_metrics: sandbox::drain(auth_collector.as_ref()),
     })
+}
+
+/// Enforces the output-size ceiling on a successful result: a handler JSON larger than
+/// `max_output_size` (when non-zero) is turned into an [`EngineError::OutputTooLarge`] so a
+/// script can't return a `memory_limit`-sized blob. Errors and the disabled case (`0`) pass
+/// through untouched.
+fn enforce_output_cap(outcome: ExecOutcome, max_output_size: usize) -> ExecOutcome {
+    if max_output_size == 0 {
+        return outcome;
+    }
+    if let ExecOutcome::Success(json) = &outcome {
+        let size = json.len();
+        if size > max_output_size {
+            return ExecOutcome::Error(EngineError::OutputTooLarge {
+                size,
+                limit: max_output_size,
+            });
+        }
+    }
+    outcome
 }
 
 /// Mutable references to the per-capability metric collectors.
@@ -317,6 +353,7 @@ fn inject_apis(
                 params.allowed_hosts,
                 params.max_ops,
                 params.allow_private_targets,
+                params.wildcard_hosts_allowed,
             )
             .map_err(EngineError::internal)?,
         );
@@ -395,7 +432,14 @@ fn eval_script(qctx: &Ctx<'_>, script: &str) -> Result<(), rquickjs::Error> {
     Ok(())
 }
 
-/// Removes dangerous globals before handler runs.
+/// Removes `eval` and `Proxy` before the handler runs.
+///
+/// This is isolation hardening, **not** a dynamic-code block: `new Function("…")()` and the
+/// `AsyncFunction`/`GeneratorFunction` constructors still compile strings, and that is fine —
+/// the script is already arbitrary code, and the real boundary is `QuickJS` having no host
+/// access (no fs/net/process). `eval` is removed to trim a historically bug-prone surface and
+/// `Proxy` to deny exotic-object traps over the injected capability/`$sys` globals. Do not
+/// rely on their absence for any policy that depends on the script *not* generating code.
 fn sanitize_globals(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     let globals = qctx.globals();
     globals.remove("eval")?;
@@ -708,7 +752,8 @@ impl EngineError {
             | Self::HandlerNotDefined
             | Self::Timeout { .. }
             | Self::MemoryLimit
-            | Self::Malformed(_) => 422,
+            | Self::Malformed(_)
+            | Self::OutputTooLarge { .. } => 422,
         }
     }
 
@@ -736,6 +781,12 @@ impl EngineError {
                 runtime_envelope("MEMORY_LIMIT", false, dev, MEMORY_MSG.to_owned())
             }
             Self::Malformed(message) => runtime_envelope("MALFORMED_RESPONSE", false, dev, message),
+            Self::OutputTooLarge { size, limit } => runtime_envelope(
+                "OUTPUT_TOO_LARGE",
+                false,
+                dev,
+                format!("handler output too large: {size} bytes (max {limit})"),
+            ),
             // Generic message + raw cause in gated debug — never leak internal infra
             // detail (hostnames, etc.) in the always-present `message`.
             Self::Internal(raw) => attach_debug(

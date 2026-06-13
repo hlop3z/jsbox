@@ -233,7 +233,11 @@ impl Metrics {
             EngineError::Capability(_) => &self.capability_error,
             EngineError::Timeout { .. } => &self.timeout,
             EngineError::MemoryLimit => &self.memory_limit,
-            EngineError::Malformed(_) => &self.malformed_response,
+            // Both are the handler producing an unusable response (bad shape / over the size
+            // cap) — bucket them together rather than adding a near-duplicate series.
+            EngineError::Malformed(_) | EngineError::OutputTooLarge { .. } => {
+                &self.malformed_response
+            }
             EngineError::Internal(_) => &self.internal_error,
         };
         let _ = counter.fetch_add(1, Ordering::Relaxed);
