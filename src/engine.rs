@@ -822,3 +822,40 @@ impl CapabilityErr {
         attach_debug(envelope, self.stack, self.raw, error_debug)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Verifies the wall-clock interrupt preempts a catastrophic-backtracking regex.
+    //!
+    //! `QuickJS`'s libregexp does not yield to the interrupt handler on its own, so this proves
+    //! that a `ReDoS` pattern is still bounded by the execution timeout rather than pinning a
+    //! `spawn_blocking` thread until the match completes.
+
+    use rquickjs::{Context, Runtime, Value as JsValue};
+    use std::time::{Duration, Instant};
+
+    /// A `(a+)+$` pattern over a non-matching tail backtracks exponentially; with 30 leading
+    /// `a`s it would run for several seconds uninterrupted, so prompt completion proves the
+    /// interrupt aborted the match rather than letting it run to the end.
+    #[test]
+    fn catastrophic_regex_is_interrupted() {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let timeout = Duration::from_millis(250);
+        let start = Instant::now();
+        runtime.set_interrupt_handler(Some(Box::new(move || start.elapsed() > timeout)));
+        let ctx = Context::full(&runtime).unwrap_or_else(|_err| unreachable!());
+        let script = format!("/(a+)+$/.test(\"{}!\")", "a".repeat(30));
+        ctx.with(|qctx| {
+            let res: Result<JsValue<'_>, _> = qctx.eval(script.as_bytes());
+            assert!(
+                res.is_err(),
+                "the wall-clock interrupt must abort a catastrophic regex"
+            );
+        });
+        runtime.set_interrupt_handler(None);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "regex was not preempted promptly (interrupt did not fire during matching)"
+        );
+    }
+}

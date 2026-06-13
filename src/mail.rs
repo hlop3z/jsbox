@@ -104,6 +104,15 @@ pub(crate) struct MailConfig {
     /// Maximum recipients (to + cc + bcc) per send (default 50).
     #[serde(default = "default_max_recipients")]
     pub(crate) max_recipients: usize,
+    /// Recipient-domain allowlist: when non-empty, every recipient's domain (to/cc/bcc) must
+    /// be in this list (case-insensitive). Empty (default) = unrestricted. Set it for
+    /// untrusted scripts so a handler can't turn the operator's relay into an open spam cannon.
+    #[serde(default)]
+    pub(crate) allowed_recipient_domains: Vec<String>,
+    /// Per-execution cap on `mail.send` calls. `0` (default) = bounded only by the global
+    /// `max_ops` budget; when set, the effective cap is `min(max_sends, max_ops)`.
+    #[serde(default)]
+    pub(crate) max_sends: usize,
     /// Connect + send timeout in milliseconds (default 10000).
     #[serde(default = "default_timeout")]
     pub(crate) timeout_ms: u64,
@@ -194,6 +203,8 @@ struct SendCtx<'a> {
     default_from: &'a str,
     /// Recipient cap.
     max_recipients: usize,
+    /// Recipient-domain allowlist (empty = unrestricted).
+    allowed_domains: &'a [String],
 }
 
 // -- Public API -------------------------------------------------------------
@@ -211,6 +222,13 @@ pub(crate) fn inject_mail(
     let transport = build_transport(config)?;
     let default_from = config.from.clone();
     let max_recipients = config.max_recipients;
+    let allowed_domains = config.allowed_recipient_domains.clone();
+    // Per-execution send cap (Tier: mail abuse): tighter of the mail cap and the global budget.
+    let send_cap = if config.max_sends == 0 {
+        max_ops
+    } else {
+        config.max_sends.min(max_ops)
+    };
 
     let metrics: Collector<MailMetric> = sandbox::new_collector();
     let metrics_clone = Arc::clone(&metrics);
@@ -218,7 +236,7 @@ pub(crate) fn inject_mail(
     let mail_fn = Function::new(
         qctx.clone(),
         move |action: String, payload_json: String| -> String {
-            if let Err(err) = sandbox::check_op_limit(&metrics_clone, max_ops) {
+            if let Err(err) = sandbox::check_op_limit(&metrics_clone, send_cap) {
                 return errors::capability_fault_json(ErrorSource::Mail, MAIL_OP_LIMIT, &err, None);
             }
 
@@ -227,6 +245,7 @@ pub(crate) fn inject_mail(
                 transport: &transport,
                 default_from: &default_from,
                 max_recipients,
+                allowed_domains: &allowed_domains,
             };
             let result = dispatch(&send_ctx, &action, &payload_json);
             let metric = build_metric(&action, result.as_ref().ok(), start);
@@ -308,6 +327,7 @@ fn do_send(send_ctx: &SendCtx<'_>, payload_json: &str) -> Result<SendOutcome, Ma
             send_ctx.max_recipients
         )));
     }
+    enforce_recipient_domains(&payload, send_ctx.allowed_domains)?;
 
     let message = build_message(&payload, send_ctx.default_from).map_err(MailError::fallback)?;
     let bytes = message.formatted().len();
@@ -327,6 +347,25 @@ fn do_send(send_ctx: &SendCtx<'_>, payload_json: &str) -> Result<SendOutcome, Ma
         }
         Err(err) => Err(MailError::from_driver(&err)),
     }
+}
+
+/// Rejects any recipient whose domain isn't in `allowed` (case-insensitive). An empty list
+/// means no restriction. Addresses are parsed to extract the domain, so a malformed address
+/// is reported here rather than later in message building.
+fn enforce_recipient_domains(payload: &SendPayload, allowed: &[String]) -> Result<(), MailError> {
+    if allowed.is_empty() {
+        return Ok(());
+    }
+    for addr in payload.to.iter().chain(&payload.cc).chain(&payload.bcc) {
+        let mailbox = parse_mailbox(addr, "recipient").map_err(MailError::fallback)?;
+        let domain = mailbox.email.domain().to_lowercase();
+        if !allowed.iter().any(|allow| allow.to_lowercase() == domain) {
+            return Err(MailError::fallback(format!(
+                "recipient domain '{domain}' is not in allowed_recipient_domains"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Counts total recipients across to/cc/bcc (saturating).
@@ -403,5 +442,82 @@ fn build_metric(action: &str, outcome: Option<&SendOutcome>, start: Instant) -> 
         recipients,
         bytes,
         accepted,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Recipient-domain allowlist enforcement (the spam-cannon control).
+
+    use super::{SendPayload, enforce_recipient_domains};
+
+    /// A payload with the given `to` / `cc` recipients and everything else empty.
+    fn payload(to: &[&str], cc: &[&str]) -> SendPayload {
+        SendPayload {
+            from: String::new(),
+            to: to.iter().map(|addr| (*addr).to_owned()).collect(),
+            cc: cc.iter().map(|addr| (*addr).to_owned()).collect(),
+            bcc: Vec::new(),
+            reply_to: String::new(),
+            subject: String::new(),
+            text: String::new(),
+            html: String::new(),
+        }
+    }
+
+    /// An allowlist from string literals.
+    fn allow(domains: &[&str]) -> Vec<String> {
+        domains.iter().map(|dom| (*dom).to_owned()).collect()
+    }
+
+    /// An empty allowlist places no restriction on recipients.
+    #[test]
+    fn empty_allowlist_permits_any_domain() {
+        assert!(
+            enforce_recipient_domains(&payload(&["user@anywhere.example"], &[]), &[]).is_ok(),
+            "empty allowlist is unrestricted"
+        );
+    }
+
+    /// An allowed domain passes, matched case-insensitively.
+    #[test]
+    fn allowed_domain_passes_case_insensitively() {
+        let allowed = allow(&["example.com"]);
+        assert!(
+            enforce_recipient_domains(&payload(&["user@example.com"], &[]), &allowed).is_ok(),
+            "exact domain allowed"
+        );
+        assert!(
+            enforce_recipient_domains(&payload(&["user@EXAMPLE.COM"], &[]), &allowed).is_ok(),
+            "case-insensitive domain allowed"
+        );
+    }
+
+    /// An off-list recipient (in any of to/cc/bcc) rejects the whole send.
+    #[test]
+    fn disallowed_domain_is_rejected() {
+        let allowed = allow(&["example.com"]);
+        assert!(
+            enforce_recipient_domains(&payload(&["user@evil.example"], &[]), &allowed).is_err(),
+            "off-list domain rejected"
+        );
+        assert!(
+            enforce_recipient_domains(
+                &payload(&["ok@example.com"], &["bad@evil.example"]),
+                &allowed
+            )
+            .is_err(),
+            "a single off-list cc rejects the whole send"
+        );
+    }
+
+    /// A recipient that doesn't parse as an address is rejected under an allowlist.
+    #[test]
+    fn malformed_address_is_rejected_under_allowlist() {
+        let allowed = allow(&["example.com"]);
+        assert!(
+            enforce_recipient_domains(&payload(&["not-an-email"], &[]), &allowed).is_err(),
+            "unparseable recipient rejected"
+        );
     }
 }

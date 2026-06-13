@@ -27,10 +27,13 @@ the **attack** it closes, and the **control**. Status is tracked here as work la
 | 6 | Fail-closed auth on `/execute` (`access_token` bearer + refuse exposed bind w/o it) | 1 | Critical | ✅ done |
 | 9 | Document `Function`/`AsyncFunction` survive `eval` removal (isolation-only) | 2 | Low | ✅ done |
 | 2 | Pin resolved IP through reqwest (close DNS-rebind TOCTOU on `api`) | 3 | High | ✅ done |
-| 7 | Mail: operator recipient-domain allowlist + per-exec send cap | 3 | Medium | ⬜ todo |
-| 8 | Verify: ReDoS catastrophic-backtrack is preempted by the wall-clock interrupt | 2 | Low | ⬜ todo |
+| 7 | Mail: operator recipient-domain allowlist + per-exec send cap | 3 | Medium | ✅ done |
+| 8 | Verify: ReDoS catastrophic-backtrack is preempted by the wall-clock interrupt | 2 | Low | ✅ verified |
 
-## What landed (verified: `cargo fmt --check` clean, clippy gauntlet 0 errors, 39 unit tests pass)
+All nine items resolved. Gauntlet green in Docker (`rust:1.92-alpine`): `cargo fmt --check`
+clean, `cargo clippy --all-targets` 0 errors, `cargo test` 44 passed.
+
+## What landed
 
 - **1 — IPv6 SSRF** (`ssrf.rs`): new `is_private_v6` / `v6_embeds_private_v4` cover loopback,
   v4-mapped, ULA `fc00::/7`, link-local `fe80::/10`, and private-v4 smuggled via 6to4
@@ -57,14 +60,15 @@ the **attack** it closes, and the **control**. Status is tracked here as work la
   `block_private_ip` pre-check stays for literal IPs + a clean in-band `HTTP_SSRF_BLOCKED`. +3
   tests (wildcard gating + the resolver filter, hermetic via IP literals).
 
-## Remaining follow-ups (7–8)
-
-- **7 — mail abuse controls.** A script picks arbitrary `to`/subject/body against the operator's
-  SMTP relay (open spam cannon if scripts are untrusted). `max_recipients` exists; add an operator
-  recipient-domain allowlist and a per-execution send cap.
-- **8 — ReDoS vs interrupt.** Confirm the wall-clock interrupt preempts catastrophic-backtracking
-  regex in QuickJS (the interrupt fires between ops; libregexp may not yield). One adversarial
-  test (`/(a+)+$/` on a long non-match) settles it.
+- **7 — mail abuse controls** (`mail.rs`): `MailConfig.allowed_recipient_domains` (empty =
+  unrestricted) rejects any recipient whose domain is off-list, case-insensitively — so an
+  untrusted handler can't aim the operator's relay anywhere. `MailConfig.max_sends` caps
+  `mail.send` calls per execution (effective cap `min(max_sends, max_ops)`). +4 tests.
+- **8 — ReDoS vs interrupt** (`engine.rs` test): **verified the interrupt preempts it.** A
+  `/(a+)+$/` against a 30-`a` non-match aborts at the ~250 ms interrupt deadline, not the
+  multi-second uninterrupted runtime — so this rquickjs/QuickJS build's libregexp *does* honor
+  the interrupt handler during matching, and ReDoS stays bounded by the execution timeout (no
+  separate mitigation needed). Kept as a regression test.
 
 ## Log
 
@@ -73,3 +77,6 @@ the **attack** it closes, and the **control**. Status is tracked here as work la
   clean, `cargo clippy --all-targets` 0 errors, `cargo test` 36 passed.
 - Landed item 2 (DNS-rebind pinning via `reqwest::dns::Resolve`). Gauntlet green: fmt clean,
   clippy 0 errors, `cargo test` 39 passed. Remaining: 7 (mail abuse), 8 (ReDoS verification).
+- Landed item 7 (mail allowlist + send cap) and verified item 8 (interrupt preempts ReDoS — kept
+  as a regression test). All nine items resolved. Gauntlet green: fmt clean, clippy 0 errors,
+  `cargo test` 44 passed.

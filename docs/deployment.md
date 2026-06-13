@@ -133,6 +133,12 @@ a script can only ever return the `"[secret:NAME]"` placeholder, never the value
 sensitive (it carries DB passwords, SMTP creds): terminate TLS in front of jsbox, and don't log
 request bodies.
 
+**Mail relay abuse (untrusted scripts).** A handler chooses its own `to`/subject/body against the
+operator's SMTP relay, so for untrusted scripts constrain it in `config.mail`: set
+`allowed_recipient_domains` (a recipient whose domain is off-list is rejected before send) and
+`max_sends` (per-execution cap on `mail.send`, on top of `max_recipients` per message). Together
+they keep a handler from turning the relay into an open spam cannon.
+
 ## 7. Kubernetes specifics
 
 - **Graceful shutdown.** jsbox handles `SIGTERM`/Ctrl-C and drains in-flight requests
