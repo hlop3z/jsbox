@@ -5,6 +5,10 @@ as of `main` (2026-06). Companion to [script-registry.md](script-registry.md).
 A `pgbouncer` service (transaction mode) ships in `docker-compose.yml`, and the
 integration suite runs the full db section through it to prove the claim below.
 
+> **Behavioral contract → [`openspec/specs/db`](../../openspec/specs/db/spec.md) and
+> [`openspec/specs/resilience`](../../openspec/specs/resilience/spec.md).** This note is the
+> **rationale** for the per-execution-connection + external-pooler decision (the "why").
+
 ## Decision
 
 **Solve connection churn with mature external infrastructure (PgBouncer et al.), not

@@ -4,6 +4,11 @@ Status: **Tiers 0, 1, 2, 3, 5 implemented**, **Tier 4 wired + exercised** (opera
 all (2026-06). Companion to [pooled-capabilities.md](pooled-capabilities.md). Grounded in the
 code as of `main`.
 
+> **Behavioral contract → [`openspec/specs/resilience`](../../openspec/specs/resilience/spec.md).**
+> The testable requirements for each tier (clamp, bulkhead, deadline, breaker, partition
+> fairness) live there. This note is the **rationale**: why each layer exists, the async-Rust
+> pitfalls, and the measured A/B results — the "why" a spec doesn't carry.
+
 ## The principle
 
 Enterprise resilience for a timeout is never a single mechanism — it is **defense in
@@ -191,7 +196,7 @@ legitimately long query), so the value is operator-tuned to the workload's real 
 The resilience tiers are only operable if you can _see_ them fire. jsbox exposes a
 dependency-free Prometheus text endpoint (`src/metrics.rs`, no client library) with
 process-wide atomic counters incremented on each request's terminal outcome, plus live
-gauges read at scrape time: `jsbox_executions_total{outcome}` (success / script_error /
+gauges read at scrape time: `jsbox_executions_total{outcome}` (success / script*error /
 capability_error / timeout / memory_limit / malformed_response / internal_error),
 `jsbox_rejections_total`, `jsbox_overload_total{scope}` (global bulkhead vs partition cap),
 `jsbox_db_breaker_trips_total`, and `jsbox_bulkhead_permits_available` / `_total`. So shed
@@ -203,7 +208,7 @@ computed at the dashboard, not pre-baked. The buckets are integer-microsecond co
 the hot path (no float), and the implicit `+Inf` bucket plus `_sum`/`_count` follow the
 standard exposition. Per-capability op latency is exposed the same way as a single labeled
 family `jsbox_capability_op_duration_seconds{capability="db"|"http"|"mail"|"s3"|"redis"|"amq"|"auth"}`
-(fed from the per-op `duration_us` already drained into `meta`), so a slow _downstream_ is
+(fed from the per-op `duration_us` already drained into `meta`), so a slow \_downstream* is
 attributable — not just a slow total execution.
 
 ## Learning from big companies' async-in-Rust mistakes

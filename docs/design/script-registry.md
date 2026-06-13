@@ -4,6 +4,10 @@ Status: **Phase A implemented** (2026-06): `src/registry.rs`, `scripts_dir` in
 `config.json`, `script` XOR `key` in the handler, `meta.key` echo. Phase B+ remains
 deferred as described below.
 
+> **Behavioral contract → [`openspec/specs/script-registry`](../../openspec/specs/script-registry/spec.md).**
+> This note is the **rationale** — why deploy-time registration, the in-memory/no-traversal
+> safety, and what Phase B+ would add (the "why" and the road not taken).
+
 ## Idea
 
 `POST /execute` accepts **either** of:

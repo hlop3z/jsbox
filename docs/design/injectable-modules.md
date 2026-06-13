@@ -13,6 +13,10 @@ module (`export default function handler`), `import`s registered modules from
 `modules_dir`, and the `use()` bridge was dropped as unnecessary. See "Implementation"
 immediately below; the "Loader API"/`use()` sections are retained as superseded rationale.
 
+> **Behavioral contract → [`openspec/specs/module-registry`](../../openspec/specs/module-registry/spec.md)**
+> (and [`execution`](../../openspec/specs/execution/spec.md) for handler-as-module). This note is
+> the **rationale** — the trust model, the lessons table, and the `use()`-vs-ESM decision trail.
+
 ## Implementation (Revision 4 — what shipped)
 
 - **`modules_dir`** (`config.json`) loads `*.js` / `*.mjs` into an immutable
@@ -194,77 +198,18 @@ as a clean later escalation if the `import { x } from` ergonomics in handlers pr
 breaking change. None of this changes the trigger question (Q1 below): build it when 2–3 real
 helpers exist, not before — the difference is that _when_ we build it, the format is ESM.
 
-## Loader API: `use("name")` — the proposed shape (Phase A, when/if implemented)
+## Alternative considered: the `use("name")` loader (superseded)
 
-Scripts pull modules in explicitly, instead of the platform injecting globals:
+Revisions 2–3 proposed a synchronous `use("acme/pricing")` loader function (the script
+names its own binding) instead of native `import`, with Lua/CJS completion-value semantics
+(`({ quote: quote })` as the export), per-request memoization, transitive `use` with cycle
+detection, and a `meta.modules` audit. Revision 4 **dropped it**: native ESM `import` (which
+rquickjs supports synchronously, see "Native ESM" above) made a bespoke loader redundant —
+a handler-module imports directly, the format is the 2026 standard, and `MODULE_NOT_FOUND` /
+sandbox-budget / read-only-registry properties all carried over. The `use()` design is kept
+here only as the decision trail. (Full prior text: git history.)
 
-```js
-function handler(ctx) {
-  var pricing = use("acme/pricing"); // script author picks the binding name
-  return json(pricing.quote(ctx.items), null);
-}
-```
-
-Why a loader beats auto-injected globals (the earlier revision of this doc):
-
-- **Namespacing is solved by construction.** The script names its own binding, so
-  global-name collisions — the Salesforce-soup failure mode — can't happen. The
-  reserved-name machinery mostly evaporates (only `use` itself joins the built-ins).
-- **The dependency declaration lives in the code.** `config.modules` on every
-  request and a `// @modules` directive for registered scripts both disappear —
-  callers don't need to know what a script uses.
-- **Lazy, pay-per-use.** A module evals only if and when requested; `meta.modules`
-  reports what was _actually_ loaded (better audit than a config list).
-- **Mechanically trivial because jsbox is synchronous.** `use` is a native function
-  (the same `Function::new` pattern as `__db`) holding an `Arc<ModuleRegistry>`; on
-  first call it evals the module source in the current context and memoizes the
-  result per request. No async-loading problem.
-
-### Semantics to commit to
-
-1. **Export contract = completion value.** QuickJS `eval` returns the script's
-   completion value, so a module file is plain code whose final expression is its
-   export — Lua's `require` semantics, battle-tested for decades. No `module.exports`
-   object, no bespoke format:
-   ```js
-   // modules/acme/pricing.js
-   function quote(items) {
-     /* ... */
-   }
-   ({ quote: quote }); // ← the export
-   ```
-2. **Memoized per request.** Two `use("x")` calls in one execution return the same
-   instance; a fresh context next request gets a fresh instance. State never leaks.
-3. **Transitive `use` allowed, flat tree.** Modules may call `use` (forbidding it
-   would surprise more than it protects; the Salesforce/OSGi pain was _versioned
-   package graphs_, not function calls within one operator-owned tree). Guardrails:
-   memoization handles diamonds, cycle detection throws, small depth cap (~8).
-4. **Unknown module → structured runtime error** (`MODULE_NOT_FOUND`, owner:
-   developer, not retryable) via the existing tagged-error path. Dynamic names
-   (`use(ctx.x)`) are legal but discouraged; for registered scripts the registry
-   additionally best-effort scans `use("literal")` calls at load as a fail-fast
-   lint — a warning, not a guarantee.
-5. **`modules_dir`** in `config.json`; immutable `ModuleRegistry` loaded at startup
-   (same code shape as `ScriptRegistry`): size cap per file plus a **scratch-eval
-   syntax check** in a throwaway runtime so a broken module fails the boot, not a
-   customer request.
-6. **Meta:** `meta.modules` lists the keys actually loaded during the execution.
-7. **`use` survives `sanitize_globals`** (it is not `eval` — it can only reach the
-   immutable registry), and module code runs under the same memory/timeout/stack/
-   `max_ops` limits as everything else in the context.
-
-One consciously accepted tension: the lessons table says "no bespoke `require()`".
-The refined rule is **no bespoke module _format_** — `use` keeps the format minimal
-(a file evaluates to its export) and adopts well-trodden CJS/Lua _loader_ semantics.
-Real ESM would change jsbox's whole eval model (rquickjs `Module` API, different
-lifecycle) and stays out of scope; `use("x")` maps 1:1 onto dynamic `import()` if
-that migration ever happens.
-
-Everything else — `pool.rs`, capabilities, error taxonomy, both existing registries —
-untouched. Estimated size is similar to script-registry Phase A plus the memoization/
-cycle-detection logic (~20 lines).
-
-### Explicitly out of scope (the "won't do" list)
+## Out of scope (the "won't do" list)
 
 - Runtime module registration/mutation (same reasoning as script-registry Phase B).
 - Version ranges or any resolution algorithm (transitive `use` is allowed, but a

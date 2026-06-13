@@ -68,7 +68,10 @@ For builders and operators (a bit more advanced):
   (with npm/esbuild) that your handlers can share.
 - **[Deployment & hardening](deployment.md)** — the production checklist: what to set
   before you point real traffic at it, and why.
-- **Design notes** — the architecture deep-dives: [resilience](design/resilience.md)
+- **Behavioral contract (specs)** — the testable "what the system guarantees" lives in
+  [`openspec/specs/`](../openspec/specs/) (capabilities, execution, resilience, registries,
+  observability). Browse with `openspec list --specs` / `openspec show <name>`.
+- **Design notes (rationale)** — the architecture deep-dives, the "why": [resilience](design/resilience.md)
   (timeouts, bulkheads, circuit breaker), [pooled capabilities](design/pooled-capabilities.md)
   (PgBouncer), [script registry](design/script-registry.md), and
   [injectable modules](design/injectable-modules.md).
