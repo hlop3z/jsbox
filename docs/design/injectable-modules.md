@@ -1,324 +1,193 @@
-# Design note: injectable modules (operator-authored JS libraries)
+# Injectable modules (operator-authored JS libraries)
 
-Status: **native ESM implemented (2026-06); `use()` loader not built (superseded).**
 Companion to [script-registry.md](script-registry.md) and
 [pooled-capabilities.md](pooled-capabilities.md).
-Revision 2: the loader-function shape (`use("name")`) replaced auto-injected
-globals as the proposed Phase A — see "Loader API" below for why.
-Revision 3 (explored 2026-06): **native ES modules are feasible** — this reverses
-the earlier "ESM out of scope" call. rquickjs ships the full module loader, and a
-spike proved synchronous `import`/`export` in jsbox's pooled `spawn_blocking` model.
-Revision 4 (built 2026-06): shipped **Shape B** — the handler is authored as an ES
-module (`export default function handler`), `import`s registered modules from
-`modules_dir`, and the `use()` bridge was dropped as unnecessary. See "Implementation"
-immediately below; the "Loader API"/`use()` sections are retained as superseded rationale.
 
 > **Behavioral contract → [`openspec/specs/module-registry`](../../openspec/specs/module-registry/spec.md)**
-> (and [`execution`](../../openspec/specs/execution/spec.md) for handler-as-module). This note is
-> the **rationale** — the trust model, the lessons table, and the `use()`-vs-ESM decision trail.
+> (and [`execution`](../../openspec/specs/execution/spec.md) for handler-as-module). This note carries the
+> **rationale** — the trust model, the platform-lessons principles, and the ESM design.
 
-## Implementation (Revision 4 — what shipped)
+## Purpose
+
+Injectable modules let internal developers author reusable JS libraries that
+customer scripts compose with inside the sandbox: validation helpers, a pricing
+engine, a company-SDK wrapper around `db`/`api`, formatting utilities. Customers
+write less boilerplate; internal teams ship a tool once instead of pasting snippets
+into every handler.
+
+## The tool trichotomy
+
+jsbox has three ways to ship functionality to scripts, and they are **not
+interchangeable** — picking the wrong one is the root of most failure modes other
+platforms have hit:
+
+| You need…                                        | Build a…              | Why                                                                                                   |
+| ------------------------------------------------ | --------------------- | ----------------------------------------------------------------------------------------------------- |
+| I/O, secrets, metering, a real security boundary | **Rust capability**   | Only Rust-side code lives outside the sandbox. JS modules cannot hold secrets or enforce anything.    |
+| Logic the customer must NOT read or alter        | **Registered script** | The customer calls it by `key` and never sees source. Module source IS readable by customer code.     |
+| In-script helpers the customer composes with     | **Injectable module** | Plain JS in the same sandbox — convenient, composable, exactly as trusted as the customer's own code. |
+
+## The trust property (read this first)
+
+A JS module injected into the customer's context is **readable and patchable by the
+customer's script.** `Function.prototype.toString()` returns module source;
+assignment replaces module globals. Fresh-context-per-request means tampering only
+ever affects the tamperer's own execution, but a module therefore provides **zero
+confidentiality and zero integrity** against the script it shares a context with.
+
+This makes injectable modules suitable for _helpers_ (a SQL builder, validators,
+formatters) and unsuitable for _anything load-bearing_. License enforcement, hidden
+business rules, and input sanitization the platform relies on do not belong in a
+module — they belong in a Rust capability or a registered script. This rule is
+enforced in review, not in code, because it cannot be enforced in code.
+
+## How it fits the architecture
+
+The injection seam already exists and is exercised on every request. `engine.rs::run`
+evals operator-controlled JS into the fresh context before the user script:
+`bridge.js`, the Decimal global, `$sys`, and each capability wrapper (`src/js/*.js`
+via `include_str!`). An injectable module is the same mechanism with the source coming
+from a registry instead of the binary.
+
+- The registry pattern reuses the `ScriptRegistry` shape verbatim: a `modules_dir`
+  loaded once at startup into an immutable map keyed by relative path. Stateless,
+  replica-safe, deploy-time registration.
+- Fresh context per request keeps isolation airtight: module state cannot leak between
+  requests, and a script that breaks a module breaks only its own run.
+- Sandbox limits apply unchanged: module code runs under the same memory cap, timeout,
+  `max_ops`, and stack limit. Nothing new to meter.
+
+## Design principles (distilled from other platforms)
+
+Larger platforms got into trouble when shared code acquired **its own lifecycle**
+(versioning, resolution, mutation, trust) separate from the deployment lifecycle.
+jsbox's script registry deliberately has no such lifecycle, and modules inherit that
+property. The specific rules:
+
+- **Immutable deploy-time artifacts; explicit, flat composition.** A script that needs
+  a module names it; nothing is ambient. (AWS Lambda Layers' opaque integer versioning,
+  5-layer cap, and absent dependency resolution drove the ecosystem back to bundling code
+  with the function.)
+
+- **The module format is a permanent commitment, so it is minimal and standard.** Native
+  ESM is the format; no bespoke `module.exports` objects or custom resolution that would
+  have to be supported forever. (Cloudflare Workers' service-worker "everything is a global"
+  format cost years of migration and a compatibility-flag regime they still carry.)
+
+- **Reserved-name validation at load; no inter-module dependency graph.** A module may not
+  shadow `db`, `api`, `$`, `json`, `handler`, and similar globals. (Salesforce's global
+  namespace pollution and implicit cross-package dependencies — "Happy Soup" — produced a
+  decade-long 1GP→2GP repackaging.)
+
+- **No runtime mutation, no version ranges.** A module's content changes only via redeploy
+  and restart, atomically with everything else. If versioning is ever needed it is an
+  explicit name suffix (`pricing-v2`), not a resolver. (npm's mutable shared registry and
+  semver ranges produced left-pad and non-reproducible builds.)
+
+- **Static, load-time composition only.** No hot-reload, no module lifecycle, no unloading.
+  Restart is the reload mechanism — jsbox restarts in milliseconds. (OSGi/Jigsaw's dynamic
+  load/unload and classloader graphs were so complex the industry routed around them.)
+
+- **Plain QuickJS-compatible JS with no jsbox-specific magic.** Internal developers can
+  unit-test modules with any JS runner; the only contract is to define the export and touch
+  nothing else. (Google App Engine's forked/whitelisted stdlibs made code non-portable and
+  untestable, and were scrapped for standard runtimes.)
+
+- **Modules never get powers scripts don't have.** Anything needing real authority goes
+  through the Rust FFI like every capability. (Shopify Scripts' shared-library Ruby inside
+  the platform runtime became unsandboxable and was replaced by WASM functions with a strict
+  data-in/data-out boundary.)
+
+## Implementation (as built — native ESM)
+
+QuickJS is a native ES module engine and rquickjs exposes the whole surface, so modules
+are real ESM rather than a bespoke loader format.
 
 - **`modules_dir`** (`config.json`) loads `*.js` / `*.mjs` into an immutable
-  `ModuleRegistry` (`src/modules.rs`), specifier = relative path without extension — the
-  exact `ScriptRegistry` shape, including the in-memory-lookup / no-traversal safety.
-- **`RegistryResolver` + `RegistryLoader`** (`src/modules.rs`) wire that registry into each
-  pooled `Runtime` via `Runtime::set_loader` (the `loader` feature). Resolution is a pure
-  `HashMap` hit: a bare specifier resolves **iff** registered; `../`, `/etc/…`, and unknown
-  names fail — a script reaches only registered modules, never the filesystem.
+  `ModuleRegistry` (`src/modules.rs`); the specifier is the relative path without
+  extension — the exact `ScriptRegistry` shape, including in-memory lookup and
+  no-traversal safety.
+- **`RegistryResolver` + `RegistryLoader`** (`src/modules.rs`) wire that registry into
+  each pooled `Runtime` via `Runtime::set_loader` (the `loader` feature). Resolution is a
+  pure `HashMap` hit: a bare specifier resolves **iff** registered; `../`, `/etc/…`, and
+  unknown names fail. A script reaches only registered modules, never the filesystem.
 - **Handler-as-module** (`src/engine.rs`): `resolve_handler` detects a top-level `export`
-  ([`is_es_module`]), and in module mode `Module::declare(...).eval()` + `Promise::finish()`
+  (`is_es_module`), and in module mode `Module::declare(...).eval()` + `Promise::finish()`
   settles synchronously, then the handler is read from the namespace (`default`, else
   `handler`). Classic `function handler(ctx)` scripts keep running unchanged (script mode).
-- **Not built:** the `use("name")` synchronous loader. Native `import` made it redundant —
-  a handler-module imports directly. The sections below describing `use()` are kept as the
-  decision trail, not as the current API.
 - **`MODULE_NOT_FOUND`:** an unresolvable `import` (unknown specifier, `../`, `/etc/…`) is
   classified as a dedicated `MODULE_NOT_FOUND` error (owner: developer, not retryable, 422),
-  not a generic syntax error. The resolver/loader embed a sentinel (`modules::UNRESOLVED_MARKER`)
-  in the thrown exception that the engine matches structurally — self-controlled, so it
-  doesn't depend on rquickjs's wording.
-
-## Idea
-
-Let internal developers author reusable JS libraries ("modules") that customer
-scripts can use inside the sandbox: validation helpers, a pricing engine, a
-company-SDK wrapper around `db`/`api`, formatting utilities. Customers write less
-boilerplate; internal teams ship tools once instead of pasting snippets into every
-handler.
-
-## The tool trichotomy (decide which thing you're building first)
-
-jsbox would then have three ways to ship functionality to scripts, and they are
-**not interchangeable** — picking the wrong one is the root of most failures below:
-
-| You need…                                      | Build a…              | Why                                                                                                       |
-| ---------------------------------------------- | --------------------- | --------------------------------------------------------------------------------------------------------- |
-| I/O, secrets, metering, real security boundary | **Rust capability**   | Only Rust-side code is outside the sandbox. JS modules can't hold secrets or enforce anything.            |
-| Logic the customer must NOT read or alter      | **Registered script** | Customer calls it by `key` and never sees source. Module source IS readable by customer code (see below). |
-| In-script helpers the customer composes with   | **Injectable module** | Plain JS in the same sandbox — convenient, composable, and exactly as trusted as the customer's own code. |
-
-The hard truth that anchors this table: **a JS module injected into the customer's
-context is readable and patchable by the customer's script.**
-`Function.prototype.toString()` returns module source; assignment replaces module
-globals. Fresh-context-per-request means tampering only ever affects the tamperer's
-own execution (nobody else's), but it means modules provide **zero confidentiality
-and zero integrity** against the script they share a context with. Any plan that
-quietly assumes otherwise (license enforcement in a module, "hidden" business rules,
-input sanitization the platform relies on) is broken on day one. That logic belongs
-in a capability or a registered script.
-
-## How it fits the current architecture
-
-Mechanically this is the cheapest feature jsbox could add, because the injection
-seam already exists and is exercised four times per request:
-
-- `engine.rs::run` already evals operator-controlled JS into the fresh context
-  before the user script: `bridge.js`, the Decimal global, `$sys`, and each
-  capability wrapper (`src/js/*.js` via `include_str!`). An injectable module is
-  _literally the same mechanism_ with the source coming from a registry instead of
-  the binary.
-- The registry pattern from Phase A reuses verbatim: a `modules_dir` loaded once at
-  startup into an immutable map, keyed by relative path. Stateless, replica-safe,
-  deploy-time registration.
-- Fresh context per request keeps isolation airtight: module state cannot leak
-  between requests, and a script that breaks a module breaks only its own run.
-- Sandbox limits apply unchanged: module code runs under the same memory cap,
-  timeout, `max_ops`, and stack limit. Nothing new to meter.
-
-## Lessons from bigger platforms (what failed, and the rule we adopt)
-
-| Platform attempt                             | What went wrong                                                                                                                                                                                               | Rule for jsbox                                                                                                                                                                                                                                                                                                 |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **AWS Lambda Layers**                        | Opaque integer versioning, no dependency resolution, 5-layer cap, code invisible while debugging, cross-account sharing friction. The ecosystem largely abandoned layers for bundling code with the function. | Modules are **immutable deploy-time artifacts**, and composition is **explicit and flat**. If a script needs a module, it names it; nothing is ambient. Prefer "bundle at deploy" over "resolve at runtime".                                                                                                   |
-| **Cloudflare Workers service-worker format** | Started with "everything is a global in one scope"; migrating the ecosystem to ES modules took years and a compatibility-flag regime they still carry.                                                        | Whatever shape we pick is a **format commitment**. Keep it minimal (one file evaluates to its export; loaded via `use()`) so a future ESM migration maps 1:1 (`use("x")` → dynamic `import()`), and never invent a bespoke module _format_ (`module.exports` objects, custom resolution) we'd support forever. |
-| **Salesforce managed packages / Apex**       | Global namespace pollution, implicit cross-package dependencies ("Happy Soup"), version lock-in; the packaging redesign (1GP→2GP) took a decade.                                                              | **Reserved-name validation at load** (a module may not shadow `db`, `api`, `$`, `json`, `handler`, …) and **no inter-module dependencies in v1**. Flat list, alphabetical injection, no resolution algorithm.                                                                                                  |
-| **npm / left-pad**                           | Mutable shared registry: removing or changing a tiny package broke the world. Semver ranges made builds non-reproducible.                                                                                     | **No runtime mutation, no version ranges.** A module's content changes only via redeploy + restart, atomically with everything else. If versioning is ever needed, it's an explicit name suffix (`pricing-v2`), not a resolver.                                                                                |
-| **OSGi / Java Jigsaw**                       | Dynamic load/unload and classloader graphs were so complex the industry routed around them; Jigsaw took 20 years and still broke things.                                                                      | **Static, load-time composition only.** No hot-reload, no module lifecycle, no unloading. Restart is the reload mechanism — jsbox restarts in milliseconds.                                                                                                                                                    |
-| **Google App Engine restricted runtimes**    | Forked/whitelisted stdlibs made code non-portable and untestable outside the platform; eventually scrapped for standard runtimes.                                                                             | Modules are **plain QuickJS-compatible JS with no jsbox-specific magic**, so internal devs can unit-test them with any JS runner. The only contract: define your global, touch nothing else.                                                                                                                   |
-| **Shopify Scripts (embedded Ruby)**          | Shared-library scripting inside the platform runtime became unsandboxable and unmaintainable; deprecated in favor of WASM functions with a strict data-in/data-out boundary.                                  | Keep the **boundary discipline**: modules never get powers scripts don't have. Anything needing real authority goes through the Rust FFI like every capability.                                                                                                                                                |
-
-The meta-lesson across all seven: platforms get into trouble when shared code
-acquires **its own lifecycle** (versioning, resolution, mutation, trust) separate
-from the deployment lifecycle. Phase A of the script registry deliberately has no
-such lifecycle — modules must inherit that property, not erode it.
-
-## Native ESM: what rquickjs gives us (Revision 3 — explored 2026-06)
-
-The original doc deferred real ES modules ("would change jsbox's whole eval model").
-That call was wrong, and exploring the dependency proved it. **QuickJS is a native ES
-module engine, and rquickjs 0.12 exposes the whole surface** — we already depend on it.
-
-### What's in the box (verified against `rquickjs-core-0.12.0`)
-
-- **`Module::declare(ctx, name, src)` / `.eval()`** — compile an ESM source (with
-  `import`/`export`) to a `Module`, then evaluate it. `Module::namespace()` → an `Object`
-  of its exports; `module.get("quote")` reads one.
-- **Pluggable in-memory loader.** `Runtime::set_loader(resolver, loader)` (behind the
-  `loader` feature) takes a `Resolver` + `Loader`. The built-in `BuiltinResolver` (a set of
-  known names) + `BuiltinLoader` (a `name → source` map) **are the module registry** — no
-  filesystem, no network, populated once at startup. Custom impls holding an
-  `Arc<ModuleRegistry>` are trivial if we want lazy source lookup.
+  not a generic syntax error. The resolver/loader embed a sentinel
+  (`modules::UNRESOLVED_MARKER`) in the thrown exception that the engine matches
+  structurally, so the classification does not depend on rquickjs's wording.
 - **Synchronous settle.** Module evaluation returns a `Promise` (QuickJS allows top-level
-  await), but `Promise::finish()` pumps the job queue to completion **synchronously** and
-  returns the value. Since every jsbox capability is sync FFI, a module never genuinely
-  suspends — it settles on the first pump. **No async runtime is introduced**; this fits the
-  `spawn_blocking` model exactly. The existing wall-clock interrupt still bounds it (the
-  interrupt fires during job execution).
-- **Bytecode caching: blocked, not free.** `Module::write(WriteOptions)` → bytecode is safe, but
-  reading it back is `unsafe Module::load(bytes)`, and jsbox sets `unsafe_code = "forbid"` — so
-  the "precompile at startup, skip per-request parse" idea is **not available** without relaxing
-  the unsafe ban. Measured cost makes it moot anyway (+201 µs/import, §Performance), but the
-  earlier "bytecode for free" note was wrong: it isn't, under the lint contract.
+  await), but `Promise::finish()` pumps the job queue to completion synchronously. Every
+  jsbox capability is sync FFI, so a module never genuinely suspends — it settles on the
+  first pump. No async runtime is introduced; this fits the `spawn_blocking` model exactly,
+  and the existing wall-clock interrupt still bounds it.
+- **Sandbox budget and read-only registry** apply unchanged: module code runs under the
+  same memory, timeout, `max_ops`, and stack limits as the handler, and the registry is
+  immutable after startup.
 
-### The spike (proof, since reverted)
+### Bytecode caching is blocked by `unsafe_code = "forbid"`
 
-A throwaway test under the `loader` feature passed on the first real run:
+`Module::write(WriteOptions)` to produce bytecode is safe, but reading it back is
+`unsafe Module::load(bytes)`. jsbox sets `unsafe_code = "forbid"`, so precompiling
+modules at startup to skip per-request parsing is not available without relaxing the
+unsafe ban. The measured saving (~201 µs/import, see Performance) does not justify that
+cost, so per-request compilation is the accepted floor.
 
-```rust
-// registry: "acme/pricing" -> `export function quote(items){ return items*10; }`
-let resolver = BuiltinResolver::default().with_module("acme/pricing");
-let loader = BuiltinLoader::default().with_module("acme/pricing", PRICING_SRC);
-rt.set_loader(resolver, loader);
-// consumer module imports it and re-exports a computed value:
-//   import { quote } from "acme/pricing"; export const total = quote(5);
-let (module, promise) = Module::declare(ctx, "main", SRC)?.eval()?;
-promise.finish::<()>()?;                       // ← synchronous, no executor
-let total: i32 = module.namespace()?.get("total")?;   // == 50
-```
+## Alternative considered: `use()` loader (superseded)
 
-A second assertion proved the **security property**: an `import` of an unregistered
-specifier (`"/etc/passwd"`) fails to resolve — because we wire only the in-memory
-`BuiltinResolver`, never `FileResolver`. Scripts can reach **only** registered modules.
+An earlier design proposed a synchronous `use("acme/pricing")` loader function — the
+script names its own binding — with completion-value export semantics, per-request
+memoization, transitive `use` with cycle detection, and a `meta.modules` audit. Native
+ESM `import` made it redundant: a handler-module imports directly, the format is the
+standard, and the `MODULE_NOT_FOUND`, sandbox-budget, and read-only-registry properties
+all carry over. Prior text is in git history.
 
-### Two integration shapes (the real decision)
+## Out of scope
 
-QuickJS has two eval modes that do **not** share scope: **script** (what jsbox uses now —
-the user's `function handler(ctx)` becomes a global) and **module** (own scope, strict,
-`import`/`export`, evaluates to a namespace). That split is what forces a choice:
+- Runtime module registration or mutation (same reasoning as script-registry Phase B).
+- Version ranges or any resolution algorithm — a name maps to exactly one file; no
+  versions, no fallbacks, no search paths.
+- `Object.freeze` on module globals: deferred. It adds a false sense of integrity
+  (deep-freeze is leaky through prototypes and closures) while breaking legitimate
+  test-stubbing patterns. Revisit only with a concrete threat it solves.
+- Per-module metering or billing — module code is indistinguishable from script code
+  inside the sandbox, so metering it separately is not honestly possible.
+- Bytecode caching of modules — blocked by the `unsafe_code = "forbid"` lint, for a
+  measured saving not worth relaxing the unsafe ban (see above).
 
-**Shape A — ESM modules, script handler (smallest change).** Module _files_ are native ESM
-(`export function quote(){}`), authored with npm/esbuild and dropped in. The handler stays a
-plain script and pulls them via `use("acme/pricing")`, where `use` is a native function that
-calls `Module::import(ctx, name).finish()` and returns the namespace (memoized per request).
-The handler contract, `sanitize_globals`, and the whole request path are untouched; only the
-module-loading seam is new. This is the natural evolution of the Revision 2 `use()` design —
-the difference is the _module format_ becomes real ESM instead of a completion-value file.
+## Performance
 
-**Shape B — handler-as-module (the full "1:1 ESM" experience).** The user script is itself
-compiled as a module and `export`s its handler; the handler then uses native
-`import { quote } from "acme/pricing"` directly. Cost: the request path changes
-(`eval_script` → `Module::evaluate` + read `handler` from the namespace), the
-"handler not defined" classification moves, and it's a **breaking change** to how handlers
-are authored (`function handler` → `export function handler` / `export default`).
-Backward-compat is possible by sniffing the source (`import`/`export` present → module, else
-script — QuickJS even has `JS_DetectModule`), at the price of a dual-mode eval path.
+Per-request cost is one extra module instantiation per requested module in the fresh
+context — the same class as the capability wrappers already eval'd today. Module objects
+live in the per-request heap under `memory_limit`, so a fat module eats the customer's own
+budget, which is the correct incentive.
 
-### "ESM or IIFE" — the npm-authoring goal
+Measured (`stress_breaker_esm.py`, sequential, tiny handlers, ~2.5 ms request floor):
+an export-default handler adds ~39 µs/request over a classic script (module vs script
+compile — negligible); a handler importing one small registry module adds ~201 µs/request
+(compile + resolve + the imported module's own compile and eval). Both are well under 10 %
+of the per-request floor. Keep imported modules small and few.
 
-The stated goal ("author with npm, drop in as ESM or IIFE") is satisfied by **standardizing
-on ESM** and letting the bundler do its job: `esbuild --bundle --format=esm --packages=bundle`
-turns a TS/npm module into one self-contained `.mjs` with no bare specifiers left to resolve
-at runtime (any remaining `import` is of _another jsbox module_, which the registry loader
-resolves). IIFE/CJS bundles still work too — but via the _old_ completion-value `use()` path,
-a different code branch; supporting both means `use()` sniffs the format. Recommendation: make
-**ESM the canonical format** (it is the 2026 default, every bundler emits it, and it maps 1:1
-to a future where handlers are modules), and treat legacy-IIFE as an optional convenience, not
-a parallel contract.
+## Intended consumer profile
 
-### Cost and the revised recommendation
+The target is **helper/utility tools extracted from observed repetition** in customer
+scripts — a SQL query builder on top of `db`, validation helpers, pagination and response
+shaping. Critical logic stays in Rust capabilities. This is the low-risk variant of the
+feature: no secrecy or integrity requirements, small files, negligible eval cost. Two
+authoring rules follow:
 
-Build cost is one feature flag (`loader`) — a small amount of resolver/loader machinery, no
-new crypto/native deps, musl-clean. Runtime cost is one module instantiation per requested
-module (same class as the capability-wrapper evals today; bytecode caching erases it later).
+- **Extract, don't speculate.** A module is born when the same pattern appears in ~3 real
+  scripts, not from an up-front SDK design that no code matches.
+- **Helpers must make the safe path the only path.** The SQL builder is the canonical
+  example: it always emits `{text, params}` pairs (parameterized `$1, $2` placeholders)
+  with no raw-string interpolation escape hatch. A convenience helper that made string-built
+  SQL easy would actively encourage injection in customer scripts — the one way a
+  "non-critical" helper causes critical damage.
 
-Recommendation: **adopt native ESM as the module format (Shape A first).** It directly answers
-"make modules use `export`," keeps the blast radius tiny, and leaves Shape B (handler-as-module)
-as a clean later escalation if the `import { x } from` ergonomics in handlers prove worth the
-breaking change. None of this changes the trigger question (Q1 below): build it when 2–3 real
-helpers exist, not before — the difference is that _when_ we build it, the format is ESM.
-
-## Alternative considered: the `use("name")` loader (superseded)
-
-Revisions 2–3 proposed a synchronous `use("acme/pricing")` loader function (the script
-names its own binding) instead of native `import`, with Lua/CJS completion-value semantics
-(`({ quote: quote })` as the export), per-request memoization, transitive `use` with cycle
-detection, and a `meta.modules` audit. Revision 4 **dropped it**: native ESM `import` (which
-rquickjs supports synchronously, see "Native ESM" above) made a bespoke loader redundant —
-a handler-module imports directly, the format is the 2026 standard, and `MODULE_NOT_FOUND` /
-sandbox-budget / read-only-registry properties all carried over. The `use()` design is kept
-here only as the decision trail. (Full prior text: git history.)
-
-## Out of scope (the "won't do" list)
-
-- Runtime module registration/mutation (same reasoning as script-registry Phase B).
-- Version ranges or any resolution algorithm (transitive `use` is allowed, but a
-  name maps to exactly one file — no versions, no fallbacks, no search paths).
-- ~~ES modules / `import` syntax — `use()` is the only loader; ESM would change the
-  whole eval model and is deferred until something forces it.~~ **Superseded by
-  Revision 3** (see "Native ESM" above): rquickjs makes synchronous ESM feasible, and it
-  is now the recommended module format. `use()` survives as the sync bridge for a
-  script-mode handler (Shape A); native `import` in the handler is the Shape-B escalation.
-- `Object.freeze` on module globals: considered and **deferred** — it adds a false
-  sense of integrity (deep-freeze is leaky: prototypes, closures) while breaking
-  legitimate test-stubbing patterns. Revisit only with a concrete threat it solves.
-- Per-module metering/billing — module code is indistinguishable from script code
-  inside the sandbox; metering it separately is not honestly possible.
-- Bytecode caching of modules — **blocked** by the `unsafe_code = "forbid"` lint:
-  reading precompiled bytecode is `unsafe Module::load`. Would require relaxing the unsafe
-  ban (a real cost) for a measured saving of ~201 µs/import — not worth it today.
-
-## Performance note
-
-Per-request cost is one extra `eval` per requested module in the fresh context —
-roughly the same class as the capability wrappers already eval'd today (tens of µs
-per KB-scale file). A 100 KB SDK costs ~low-single-digit ms per request; fine at
-moderate volume, and the bytecode-cache evolution erases it if it ever matters.
-Memory: module objects live in the per-request heap, under `memory_limit` — a fat
-module eats the customer's own budget, which is the correct incentive.
-
-**Measured** (`stress_breaker_esm.py`, sequential, tiny handlers, ~2.5 ms request floor):
-a handler authored as a module adds **+39 µs/request** over a classic script (module vs
-script compile — negligible), and a handler that `import`s one small registry module adds
-**+201 µs/request** (compile + resolve + the imported module's own compile/eval). Both are
-well under 10 % of the per-request floor. Bytecode caching would shave the import cost but is
-blocked by the unsafe-forbid lint (see the "out of scope" list), so this is the accepted floor —
-keep imported modules small and few.
-
-## Intended consumer profile (answered 2026-06)
-
-The target is **helper/utility tools extracted from observed repetition** in
-customer scripts — e.g. a SQL query builder on top of `db`, validation helpers,
-pagination/response shaping. Explicitly _not_ critical logic (that stays in Rust
-capabilities). This is the low-risk variant of the feature: no secrecy or integrity
-requirements, small files, negligible eval cost. Two working rules follow:
-
-- **Extract, don't speculate.** A module is born when the same pattern shows up in
-  ~3 real scripts, not from an up-front SDK design nobody's code matches.
-- **Helpers must make the safe path the only path.** The SQL builder is the
-  canonical example: it must always emit `{text, params}` pairs (parameterized
-  `$1, $2` placeholders) with **no raw-string interpolation escape hatch** —
-  a convenience helper that makes string-built SQL easy would actively encourage
-  injection in customer scripts, which is the one way a "non-critical" helper
-  causes critical damage.
-
-## Remaining decision input before building
-
-1. Do customers ever supply their _own_ modules? (Today's answer should be no —
-   that's just inline script code they can paste/bundle themselves. A customer
-   module registry would be a different, bigger feature.)
-2. Timing: the mechanism is cheap (~script-registry-sized), but per "extract,
-   don't speculate", build it when the first 2–3 concrete helpers exist as proven
-   snippets — not before.
-
-## Questions for you (these gate whether/when we build it)
-
-> Added 2026-06 while per-capability histograms were being built. Read at your
-> leisure; your answers turn this from a proposal into a yes/no with a scope.
-
-The code is the easy part (~script-registry-sized + ~20 lines of memoization/cycle
-detection). The risk is entirely in the **lifecycle and trust** decisions the
-lessons table warns about. Six questions, roughly in priority order:
-
-1. **Is the trigger met yet?** The doc's own rule is "extract, don't speculate —
-   a module is born when the same pattern shows up in ~3 real scripts." **Do we
-   actually have 2–3 concrete, repeated helper snippets in real customer scripts
-   today?** If not, my recommendation is to _not build it yet_ and instead start a
-   one-paragraph "candidate helpers" log; the feature lands the day the third
-   repeat appears. (This is the single most important answer — everything below is
-   moot if the trigger isn't met.)
-
-2. **Confirm the consumer is operator-only.** The plan assumes **internal devs
-   author modules, customers only consume them** (no customer-supplied module
-   registry — that's a much bigger feature with a real trust boundary). Still true?
-
-3. **Confirm the trust model is acceptable for the intended use.** A JS module is
-   **readable and patchable by the customer script it shares a context with** —
-   zero confidentiality, zero integrity (only the tamperer's own request is
-   affected, but still). That's fine for _helpers_ (a SQL builder, validators) and
-   fatal for _anything load-bearing_ (license checks, hidden pricing, sanitization
-   the platform relies on). Do you agree to the hard rule: **modules are
-   convenience only; anything needing authority or secrecy goes in a Rust
-   capability or a registered script** — and we enforce that socially/in review,
-   not in code (because we can't)?
-
-4. **Loader shape: `use("name")` vs auto-injected globals.** Revision 2 proposes a
-   `use("acme/pricing")` loader (script names its own binding; lazy; `meta.modules`
-   audits what actually loaded) over auto-injecting globals from a config list. Do
-   you endorse the loader shape as the format commitment? (It's the one thing we'd
-   support ~forever; it maps 1:1 to dynamic `import()` if ESM ever happens.)
-
-5. **Transitive `use` in v1: allow or forbid?** Proposed: **allow** modules to call
-   `use`, with memoization for diamonds, cycle detection that throws, and a small
-   depth cap (~8) — the Salesforce/OSGi pain was _versioned package graphs_, not
-   function calls in one operator-owned tree. The conservative alternative is a
-   **flat, no-transitive** v1 (a module may not call `use`) that we relax later.
-   Which risk posture do you want for the first cut?
-
-6. **First proving module.** The doc names a **parameterized SQL builder** (always
-   emits `{text, params}`, no raw-string escape hatch) as the canonical first
-   helper. Is that the one we build alongside the mechanism to validate the design,
-   or do you have a different first candidate in mind?
-
-A "no / not yet" on Q1 is a perfectly good outcome — it just means we log candidates
-and revisit. If Q1 is "yes", answers to 2–6 are enough to start.
+Customers do not supply their own modules. Customer-authored code is just inline script
+they can paste or bundle themselves; a customer module registry would be a separate, larger
+feature with a real trust boundary.
