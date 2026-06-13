@@ -70,8 +70,8 @@ Deploy PgBouncer between jsbox and Postgres; point `config.db.host` at it.
       code): set the cap server-side where every server session inherits it —
       `ALTER ROLE <user> SET statement_timeout = '<ms>'`, a per-database default, or a
       PgBouncer `connect_query`/`server_reset_query`. The trade-off is that the
-      per-request `config.db.statement_timeout_ms` is then not honored *through a
-      transaction-mode pooler* (it still is on direct connections and session-mode
+      per-request `config.db.statement_timeout_ms` is then not honored _through a
+      transaction-mode pooler_ (it still is on direct connections and session-mode
       pooling, where the `SET` is left in place).
     - **True per-request enforcement through a txn-mode pooler would need code**: a
       `Client::cancel_token()` watchdog that cancels the query after the deadline from

@@ -136,7 +136,8 @@ filesystem access** — a script can `import` only registered modules; an unknow
 traversal specifier (`../`, `/etc/…`) never resolves. Modules run in the same sandbox as
 the handler (same memory/timeout/`max_ops` budget) and are read-only at runtime, like the
 script registry. Author them with any bundler (`esbuild --bundle --format=esm`) and drop
-the output in. Design notes: [`docs/design/injectable-modules.md`](docs/design/injectable-modules.md).
+the output in. Authoring how-to: [`docs/modules.md`](docs/modules.md); design notes:
+[`docs/design/injectable-modules.md`](docs/design/injectable-modules.md).
 
 ### Operational endpoints
 
@@ -152,16 +153,16 @@ GET /metrics   -> 200 Prometheus text (version 0.0.4)
 counters plus live resilience signals — so a dashboard or alert can watch shed load and a
 flapping database without parsing logs:
 
-| Metric                            | Type    | Labels                          | Meaning                                                       |
-| --------------------------------- | ------- | ------------------------------- | ------------------------------------------------------------- |
-| `jsbox_executions_total`          | counter | `outcome` (`success`, `script_error`, `capability_error`, `timeout`, `memory_limit`, `malformed_response`, `internal_error`) | Executions by terminal outcome.                               |
-| `jsbox_rejections_total`          | counter | —                               | Requests rejected before execution (bad body, routing, oversized). |
-| `jsbox_overload_total`            | counter | `scope` (`global`, `partition`) | Requests shed by the bulkhead (Tier 1) / partition cap (Tier 5). |
-| `jsbox_db_breaker_trips_total`    | counter | —                               | Cumulative db circuit-breaker open transitions (Tier 3).      |
-| `jsbox_bulkhead_permits_available`| gauge   | —                               | Free global bulkhead permits right now.                       |
-| `jsbox_bulkhead_permits_total`    | gauge   | —                               | Configured global bulkhead capacity.                          |
-| `jsbox_execution_duration_seconds`| histogram | `le`                          | Execution wall-clock latency (`_bucket`/`_sum`/`_count`; executions that ran). |
-| `jsbox_capability_op_duration_seconds`| histogram | `capability` (`db`/`http`/`mail`/`s3`/`redis`/`amq`/`auth`), `le` | Per-capability op latency — which downstream is slow, not just total exec time. |
+| Metric                                 | Type      | Labels                                                                                                                       | Meaning                                                                         |
+| -------------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `jsbox_executions_total`               | counter   | `outcome` (`success`, `script_error`, `capability_error`, `timeout`, `memory_limit`, `malformed_response`, `internal_error`) | Executions by terminal outcome.                                                 |
+| `jsbox_rejections_total`               | counter   | —                                                                                                                            | Requests rejected before execution (bad body, routing, oversized).              |
+| `jsbox_overload_total`                 | counter   | `scope` (`global`, `partition`)                                                                                              | Requests shed by the bulkhead (Tier 1) / partition cap (Tier 5).                |
+| `jsbox_db_breaker_trips_total`         | counter   | —                                                                                                                            | Cumulative db circuit-breaker open transitions (Tier 3).                        |
+| `jsbox_bulkhead_permits_available`     | gauge     | —                                                                                                                            | Free global bulkhead permits right now.                                         |
+| `jsbox_bulkhead_permits_total`         | gauge     | —                                                                                                                            | Configured global bulkhead capacity.                                            |
+| `jsbox_execution_duration_seconds`     | histogram | `le`                                                                                                                         | Execution wall-clock latency (`_bucket`/`_sum`/`_count`; executions that ran).  |
+| `jsbox_capability_op_duration_seconds` | histogram | `capability` (`db`/`http`/`mail`/`s3`/`redis`/`amq`/`auth`), `le`                                                            | Per-capability op latency — which downstream is slow, not just total exec time. |
 
 ## JS API
 
@@ -557,6 +558,9 @@ Config: `{ "auth": { "issuer": "https://login.example.com", "userinfo_url": null
 
 ## Configuration
 
+> Running it for real? See **[`docs/deployment.md`](docs/deployment.md)** — the production
+> hardening checklist (what to set before you point traffic at it, and why).
+
 Optional `config.json` in the working directory. All fields have defaults:
 
 ```json
@@ -581,24 +585,24 @@ Optional `config.json` in the working directory. All fields have defaults:
 }
 ```
 
-| Field              | Default    | Description                                                                                                                            |
-| ------------------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `debug`            | `false`    | **Dev only.** Relaxes the SSRF private-IP block for `s3`/`api` so localhost/LAN targets (e.g. MinIO) work. Never enable in production. |
-| `error_debug`      | `true`     | Include `error.debug` (stack traces) in system-error responses. Set `false` at an exposed edge to omit them.                           |
-| `memory_limit`     | `"32mb"`   | Max JS heap per execution                                                                                                              |
-| `max_stack_size`   | `"512kb"`  | Max native call stack (recursion depth)                                                                                                |
-| `timeout_ms`       | `4000`     | Max wall-clock execution time                                                                                                          |
-| `pool_size`        | `0` (auto) | QuickJS runtime pool size (0 = CPU cores)                                                                                              |
-| `max_script_size`  | `"1mb"`    | Max script source size                                                                                                                 |
-| `max_context_size` | `0` (auto) | Max context JSON size. `0` auto-derives `memory_limit / 8`; explicit values are capped at `memory_limit / 4` (boot fails if exceeded). |
-| `max_ops`          | `1500`     | Max HTTP + DB operations per execution                                                                                                 |
-| `max_concurrent_executions` | `0` (auto) | Bulkhead: max in-flight executions. `0` auto-derives `pool_size × 16`. Excess load fast-fails `429 OVERLOADED`. Tune to your DB/PgBouncer connection budget. |
-| `max_statement_timeout_ms`  | `0` (off)  | Operator ceiling for `db` `statement_timeout`. `0` = no ceiling. Clamps per-request `statement_timeout_ms` (a request `0` becomes this). See [resilience note](docs/design/resilience.md). |
-| `max_concurrent_per_partition` | `0` (off) | Per-partition fairness (per-pod backstop): max concurrent executions per `X-Partition-Key` (or `partition` field). `0` = off. A key over its share fast-fails `429 PARTITION_OVERLOADED` even when global capacity remains, so one noisy key can't monopolize a pod. Not a global guarantee — the gateway owns global fairness. |
-| `partition_buckets`         | `0` (256)  | Hashed partition buckets (used only when `max_concurrent_per_partition > 0`). More buckets = fewer key collisions. |
-| `db_breaker_threshold`      | `0` (off)  | Circuit breaker: consecutive `db` connect failures (per `host:port`) that trip the breaker open. `0` = off. While open, `db` requests fast-fail `DB_CIRCUIT_OPEN` instead of waiting on the connect timeout to a dead database. |
-| `db_breaker_cooldown_ms`    | `0` (5000) | How long the `db` breaker stays open before a half-open probe (used only when `db_breaker_threshold > 0`). |
-| `scripts_dir`      | _(unset)_  | Directory of registered scripts for execute-by-key. Unset = inline `script` only; `key` requests answer `SCRIPT_NOT_FOUND`.            |
+| Field                          | Default    | Description                                                                                                                                                                                                                                                                                                                     |
+| ------------------------------ | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `debug`                        | `false`    | **Dev only.** Relaxes the SSRF private-IP block for `s3`/`api` so localhost/LAN targets (e.g. MinIO) work. Never enable in production.                                                                                                                                                                                          |
+| `error_debug`                  | `true`     | Include `error.debug` (stack traces) in system-error responses. Set `false` at an exposed edge to omit them.                                                                                                                                                                                                                    |
+| `memory_limit`                 | `"32mb"`   | Max JS heap per execution                                                                                                                                                                                                                                                                                                       |
+| `max_stack_size`               | `"512kb"`  | Max native call stack (recursion depth)                                                                                                                                                                                                                                                                                         |
+| `timeout_ms`                   | `4000`     | Max wall-clock execution time                                                                                                                                                                                                                                                                                                   |
+| `pool_size`                    | `0` (auto) | QuickJS runtime pool size (0 = CPU cores)                                                                                                                                                                                                                                                                                       |
+| `max_script_size`              | `"1mb"`    | Max script source size                                                                                                                                                                                                                                                                                                          |
+| `max_context_size`             | `0` (auto) | Max context JSON size. `0` auto-derives `memory_limit / 8`; explicit values are capped at `memory_limit / 4` (boot fails if exceeded).                                                                                                                                                                                          |
+| `max_ops`                      | `1500`     | Max HTTP + DB operations per execution                                                                                                                                                                                                                                                                                          |
+| `max_concurrent_executions`    | `0` (auto) | Bulkhead: max in-flight executions. `0` auto-derives `pool_size × 16`. Excess load fast-fails `429 OVERLOADED`. Tune to your DB/PgBouncer connection budget.                                                                                                                                                                    |
+| `max_statement_timeout_ms`     | `0` (off)  | Operator ceiling for `db` `statement_timeout`. `0` = no ceiling. Clamps per-request `statement_timeout_ms` (a request `0` becomes this). See [resilience note](docs/design/resilience.md).                                                                                                                                      |
+| `max_concurrent_per_partition` | `0` (off)  | Per-partition fairness (per-pod backstop): max concurrent executions per `X-Partition-Key` (or `partition` field). `0` = off. A key over its share fast-fails `429 PARTITION_OVERLOADED` even when global capacity remains, so one noisy key can't monopolize a pod. Not a global guarantee — the gateway owns global fairness. |
+| `partition_buckets`            | `0` (256)  | Hashed partition buckets (used only when `max_concurrent_per_partition > 0`). More buckets = fewer key collisions.                                                                                                                                                                                                              |
+| `db_breaker_threshold`         | `0` (off)  | Circuit breaker: consecutive `db` connect failures (per `host:port`) that trip the breaker open. `0` = off. While open, `db` requests fast-fail `DB_CIRCUIT_OPEN` instead of waiting on the connect timeout to a dead database.                                                                                                 |
+| `db_breaker_cooldown_ms`       | `0` (5000) | How long the `db` breaker stays open before a half-open probe (used only when `db_breaker_threshold > 0`).                                                                                                                                                                                                                      |
+| `scripts_dir`                  | _(unset)_  | Directory of registered scripts for execute-by-key. Unset = inline `script` only; `key` requests answer `SCRIPT_NOT_FOUND`.                                                                                                                                                                                                     |
 
 Size fields accept `"8mb"`, `"256kb"`, `"1gb"`, or plain numbers in bytes.
 

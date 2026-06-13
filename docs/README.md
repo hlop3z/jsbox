@@ -59,3 +59,16 @@ they're **always on**, no config. Only `$sys.env` / `$sys.secrets` need `config.
 
 If you don't turn a super-power on, the robot simply doesn't have it. (For example,
 if there's no `config.mail`, then `mail` is `undefined` — it isn't there at all.)
+
+## Going further 🛠️
+
+For builders and operators (a bit more advanced):
+
+- **[Authoring modules](modules.md)** — write reusable `import`able helper libraries
+  (with npm/esbuild) that your handlers can share.
+- **[Deployment & hardening](deployment.md)** — the production checklist: what to set
+  before you point real traffic at it, and why.
+- **Design notes** — the architecture deep-dives: [resilience](design/resilience.md)
+  (timeouts, bulkheads, circuit breaker), [pooled capabilities](design/pooled-capabilities.md)
+  (PgBouncer), [script registry](design/script-registry.md), and
+  [injectable modules](design/injectable-modules.md).

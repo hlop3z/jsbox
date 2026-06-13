@@ -121,9 +121,11 @@ module engine, and rquickjs 0.12 exposes the whole surface** — we already depe
   suspends — it settles on the first pump. **No async runtime is introduced**; this fits the
   `spawn_blocking` model exactly. The existing wall-clock interrupt still bounds it (the
   interrupt fires during job execution).
-- **Bytecode for free.** `Module::write(WriteOptions)` → bytecode; `unsafe Module::load(bytes)`
-  reads it back. The earlier "bytecode caching" Phase-B+ idea is native for modules — precompile
-  at startup, skip per-request parse.
+- **Bytecode caching: blocked, not free.** `Module::write(WriteOptions)` → bytecode is safe, but
+  reading it back is `unsafe Module::load(bytes)`, and jsbox sets `unsafe_code = "forbid"` — so
+  the "precompile at startup, skip per-request parse" idea is **not available** without relaxing
+  the unsafe ban. Measured cost makes it moot anyway (+201 µs/import, §Performance), but the
+  earlier "bytecode for free" note was wrong: it isn't, under the lint contract.
 
 ### The spike (proof, since reverted)
 
@@ -151,13 +153,13 @@ QuickJS has two eval modes that do **not** share scope: **script** (what jsbox u
 the user's `function handler(ctx)` becomes a global) and **module** (own scope, strict,
 `import`/`export`, evaluates to a namespace). That split is what forces a choice:
 
-**Shape A — ESM modules, script handler (smallest change).** Module *files* are native ESM
+**Shape A — ESM modules, script handler (smallest change).** Module _files_ are native ESM
 (`export function quote(){}`), authored with npm/esbuild and dropped in. The handler stays a
 plain script and pulls them via `use("acme/pricing")`, where `use` is a native function that
 calls `Module::import(ctx, name).finish()` and returns the namespace (memoized per request).
 The handler contract, `sanitize_globals`, and the whole request path are untouched; only the
 module-loading seam is new. This is the natural evolution of the Revision 2 `use()` design —
-the difference is the *module format* becomes real ESM instead of a completion-value file.
+the difference is the _module format_ becomes real ESM instead of a completion-value file.
 
 **Shape B — handler-as-module (the full "1:1 ESM" experience).** The user script is itself
 compiled as a module and `export`s its handler; the handler then uses native
@@ -173,8 +175,8 @@ script — QuickJS even has `JS_DetectModule`), at the price of a dual-mode eval
 The stated goal ("author with npm, drop in as ESM or IIFE") is satisfied by **standardizing
 on ESM** and letting the bundler do its job: `esbuild --bundle --format=esm --packages=bundle`
 turns a TS/npm module into one self-contained `.mjs` with no bare specifiers left to resolve
-at runtime (any remaining `import` is of *another jsbox module*, which the registry loader
-resolves). IIFE/CJS bundles still work too — but via the *old* completion-value `use()` path,
+at runtime (any remaining `import` is of _another jsbox module_, which the registry loader
+resolves). IIFE/CJS bundles still work too — but via the _old_ completion-value `use()` path,
 a different code branch; supporting both means `use()` sniffs the format. Recommendation: make
 **ESM the canonical format** (it is the 2026 default, every bundler emits it, and it maps 1:1
 to a future where handlers are modules), and treat legacy-IIFE as an optional convenience, not
@@ -190,7 +192,7 @@ Recommendation: **adopt native ESM as the module format (Shape A first).** It di
 "make modules use `export`," keeps the blast radius tiny, and leaves Shape B (handler-as-module)
 as a clean later escalation if the `import { x } from` ergonomics in handlers prove worth the
 breaking change. None of this changes the trigger question (Q1 below): build it when 2–3 real
-helpers exist, not before — the difference is that *when* we build it, the format is ESM.
+helpers exist, not before — the difference is that _when_ we build it, the format is ESM.
 
 ## Loader API: `use("name")` — the proposed shape (Phase A, when/if implemented)
 
@@ -277,8 +279,9 @@ cycle-detection logic (~20 lines).
   legitimate test-stubbing patterns. Revisit only with a concrete threat it solves.
 - Per-module metering/billing — module code is indistinguishable from script code
   inside the sandbox; metering it separately is not honestly possible.
-- Bytecode caching of modules — same Phase B+ seam as registered scripts; modules
-  are actually the _better_ candidate (stable, shared), so do them together.
+- Bytecode caching of modules — **blocked** by the `unsafe_code = "forbid"` lint:
+  reading precompiled bytecode is `unsafe Module::load`. Would require relaxing the unsafe
+  ban (a real cost) for a measured saving of ~201 µs/import — not worth it today.
 
 ## Performance note
 
@@ -293,8 +296,9 @@ module eats the customer's own budget, which is the correct incentive.
 a handler authored as a module adds **+39 µs/request** over a classic script (module vs
 script compile — negligible), and a handler that `import`s one small registry module adds
 **+201 µs/request** (compile + resolve + the imported module's own compile/eval). Both are
-well under 10 % of the per-request floor; the import case is the natural target for module
-bytecode caching (`Module::write`/`load`) if per-import latency ever matters.
+well under 10 % of the per-request floor. Bytecode caching would shave the import cost but is
+blocked by the unsafe-forbid lint (see the "out of scope" list), so this is the accepted floor —
+keep imported modules small and few.
 
 ## Intended consumer profile (answered 2026-06)
 
@@ -334,7 +338,7 @@ lessons table warns about. Six questions, roughly in priority order:
 1. **Is the trigger met yet?** The doc's own rule is "extract, don't speculate —
    a module is born when the same pattern shows up in ~3 real scripts." **Do we
    actually have 2–3 concrete, repeated helper snippets in real customer scripts
-   today?** If not, my recommendation is to *not build it yet* and instead start a
+   today?** If not, my recommendation is to _not build it yet_ and instead start a
    one-paragraph "candidate helpers" log; the feature lands the day the third
    repeat appears. (This is the single most important answer — everything below is
    moot if the trigger isn't met.)
@@ -346,8 +350,8 @@ lessons table warns about. Six questions, roughly in priority order:
 3. **Confirm the trust model is acceptable for the intended use.** A JS module is
    **readable and patchable by the customer script it shares a context with** —
    zero confidentiality, zero integrity (only the tamperer's own request is
-   affected, but still). That's fine for *helpers* (a SQL builder, validators) and
-   fatal for *anything load-bearing* (license checks, hidden pricing, sanitization
+   affected, but still). That's fine for _helpers_ (a SQL builder, validators) and
+   fatal for _anything load-bearing_ (license checks, hidden pricing, sanitization
    the platform relies on). Do you agree to the hard rule: **modules are
    convenience only; anything needing authority or secrecy goes in a Rust
    capability or a registered script** — and we enforce that socially/in review,
@@ -361,7 +365,7 @@ lessons table warns about. Six questions, roughly in priority order:
 
 5. **Transitive `use` in v1: allow or forbid?** Proposed: **allow** modules to call
    `use`, with memoization for diamonds, cycle detection that throws, and a small
-   depth cap (~8) — the Salesforce/OSGi pain was *versioned package graphs*, not
+   depth cap (~8) — the Salesforce/OSGi pain was _versioned package graphs_, not
    function calls in one operator-owned tree. The conservative alternative is a
    **flat, no-transitive** v1 (a module may not call `use`) that we relax later.
    Which risk posture do you want for the first cut?

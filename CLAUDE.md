@@ -64,7 +64,7 @@ via `handle.block_on(tokio::time::timeout(deadline, fut))` on the `spawn_blockin
 so a hung query is bounded by the execution wall-clock budget (`DB_TIMEOUT`) even when the
 server-side `statement_timeout` is lost through a transaction-mode pooler. The `block_on`
 **must** run on the blocking thread (never a runtime worker). The string-in/string-out FFI
-contract is unchanged — but `db.rs` is no longer a pure copy of the *sync* capability
+contract is unchanged — but `db.rs` is no longer a pure copy of the _sync_ capability
 template; other capabilities (`mail`/`s3`/`redis`/`amq`) remain sync. See
 `docs/design/resilience.md`.
 

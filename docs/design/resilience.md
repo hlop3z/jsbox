@@ -155,11 +155,11 @@ independently, which is the right granularity since connect failures are observe
 is dropped so every connect pays the 5 s timeout; bulkhead sized to concurrency so the
 breaker is the only variable):
 
-| | A — breaker off | B — breaker on (`threshold=3`) |
-| --- | --- | --- |
-| throughput | 5.3 req/s | **288.7 req/s** (54× higher) |
-| latency p99 | 5.02 s | **0.02 s** (281× lower) |
-| outcome | every request pins a `spawn_blocking` thread 5 s, then `DB_CONNECTION` | 17 connects trip it, then 1715 fast-fail `DB_CIRCUIT_OPEN` in ~ms |
+|             | A — breaker off                                                        | B — breaker on (`threshold=3`)                                    |
+| ----------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| throughput  | 5.3 req/s                                                              | **288.7 req/s** (54× higher)                                      |
+| latency p99 | 5.02 s                                                                 | **0.02 s** (281× lower)                                           |
+| outcome     | every request pins a `spawn_blocking` thread 5 s, then `DB_CONNECTION` | 17 connects trip it, then 1715 fast-fail `DB_CIRCUIT_OPEN` in ~ms |
 
 Under a dead database the breaker turns a 5 s-per-request thread-pinning stall into an
 instant retryable fast-fail — the difference between a pod that falls over and one that
@@ -203,7 +203,7 @@ computed at the dashboard, not pre-baked. The buckets are integer-microsecond co
 the hot path (no float), and the implicit `+Inf` bucket plus `_sum`/`_count` follow the
 standard exposition. Per-capability op latency is exposed the same way as a single labeled
 family `jsbox_capability_op_duration_seconds{capability="db"|"http"|"mail"|"s3"|"redis"|"amq"|"auth"}`
-(fed from the per-op `duration_us` already drained into `meta`), so a slow *downstream* is
+(fed from the per-op `duration_us` already drained into `meta`), so a slow _downstream_ is
 attributable — not just a slow total execution.
 
 ## Learning from big companies' async-in-Rust mistakes

@@ -75,14 +75,14 @@ So a dead database pages the ops team, but your `TypeError` doesn't. 🙂
 
 The HTTP status is a quick signal for gateways and load balancers:
 
-| You get | Means                                                                            |
-| ------- | -------------------------------------------------------------------------------- |
-| **200** | the robot ran fine; if there's an `error` it's an app/tool issue (read the body) |
-| **400** | your request was bad (`request` type)                                            |
-| **404** | the `key` you asked for isn't registered (`SCRIPT_NOT_FOUND`)                    |
-| **422** | your script can't be processed (typo, timeout, no `handler`)                     |
+| You get | Means                                                                                                 |
+| ------- | ----------------------------------------------------------------------------------------------------- |
+| **200** | the robot ran fine; if there's an `error` it's an app/tool issue (read the body)                      |
+| **400** | your request was bad (`request` type)                                                                 |
+| **404** | the `key` you asked for isn't registered (`SCRIPT_NOT_FOUND`)                                         |
+| **422** | your script can't be processed (typo, timeout, no `handler`)                                          |
 | **429** | at capacity (`OVERLOADED`) or your partition hit its share (`PARTITION_OVERLOADED`) — back off, retry |
-| **500** | the robot itself broke (rare!) — safe to retry, someone should look              |
+| **500** | the robot itself broke (rare!) — safe to retry, someone should look                                   |
 
 The rule: **5xx means "infrastructure, react!"** Everything else is explained in the
 body, so a gateway never retries things it shouldn't.
@@ -129,17 +129,17 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 
 ### The engine (`type: "runtime"`)
 
-| `code`                | retry | owner     | When                                                   |
-| --------------------- | ----- | --------- | ------------------------------------------------------ |
-| `SYNTAX_ERROR`        | no    | developer | The script didn't parse.                               |
-| `MODULE_NOT_FOUND`    | no    | developer | An ES-module handler `import`ed a specifier that isn't a registered module. |
-| `HANDLER_NOT_DEFINED` | no    | developer | No `handler(ctx)` function.                            |
-| `TIMEOUT`             | no    | developer | Ran past the time limit.                               |
-| `MEMORY_LIMIT`        | no    | developer | The context was too big to load into the memory limit. |
-| `MALFORMED_RESPONSE`  | no    | developer | Returned something that isn't a `json(...)` answer.    |
-| `OVERLOADED`          | yes   | operator  | Server at capacity (bulkhead full) — back off, retry (429). |
-| `PARTITION_OVERLOADED` | yes  | caller    | This partition key hit its concurrency share (per-partition fairness) — back off, retry (429). |
-| `INTERNAL`            | yes   | operator  | The robot's own fault (rare) — a 500.                  |
+| `code`                 | retry | owner     | When                                                                                           |
+| ---------------------- | ----- | --------- | ---------------------------------------------------------------------------------------------- |
+| `SYNTAX_ERROR`         | no    | developer | The script didn't parse.                                                                       |
+| `MODULE_NOT_FOUND`     | no    | developer | An ES-module handler `import`ed a specifier that isn't a registered module.                    |
+| `HANDLER_NOT_DEFINED`  | no    | developer | No `handler(ctx)` function.                                                                    |
+| `TIMEOUT`              | no    | developer | Ran past the time limit.                                                                       |
+| `MEMORY_LIMIT`         | no    | developer | The context was too big to load into the memory limit.                                         |
+| `MALFORMED_RESPONSE`   | no    | developer | Returned something that isn't a `json(...)` answer.                                            |
+| `OVERLOADED`           | yes   | operator  | Server at capacity (bulkhead full) — back off, retry (429).                                    |
+| `PARTITION_OVERLOADED` | yes   | caller    | This partition key hit its concurrency share (per-partition fairness) — back off, retry (429). |
+| `INTERNAL`             | yes   | operator  | The robot's own fault (rare) — a 500.                                                          |
 
 ### Your script (`type: "script"`)
 
@@ -151,18 +151,18 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 
 **`db`** (from the database's `SqlState`):
 
-| `code`             | retry | owner     | When                                                       |
-| ------------------ | ----- | --------- | ---------------------------------------------------------- |
-| `DB_SERIALIZATION` | yes   | operator  | Serialization failure — retry the transaction.             |
-| `DB_DEADLOCK`      | yes   | operator  | Deadlock — retry.                                          |
-| `DB_CONNECTION`    | yes   | operator  | Couldn't reach the database (drop, or can't connect).      |
-| `DB_CANCELED`      | yes   | operator  | Query canceled / server-side statement timeout.            |
-| `DB_TIMEOUT`       | yes   | operator  | Query exceeded the client-side execution deadline (freed the thread even when the server-side timeout was lost through a pooler). |
+| `code`             | retry | owner     | When                                                                                                                                 |
+| ------------------ | ----- | --------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `DB_SERIALIZATION` | yes   | operator  | Serialization failure — retry the transaction.                                                                                       |
+| `DB_DEADLOCK`      | yes   | operator  | Deadlock — retry.                                                                                                                    |
+| `DB_CONNECTION`    | yes   | operator  | Couldn't reach the database (drop, or can't connect).                                                                                |
+| `DB_CANCELED`      | yes   | operator  | Query canceled / server-side statement timeout.                                                                                      |
+| `DB_TIMEOUT`       | yes   | operator  | Query exceeded the client-side execution deadline (freed the thread even when the server-side timeout was lost through a pooler).    |
 | `DB_CIRCUIT_OPEN`  | yes   | operator  | Circuit breaker is open — the database keeps failing to connect, so jsbox fast-failed instead of waiting. Retry after the cool-down. |
-| `DB_CONSTRAINT`    | no    | developer | Broke a rule (unique/foreign-key/etc). `details.sqlstate`. |
-| `DB_QUERY`         | no    | developer | Bad SQL.                                                   |
-| `DB_OP_LIMIT`      | no    | developer | Hit `max_ops`.                                             |
-| `DB_ERROR`         | yes   | operator  | Anything else (fallback).                                  |
+| `DB_CONSTRAINT`    | no    | developer | Broke a rule (unique/foreign-key/etc). `details.sqlstate`.                                                                           |
+| `DB_QUERY`         | no    | developer | Bad SQL.                                                                                                                             |
+| `DB_OP_LIMIT`      | no    | developer | Hit `max_ops`.                                                                                                                       |
+| `DB_ERROR`         | yes   | operator  | Anything else (fallback).                                                                                                            |
 
 **`mail`** (from the SMTP reply):
 
