@@ -151,6 +151,20 @@ targets is a dead/unreachable target, where Tier 2's deadline already bounds a _
 query. It is per-pod like the bulkhead: each replica learns the target's health
 independently, which is the right granularity since connect failures are observed locally.
 
+**Measured** (`stress_breaker_esm.py`, 16 concurrent against a black-holed DB whose TCP SYN
+is dropped so every connect pays the 5 s timeout; bulkhead sized to concurrency so the
+breaker is the only variable):
+
+| | A — breaker off | B — breaker on (`threshold=3`) |
+| --- | --- | --- |
+| throughput | 5.3 req/s | **288.7 req/s** (54× higher) |
+| latency p99 | 5.02 s | **0.02 s** (281× lower) |
+| outcome | every request pins a `spawn_blocking` thread 5 s, then `DB_CONNECTION` | 17 connects trip it, then 1715 fast-fail `DB_CIRCUIT_OPEN` in ~ms |
+
+Under a dead database the breaker turns a 5 s-per-request thread-pinning stall into an
+instant retryable fast-fail — the difference between a pod that falls over and one that
+stays responsive while the target recovers.
+
 ### Tier 4 — pooler timeouts (operator config, wired + exercised)
 
 PgBouncer's own `query_timeout` / `query_wait_timeout` as an independent layer **below**

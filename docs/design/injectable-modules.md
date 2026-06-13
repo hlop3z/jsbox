@@ -289,6 +289,13 @@ moderate volume, and the bytecode-cache evolution erases it if it ever matters.
 Memory: module objects live in the per-request heap, under `memory_limit` — a fat
 module eats the customer's own budget, which is the correct incentive.
 
+**Measured** (`stress_breaker_esm.py`, sequential, tiny handlers, ~2.5 ms request floor):
+a handler authored as a module adds **+39 µs/request** over a classic script (module vs
+script compile — negligible), and a handler that `import`s one small registry module adds
+**+201 µs/request** (compile + resolve + the imported module's own compile/eval). Both are
+well under 10 % of the per-request floor; the import case is the natural target for module
+bytecode caching (`Module::write`/`load`) if per-import latency ever matters.
+
 ## Intended consumer profile (answered 2026-06)
 
 The target is **helper/utility tools extracted from observed repetition** in
