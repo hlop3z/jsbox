@@ -1,4 +1,4 @@
-# jsbox
+# jsbox (runlet)
 
 A sandboxed JavaScript execution engine built in Rust. Send a JS handler function + context via HTTP, get structured `{data, error, meta}` back.
 
