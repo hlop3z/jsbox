@@ -3,6 +3,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -814,6 +815,94 @@ def test_esm(t: Runner):
            lambda r: _err_code(r) == "HANDLER_NOT_DEFINED")
 
 
+def test_hasura(t: Runner):
+    """The `hasura/client` injectable module (modules/hasura/client.mjs). Hermetic: each
+    handler stubs `globalThis.api` so the module's request-shaping and error-handling are
+    exercised without a live Hasura — the module reads whatever `api.post` returns."""
+    t.section("Hasura module (hasura/client)")
+
+    # Probe: the module must be registered (merged modules_dir). Self-skip otherwise so a
+    # run against a server without modules_dir reports SKIP instead of a wall of failures.
+    probe = _post(h_raw(
+        "import { hasura } from 'hasura/client';\n"
+        "export default function handler(ctx){ return json(typeof hasura, null); }"))
+    if _err_code(probe) == "MODULE_NOT_FOUND":
+        print("\n  \033[33mSKIP\033[0m hasura module tests (no modules_dir with hasura/client)\n")
+        return
+
+    # Request shaping: /v1/graphql URL (trailing slash stripped), JSON content-type,
+    # admin-secret + role headers, and variables passed through untouched.
+    t.test("query shapes the request + returns data",
+           h_raw(
+               "import { hasura } from 'hasura/client';\n"
+               "export default function handler(ctx){\n"
+               "  var cap = {};\n"
+               "  globalThis.api = { post: function(url, body, headers){\n"
+               "    cap = { url: url, body: body, headers: headers };\n"
+               "    return { status: 200, data: { data: { users: [{ id: 7 }] } } };\n"
+               "  }};\n"
+               "  var h = hasura({ endpoint: 'https://hasura.test/', adminSecret: 'sek', role: 'viewer' });\n"
+               "  var data = h.query('query { users { id } }', { x: 1 });\n"
+               "  return json({ id: data.users[0].id, url: cap.url,\n"
+               "    secret: cap.headers['x-hasura-admin-secret'], role: cap.headers['x-hasura-role'],\n"
+               "    ctype: cap.headers['content-type'], qHas: typeof cap.body.query === 'string',\n"
+               "    varX: cap.body.variables.x }, null);\n"
+               "}"),
+           data_eq({"id": 7, "url": "https://hasura.test/v1/graphql", "secret": "sek",
+                    "role": "viewer", "ctype": "application/json", "qHas": True, "varX": 1}))
+
+    # A forwarded user JWT wins over the admin secret (Bearer set, no admin-secret header).
+    t.test("token forwards as Bearer and suppresses admin secret",
+           h_raw(
+               "import { hasura } from 'hasura/client';\n"
+               "export default function handler(ctx){\n"
+               "  var cap = {};\n"
+               "  globalThis.api = { post: function(url, body, headers){ cap.h = headers;\n"
+               "    return { status: 200, data: { data: { ok: true } } }; }};\n"
+               "  hasura({ endpoint: 'https://hasura.test', token: 'jwt123', adminSecret: 'sek' }).raw('query { ok }');\n"
+               "  return json({ auth: cap.h['authorization'], hasSecret: ('x-hasura-admin-secret' in cap.h) }, null);\n"
+               "}"),
+           data_eq({"auth": "Bearer jwt123", "hasSecret": False}))
+
+    # GraphQL error inside an HTTP 200 → query() throws with .code + .graphql attached.
+    t.test("GraphQL error in a 200 body throws (not silent)",
+           h_raw(
+               "import { hasura } from 'hasura/client';\n"
+               "export default function handler(ctx){\n"
+               "  globalThis.api = { post: function(){ return { status: 200, data: { errors: [\n"
+               "    { message: 'boom', extensions: { code: 'validation-failed' } }] } }; }};\n"
+               "  var h = hasura({ endpoint: 'https://hasura.test' });\n"
+               "  try { h.query('query { x }'); return json('no-throw', null); }\n"
+               "  catch(e){ return json({ msg: e.message, code: e.code, n: e.graphql.length }, null); }\n"
+               "}"),
+           data_eq({"msg": "boom", "code": "validation-failed", "n": 1}))
+
+    # Transport failure (api's in-band status:0) → raw() normalizes to an errors envelope,
+    # query() throws carrying the transport code.
+    t.test("transport failure normalizes + throws",
+           h_raw(
+               "import { hasura } from 'hasura/client';\n"
+               "export default function handler(ctx){\n"
+               "  globalThis.api = { post: function(){ return { status: 0, error: { code: 'HTTP_CONNECT', retryable: true } }; }};\n"
+               "  var h = hasura({ endpoint: 'https://hasura.test' });\n"
+               "  var env = h.raw('query { x }');\n"
+               "  var threw = '';\n"
+               "  try { h.query('query { x }'); } catch(e){ threw = e.code; }\n"
+               "  return json({ envCode: env.errors[0].extensions.code, threw: threw }, null);\n"
+               "}"),
+           data_eq({"envCode": "HTTP_CONNECT", "threw": "HTTP_CONNECT"}))
+
+    # No endpoint anywhere (no opts, no $sys.env) → a clear, actionable throw.
+    t.test("missing endpoint throws a helpful error",
+           h_raw(
+               "import { hasura } from 'hasura/client';\n"
+               "export default function handler(ctx){\n"
+               "  try { hasura(); return json('no-throw', null); }\n"
+               "  catch(e){ return json(e.message.indexOf('HASURA_ENDPOINT') >= 0, null); }\n"
+               "}"),
+           data_eq(True))
+
+
 def test_circuit_breaker(t: Runner):
     """Tier 3: repeated connect failures to a dead db target trip the breaker, after which
     requests to that target fast-fail DB_CIRCUIT_OPEN instead of waiting on the timeout —
@@ -1125,12 +1214,22 @@ def _start_server() -> subprocess.Popen:
     repo = os.path.dirname(os.path.abspath(__file__))
     run_dir = os.path.join(repo, ".test-run")
     os.makedirs(run_dir, exist_ok=True)
+    # Merge the test-fixture modules (tests/modules) with the shipped operator modules
+    # (modules/, e.g. hasura/client.mjs) into one scratch modules_dir, so both are
+    # importable without duplicating the shipped module as a fixture (single source of truth).
+    merged_modules = os.path.join(run_dir, "modules")
+    if os.path.isdir(merged_modules):
+        shutil.rmtree(merged_modules)
+    os.makedirs(merged_modules)
+    for src in (os.path.join(repo, "tests", "modules"), os.path.join(repo, "modules")):
+        if os.path.isdir(src):
+            shutil.copytree(src, merged_modules, dirs_exist_ok=True)
     # debug=true relaxes the SSRF private-IP block so the `api` tests can reach the
     # local `httpbin` compose service (its documented local-testing purpose).
     config = {
         "debug": True,
         "scripts_dir": os.path.join(repo, "tests", "scripts"),
-        "modules_dir": os.path.join(repo, "tests", "modules"),
+        "modules_dir": merged_modules,
         # Low bounds so the resilience tests actually exercise the bulkhead + clamp.
         "engine": {
             "max_concurrent_executions": 6,
@@ -1175,6 +1274,7 @@ def main():
     test_partition_fairness(t)
     test_metrics(t)
     test_esm(t)
+    test_hasura(t)
 
     # Database tests — only if containers are running
     if _db_available(PG_CONFIG):

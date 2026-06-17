@@ -35,7 +35,9 @@ Read these in order. Each one is short.
    use-but-never-see secrets. Always on (no setup) for `crypto` + `date`. 🧰
 10. **[`auth` — who is this person?](10-auth.md)** — check a login token and get the
     user's details from your identity server (Zitadel, Keycloak, Auth0…). 🪪
-11. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
+11. **[Hasura — GraphQL the easy way](11-hasura.md)** — the `hasura/client` module:
+    query Hasura with one line and never miss a hidden GraphQL error. 🚀
+12. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
     something fails, and how to read it. 🚦
 
 ## The super-powers 🦸

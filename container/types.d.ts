@@ -706,3 +706,69 @@ interface Sys {
 
 /** Runtime stdlib. `$sys.crypto` / `$sys.date` always available; `env` / `secrets` need `config.sys`. */
 declare const $sys: Sys;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `hasura/client` — injectable module: GraphQL client over `api` (not a global)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Type surface for the operator-deployed injectable module `modules/hasura/client.mjs`.
+ * Unlike the capability globals above, this is **imported**, not ambient:
+ * `import { hasura } from "hasura/client";`. It resolves only when the file is deployed
+ * under `config.modules_dir`; see {@link https://github.com/hlop3z/jsbox/blob/main/docs/modules.md modules.md}.
+ */
+declare module "hasura/client" {
+  /** Options for {@link hasura}. */
+  interface HasuraOptions {
+    /** Base URL; defaults to `$sys.env.HASURA_ENDPOINT`. */
+    endpoint?: string;
+    /** End-user JWT → `Authorization: Bearer`, so Hasura enforces row-level permissions. */
+    token?: string;
+    /** Admin secret; defaults to `$sys.env.HASURA_ADMIN_SECRET`. Ignored when `token` is set. */
+    adminSecret?: string;
+    /** Sent as `x-hasura-role` to select a permission role. */
+    role?: string;
+    /** Extra headers merged onto every request. */
+    headers?: HttpHeaders;
+  }
+
+  /** A GraphQL error entry from Hasura. */
+  interface HasuraError {
+    /** Human-readable message. */
+    message: string;
+    /** Hasura error extensions (e.g. `{ code: "validation-failed" }`). */
+    extensions?: Record<string, unknown>;
+  }
+
+  /** Hasura's raw response envelope from {@link HasuraClient.raw}. */
+  interface HasuraEnvelope<T = any> {
+    /** The operation result (absent when only `errors` are present). */
+    data?: T;
+    /** GraphQL/transport errors (absent on full success). */
+    errors?: HasuraError[];
+  }
+
+  /** A Hasura client bound to a set of credentials / a role. */
+  interface HasuraClient {
+    /**
+     * Runs a GraphQL query and returns **only** `data`. Throws on a GraphQL or transport
+     * error (the Error carries `.graphql` = the errors array, `.code` = the first code).
+     * @example const d = h.query(`query ($id: uuid!){ users_by_pk(id:$id){ email } }`, { id });
+     */
+    query<T = any>(query: string, variables?: Record<string, unknown>): T;
+    /** Same wire call as {@link query} — named for mutations so call sites read right. */
+    mutate<T = any>(query: string, variables?: Record<string, unknown>): T;
+    /**
+     * Runs a GraphQL operation and returns Hasura's raw `{ data?, errors? }` envelope.
+     * Never throws on a GraphQL-level error — inspect `.errors` inline.
+     */
+    raw<T = any>(
+      query: string,
+      variables?: Record<string, unknown>,
+    ): HasuraEnvelope<T>;
+  }
+
+  /** Creates a {@link HasuraClient}. Reads `$sys.env` for defaults when options are omitted. */
+  export function hasura(opts?: HasuraOptions): HasuraClient;
+  export default hasura;
+}
