@@ -91,6 +91,32 @@ afflicts native JS number math.
 - **WHEN** a handler calls `.round()` with no argument
 - **THEN** it rounds to 0 decimal places
 
+### Requirement: Major/minor unit conversion
+
+The system SHALL provide chainable `toCents(places)` and `fromCents(places)` instance methods to
+convert between major units and integer minor units, where `places` is the number of minor-unit
+digits and defaults to 2 (cents).
+
+#### Scenario: Dollars to cents
+
+- **WHEN** a handler evaluates `$("19.99").toCents().toString()`
+- **THEN** the result is the integer string `"1999"`
+
+#### Scenario: Cents to dollars
+
+- **WHEN** a handler evaluates `$(1999).fromCents().toString()`
+- **THEN** the result is `"19.99"` (fixed to `places` decimal places)
+
+#### Scenario: Configurable minor-unit digits
+
+- **WHEN** a handler passes a `places` argument (e.g. `0` for yen, `3` for dinars)
+- **THEN** the conversion scales by `10^places` instead of `100`
+
+#### Scenario: toCents rounds half-up to a whole number
+
+- **WHEN** a handler evaluates `$("1.005").toCents().toString()`
+- **THEN** the fractional minor unit is rounded half-away-from-zero to the integer `"101"`
+
 ### Requirement: Comparison
 
 The system SHALL provide comparison helpers (`cmp`, `eq`, `lt`, `lte`, `gt`, `gte`, `isZero`,

@@ -47,6 +47,29 @@ The methods **chain** — each one returns a new decimal you can keep working wi
 
 `.round` rounds **half-up** (the normal way you learned in school: `19.985` → `19.99`).
 
+## Dollars ↔ cents 🪙
+
+Money is often stored as a whole number of the **smallest unit** (cents) so there's no
+fraction to lose. Use `.toCents()` to go from dollars to cents, and `.fromCents()` to come
+back:
+
+```js
+$("19.99").toCents(); // 1999   (dollars → cents)
+$(1999).fromCents(); // "19.99" (cents → dollars)
+```
+
+Both default to **2** minor-unit digits (cents). Currencies are different — pass the number
+of digits to match: `0` for yen, `3` for dinars:
+
+```js
+$("1000").toCents(0); // 1000   (¥1000 → 1000, no fraction)
+$("1.234").toCents(3); // 1234   (3-digit minor unit)
+```
+
+`.toCents()` rounds **half-up** to a whole number, so fractions of a cent don't sneak
+through (`$("1.005").toCents()` → `101`). `.fromCents()` gives you back exactly that many
+decimal places (`$(150).fromCents()` → `"1.50"`).
+
 ## Compare two decimals
 
 ```js

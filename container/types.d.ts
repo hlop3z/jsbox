@@ -91,6 +91,20 @@ interface Decimal {
   abs(): Decimal;
   /** Rounds to `places` decimal places (default `0`), half-away-from-zero. */
   round(places?: number): Decimal;
+  /**
+   * Converts major units to integer minor units: `this * 10^places`, rounded
+   * half-away-from-zero to a whole number. `places` is the count of minor-unit
+   * digits and defaults to `2` (cents) — pass `0` for yen, `3` for dinars.
+   * @example $("19.99").toCents();   // 1999
+   * @example $("1.005").toCents();   // 101  (sub-cent rounds half-up)
+   */
+  toCents(places?: number): Decimal;
+  /**
+   * Converts integer minor units back to major units: `this / 10^places`, fixed to
+   * `places` decimal places. `places` defaults to `2` (cents).
+   * @example $(1999).fromCents(); // "19.99"
+   */
+  fromCents(places?: number): Decimal;
   /** Compares: returns `-1` if `this < other`, `0` if equal, `1` if greater. */
   cmp(other: DecimalInput): number;
   /** `this === other`. */
@@ -182,13 +196,29 @@ interface HttpClient {
    * `GET url`, with optional query params appended.
    * @example api.get("https://api.example.com/items", { page: 2 });
    */
-  get<T = any>(url: string, params?: QueryParams, headers?: HttpHeaders): ApiResponse<T>;
+  get<T = any>(
+    url: string,
+    params?: QueryParams,
+    headers?: HttpHeaders,
+  ): ApiResponse<T>;
   /** `POST url` with a JSON `body`. */
-  post<T = any>(url: string, body?: unknown, headers?: HttpHeaders): ApiResponse<T>;
+  post<T = any>(
+    url: string,
+    body?: unknown,
+    headers?: HttpHeaders,
+  ): ApiResponse<T>;
   /** `PUT url` with a JSON `body`. */
-  put<T = any>(url: string, body?: unknown, headers?: HttpHeaders): ApiResponse<T>;
+  put<T = any>(
+    url: string,
+    body?: unknown,
+    headers?: HttpHeaders,
+  ): ApiResponse<T>;
   /** `PATCH url` with a JSON `body`. */
-  patch<T = any>(url: string, body?: unknown, headers?: HttpHeaders): ApiResponse<T>;
+  patch<T = any>(
+    url: string,
+    body?: unknown,
+    headers?: HttpHeaders,
+  ): ApiResponse<T>;
   /** `DELETE url`. */
   delete<T = any>(url: string, headers?: HttpHeaders): ApiResponse<T>;
 }
@@ -555,7 +585,12 @@ interface SysCrypto {
    * {@link SysSecret} handle — it is resolved server-side; the plaintext never enters JS.
    * @example $sys.crypto.hmac("sha256", $sys.secrets.SIGNING_KEY, body);
    */
-  hmac(algo: SysHmacAlgo, key: string | SysSecret, msg: string, encoding?: SysEncoding): string;
+  hmac(
+    algo: SysHmacAlgo,
+    key: string | SysSecret,
+    msg: string,
+    encoding?: SysEncoding,
+  ): string;
   /** A random v4 UUID. */
   uuid(): string;
   /** Standard base64 codec. */

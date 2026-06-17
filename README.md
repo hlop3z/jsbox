@@ -188,13 +188,15 @@ operator overloading, so use **methods**, not `+ - * /`:
 ```js
 function handler(ctx) {
   var total = $("19.99").mul(ctx.qty).add("0.01").round(2);
-  // methods: add sub mul div neg abs round(places) cmp eq lt lte gt gte isZero
+  // methods: add sub mul div neg abs round(places) toCents(places) fromCents(places)
+  //          cmp eq lt lte gt gte isZero
   // output:  toString() | toNumber() (lossy) | json() serializes as the exact string
   return json({ total: total }, null); // { "total": "..." }
 }
 ```
 
-`.round()` is half-up. Holds ~28–29 significant digits. Divide-by-zero and overflow throw.
+`.round()` is half-up. `.toCents()` / `.fromCents()` convert major↔minor units (places
+defaults to 2). Holds ~28–29 significant digits. Divide-by-zero and overflow throw.
 See [`docs/05-decimal.md`](docs/05-decimal.md).
 
 ### api.get / post / put / patch / delete

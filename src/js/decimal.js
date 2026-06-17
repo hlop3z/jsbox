@@ -26,6 +26,14 @@
   Dec.prototype.round = function (places) {
     return new Dec(call("round", this.v, String(places === undefined ? 0 : places)));
   };
+  // Major units -> minor units (e.g. 1.50 dollars -> 150 cents). places defaults to 2.
+  Dec.prototype.toCents = function (places) {
+    return new Dec(call("to_cents", this.v, places === undefined ? "" : String(places)));
+  };
+  // Minor units -> major units (e.g. 150 cents -> 1.50 dollars). places defaults to 2.
+  Dec.prototype.fromCents = function (places) {
+    return new Dec(call("from_cents", this.v, places === undefined ? "" : String(places)));
+  };
   Dec.prototype.cmp = function (o) { return parseInt(call("cmp", this.v, coerce(o)), 10); };
   Dec.prototype.eq = function (o) { return this.cmp(o) === 0; };
   Dec.prototype.lt = function (o) { return this.cmp(o) < 0; };
