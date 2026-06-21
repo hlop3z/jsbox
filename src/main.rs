@@ -15,6 +15,7 @@ mod kv;
 mod mail;
 mod metrics;
 mod modules;
+mod mongo;
 mod partition;
 mod pool;
 mod registry;

@@ -10,9 +10,9 @@
 //! closes. One `send` call = one metered op, regardless of batch size.
 
 use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use amqprs::BasicProperties;
 use amqprs::channel::BasicPublishArguments;
@@ -21,7 +21,7 @@ use amqprs::tls::TlsAdaptor;
 use rquickjs::{Ctx, Function, Value as JsValue};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Runtime};
 
 use crate::errors::{self, ErrorOwner, ErrorSource, Fault};
 use crate::sandbox::{self, Collector};
@@ -37,31 +37,55 @@ const AMQ_OP_LIMIT: Fault = Fault::new("AMQ_OP_LIMIT", false, ErrorOwner::Develo
 const AMQ_CONNECTION: Fault = Fault::new("AMQ_CONNECTION", true, ErrorOwner::Operator);
 /// Fault for a batch larger than `max_batch`.
 const AMQ_BATCH: Fault = Fault::new("AMQ_BATCH_TOO_LARGE", false, ErrorOwner::Developer);
+/// Fault for a request-reply that received no reply within the timeout (NATS backend).
+const AMQ_TIMEOUT: Fault = Fault::new("AMQ_TIMEOUT", true, ErrorOwner::Operator);
+/// Fault for an operation the selected backend does not support (e.g. `request` on RabbitMQ).
+const AMQ_UNSUPPORTED: Fault = Fault::new("AMQ_UNSUPPORTED", false, ErrorOwner::Developer);
 
-/// Per-request `RabbitMQ` configuration.
+/// Messaging backend selected by `config.amq.backend`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AmqBackend {
+    /// `RabbitMQ` (default) — AMQP producer.
+    #[default]
+    Rabbitmq,
+    /// Subject-based messaging (`NATS`) — publish + request-reply.
+    Nats,
+}
+
+/// Per-request messaging configuration (`RabbitMQ` or `NATS`, by `backend`).
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AmqConfig {
+    /// Messaging backend (default `rabbitmq`).
+    #[serde(default)]
+    pub(crate) backend: AmqBackend,
     /// Broker host.
     pub(crate) host: String,
-    /// Broker port (default 5672).
-    #[serde(default = "default_port")]
-    pub(crate) port: u16,
-    /// AMQP username (default `guest`).
-    #[serde(default = "default_user")]
-    pub(crate) username: String,
-    /// AMQP password (default `guest`).
-    #[serde(default = "default_user")]
-    pub(crate) password: String,
-    /// Virtual host (default `/`).
+    /// Broker port (default 5672 for RabbitMQ, 4222 for NATS).
+    #[serde(default)]
+    pub(crate) port: Option<u16>,
+    /// Username — RabbitMQ defaults to `guest`; NATS authenticates only when supplied.
+    #[serde(default)]
+    pub(crate) username: Option<String>,
+    /// Password — RabbitMQ defaults to `guest`; NATS authenticates only when supplied.
+    #[serde(default)]
+    pub(crate) password: Option<String>,
+    /// Bearer token auth (NATS backend only).
+    #[serde(default)]
+    pub(crate) token: Option<String>,
+    /// Virtual host (RabbitMQ, default `/`).
     #[serde(default = "default_vhost")]
     pub(crate) vhost: String,
-    /// Exchange to publish to (default `""` — the default exchange; routing key is the queue).
+    /// Exchange to publish to (RabbitMQ, default `""` — the default exchange).
     #[serde(default)]
     pub(crate) exchange: String,
     /// Maximum messages per `send` call (default 100).
     #[serde(default = "default_max_batch")]
     pub(crate) max_batch: usize,
-    /// Use TLS (`amqps://`). Reuses the `aws-lc-rs` rustls provider.
+    /// Request-reply timeout in milliseconds (NATS backend, default 5000).
+    #[serde(default = "default_request_timeout")]
+    pub(crate) request_timeout_ms: u64,
+    /// Use TLS. Reuses the `aws-lc-rs` rustls provider.
     #[serde(default)]
     pub(crate) tls: bool,
     /// Path to a custom CA cert (PEM) for a self-hosted broker. Omit for managed services
@@ -70,14 +94,16 @@ pub(crate) struct AmqConfig {
     pub(crate) ca_cert: Option<String>,
 }
 
-/// Default AMQP port.
-const fn default_port() -> u16 {
-    5672
+impl AmqConfig {
+    /// Resolves the connection port, defaulting per backend.
+    fn resolved_port(&self) -> u16 {
+        self.port.unwrap_or(match self.backend {
+            AmqBackend::Rabbitmq => 5672,
+            AmqBackend::Nats => 4222,
+        })
+    }
 }
-/// Default AMQP user/password.
-fn default_user() -> String {
-    "guest".to_owned()
-}
+
 /// Default virtual host.
 fn default_vhost() -> String {
     "/".to_owned()
@@ -85,6 +111,10 @@ fn default_vhost() -> String {
 /// Default batch cap.
 const fn default_max_batch() -> usize {
     100
+}
+/// Default request-reply timeout (milliseconds).
+const fn default_request_timeout() -> u64 {
+    5000
 }
 
 /// Metric recorded for each `amq.send` op.
@@ -131,6 +161,14 @@ impl AmqError {
     const fn connection(message: String) -> Self {
         Self {
             fault: AMQ_CONNECTION,
+            message,
+        }
+    }
+
+    /// Builds an unsupported-operation error (`AMQ_UNSUPPORTED`).
+    const fn unsupported(message: String) -> Self {
+        Self {
+            fault: AMQ_UNSUPPORTED,
             message,
         }
     }
@@ -204,6 +242,7 @@ pub(crate) fn inject_amq(
 fn dispatch(config: &AmqConfig, action: &str, payload_json: &str) -> Result<SendOutcome, AmqError> {
     match action {
         "send" => do_send(config, payload_json),
+        "request" => do_request(config, payload_json),
         other => Err(AmqError::fallback(format!("unknown amq action: {other}"))),
     }
 }
@@ -226,12 +265,11 @@ fn do_send(config: &AmqConfig, payload_json: &str) -> Result<SendOutcome, AmqErr
         });
     }
 
-    let runtime = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| AmqError::fallback(format!("failed to build runtime: {err}")))?;
-
-    let bytes = runtime.block_on(publish_batch(config, &payload.messages))?;
+    let runtime = build_runtime()?;
+    let bytes = match config.backend {
+        AmqBackend::Rabbitmq => runtime.block_on(publish_batch(config, &payload.messages))?,
+        AmqBackend::Nats => runtime.block_on(nats_publish(config, &payload.messages))?,
+    };
 
     let json = format!("{{\"published\":{count}}}");
     Ok(SendOutcome {
@@ -241,13 +279,42 @@ fn do_send(config: &AmqConfig, payload_json: &str) -> Result<SendOutcome, AmqErr
     })
 }
 
+/// Parses + dispatches a request-reply (`NATS` backend only).
+fn do_request(config: &AmqConfig, payload_json: &str) -> Result<SendOutcome, AmqError> {
+    if config.backend != AmqBackend::Nats {
+        return Err(AmqError::unsupported(
+            "amq.request requires the nats backend".to_owned(),
+        ));
+    }
+    let req: RequestPayload = serde_json::from_str(payload_json)
+        .map_err(|err| AmqError::fallback(format!("invalid amq payload: {err}")))?;
+
+    let runtime = build_runtime()?;
+    let (json, bytes) = runtime.block_on(nats_request(config, &req.subject, req.payload.get()))?;
+    Ok(SendOutcome {
+        json,
+        messages: 1,
+        bytes,
+    })
+}
+
+/// Builds the per-call current-thread runtime used to drive the async client.
+fn build_runtime() -> Result<Runtime, AmqError> {
+    Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| AmqError::fallback(format!("failed to build runtime: {err}")))
+}
+
 /// Opens one connection + channel, publishes every message, then closes.
 async fn publish_batch(config: &AmqConfig, messages: &[AmqMessage]) -> Result<usize, AmqError> {
+    let username = config.username.as_deref().unwrap_or("guest");
+    let password = config.password.as_deref().unwrap_or("guest");
     let mut args = OpenConnectionArguments::new(
         &config.host,
-        config.port,
-        &config.username,
-        &config.password,
+        config.resolved_port(),
+        username,
+        password,
     );
     let _ = args.virtual_host(&config.vhost);
     if config.tls {
@@ -281,6 +348,86 @@ async fn publish_batch(config: &AmqConfig, messages: &[AmqMessage]) -> Result<us
     Ok(total_bytes)
 }
 
+// -- NATS backend -----------------------------------------------------------
+
+/// Connects to the NATS server, applying auth (user/password or token) and TLS.
+async fn nats_connect(config: &AmqConfig) -> Result<async_nats::Client, AmqError> {
+    let mut opts = async_nats::ConnectOptions::new()
+        .request_timeout(Some(Duration::from_millis(config.request_timeout_ms)));
+    if let Some(username) = config.username.clone() {
+        opts = opts.user_and_password(username, config.password.clone().unwrap_or_default());
+    } else if let Some(token) = config.token.clone() {
+        opts = opts.token(token);
+    }
+    if config.tls {
+        opts = opts.require_tls(true);
+        if let Some(ca) = config.ca_cert.clone() {
+            opts = opts.add_root_certificates(PathBuf::from(ca));
+        }
+    }
+    let address = format!("{}:{}", config.host, config.resolved_port());
+    async_nats::connect_with_options(address, opts)
+        .await
+        .map_err(|err| AmqError::connection(format!("nats connect failed: {err}")))
+}
+
+/// Publishes every message to its subject, then flushes to confirm delivery.
+async fn nats_publish(config: &AmqConfig, messages: &[AmqMessage]) -> Result<usize, AmqError> {
+    let client = nats_connect(config).await?;
+    let mut total_bytes: usize = 0;
+    for message in messages {
+        let content = message.payload.get().as_bytes().to_vec();
+        total_bytes = total_bytes.saturating_add(content.len());
+        client
+            .publish(message.key.clone(), bytes::Bytes::from(content))
+            .await
+            .map_err(|err| AmqError::fallback(format!("nats publish failed: {err}")))?;
+    }
+    client
+        .flush()
+        .await
+        .map_err(|err| AmqError::fallback(format!("nats flush failed: {err}")))?;
+    Ok(total_bytes)
+}
+
+/// Sends a request and returns `({"reply": <body>}, request_bytes)`. The reply body is
+/// parsed as JSON when valid, otherwise carried as a JSON string. Wrapping under `reply`
+/// keeps an arbitrary reply that happens to contain an `error` field from being mistaken
+/// for a capability error by the JS wrapper.
+async fn nats_request(
+    config: &AmqConfig,
+    subject: &str,
+    payload: &str,
+) -> Result<(String, usize), AmqError> {
+    let client = nats_connect(config).await?;
+    let request_bytes = payload.len();
+    let reply = client
+        .request(subject.to_owned(), bytes::Bytes::from(payload.as_bytes().to_vec()))
+        .await
+        .map_err(|err| AmqError {
+            fault: classify_request_error(&err.to_string()),
+            message: format!("nats request failed: {err}"),
+        })?;
+    let body_text = String::from_utf8_lossy(&reply.payload).into_owned();
+    let body: serde_json::Value =
+        serde_json::from_str(&body_text).unwrap_or(serde_json::Value::String(body_text));
+    let wrapped = serde_json::json!({ "reply": body });
+    Ok((wrapped.to_string(), request_bytes))
+}
+
+/// Classifies a NATS request error from its message: a missing responder or an elapsed
+/// timeout is the retryable `AMQ_TIMEOUT`, anything else the retryable fallback. (NATS's
+/// request error carries the cause in its `Display`, above the stringify cliff for callers.)
+fn classify_request_error(message: &str) -> Fault {
+    let lowered = message.to_lowercase();
+    if lowered.contains("no responders") || lowered.contains("timed out") || lowered.contains("timeout")
+    {
+        AMQ_TIMEOUT
+    } else {
+        AMQ_FALLBACK
+    }
+}
+
 // -- Payloads ---------------------------------------------------------------
 
 /// Parsed `send` payload.
@@ -305,6 +452,17 @@ struct AmqMessage {
 /// Default payload (`null`) when a message omits one.
 fn default_payload() -> Box<RawValue> {
     RawValue::from_string("null".to_owned()).unwrap_or_else(|_err| unreachable!())
+}
+
+/// Parsed `request` payload: a subject + a raw-JSON body.
+#[derive(Debug, Deserialize)]
+struct RequestPayload {
+    /// Subject to send the request to.
+    #[serde(default)]
+    subject: String,
+    /// Request body — serialized to its JSON bytes.
+    #[serde(default = "default_payload")]
+    payload: Box<RawValue>,
 }
 
 // -- Metrics ----------------------------------------------------------------

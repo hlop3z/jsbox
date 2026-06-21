@@ -21,6 +21,11 @@
         messages.push({ key: list[i][0], payload: list[i][1] });
       }
       return call('send', { messages: messages }).published;
+    },
+    // Request-reply (NATS backend only): publish to `subject` and return the reply's
+    // parsed JSON body. Throws AMQ_UNSUPPORTED on other backends, AMQ_TIMEOUT on no reply.
+    request: function(subject, payload) {
+      return call('request', { subject: subject, payload: payload }).reply;
     }
   };
 })();

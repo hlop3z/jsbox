@@ -46,6 +46,8 @@ pub(crate) enum ErrorSource {
     Handler,
     /// The `db` capability.
     Db,
+    /// The `mongo` capability.
+    Mongo,
     /// The `mail` capability.
     Mail,
     /// The `s3` capability.
@@ -69,6 +71,7 @@ impl ErrorSource {
             "engine" => Some(Self::Engine),
             "handler" => Some(Self::Handler),
             "db" => Some(Self::Db),
+            "mongo" => Some(Self::Mongo),
             "mail" => Some(Self::Mail),
             "s3" => Some(Self::S3),
             "api" => Some(Self::Api),

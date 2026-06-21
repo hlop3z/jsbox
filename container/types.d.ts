@@ -282,6 +282,115 @@ interface Db {
 declare const db: Db;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// `mongo` — document database (present when `config.mongo` is set)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A document, keyed by field name. */
+interface MongoDoc {
+  [field: string]: any;
+}
+
+/** Options for {@link Mongo.find}. */
+interface MongoFindOptions {
+  /** Maximum documents to return (driver-side). */
+  limit?: number;
+  /** Documents to skip before returning. */
+  skip?: number;
+  /** Sort spec, e.g. `{ createdAt: -1 }`. */
+  sort?: MongoDoc;
+  /** Projection spec, e.g. `{ _id: 0, name: 1 }`. */
+  projection?: MongoDoc;
+}
+
+/** Result of {@link Mongo.find} / {@link Mongo.aggregate}. */
+interface MongoFindResult {
+  /** The documents returned (capped by the server's `max_docs`). */
+  docs: MongoDoc[];
+  /** Number of documents in {@link docs}. */
+  count: number;
+  /** `true` if documents were dropped because the result hit `max_docs`. */
+  truncated: boolean;
+}
+
+/** Result of {@link Mongo.insertOne}. */
+interface MongoInsertOneResult {
+  /** The new document's id as a string (hex for an `ObjectId`). */
+  inserted_id: string;
+}
+
+/** Result of {@link Mongo.insertMany}. */
+interface MongoInsertManyResult {
+  /** Number of documents inserted. */
+  inserted_count: number;
+}
+
+/** Result of {@link Mongo.updateOne} / {@link Mongo.updateMany}. */
+interface MongoUpdateResult {
+  /** Documents that matched the filter. */
+  matched: number;
+  /** Documents actually modified. */
+  modified: number;
+}
+
+/** Result of {@link Mongo.deleteOne} / {@link Mongo.deleteMany}. */
+interface MongoDeleteResult {
+  /** Documents removed. */
+  deleted: number;
+}
+
+/**
+ * Document-database client over an **operator-supplied** connection (`config.mongo`),
+ * so it is trusted — no SSRF guard. Synchronous (no `await`), like `db`. **Type fidelity:**
+ * values that don't fit a JS number exactly come back as **strings** — `Int64` and
+ * `Decimal128` as strings, `ObjectId` as its hex string, `Date` as RFC 3339, `Binary` as
+ * base64; `Int32`/`Double` are numbers. Filters/updates/pipelines are passed as data (never
+ * string-interpolated). A failure to reach the database throws a retryable `MONGO_CONNECTION`.
+ */
+interface Mongo {
+  /**
+   * Finds documents matching `filter`.
+   * @example mongo.find("users", { active: true }, { limit: 50, sort: { name: 1 } });
+   */
+  find(
+    collection: string,
+    filter?: MongoDoc,
+    options?: MongoFindOptions,
+  ): MongoFindResult;
+  /** Finds the first matching document, or `null`. */
+  findOne(collection: string, filter?: MongoDoc): MongoDoc | null;
+  /** Counts documents matching `filter`. */
+  count(collection: string, filter?: MongoDoc): number;
+  /**
+   * Runs an aggregation pipeline.
+   * @example mongo.aggregate("orders", [{ $group: { _id: "$user", total: { $sum: "$amount" } } }]);
+   */
+  aggregate(collection: string, pipeline: MongoDoc[]): MongoFindResult;
+  /** Inserts one document. */
+  insertOne(collection: string, doc: MongoDoc): MongoInsertOneResult;
+  /** Inserts many documents. */
+  insertMany(collection: string, docs: MongoDoc[]): MongoInsertManyResult;
+  /** Updates the first matching document (`update` needs atomic operators like `$set`). */
+  updateOne(
+    collection: string,
+    filter: MongoDoc,
+    update: MongoDoc,
+  ): MongoUpdateResult;
+  /** Updates every matching document. */
+  updateMany(
+    collection: string,
+    filter: MongoDoc,
+    update: MongoDoc,
+  ): MongoUpdateResult;
+  /** Deletes the first matching document. */
+  deleteOne(collection: string, filter: MongoDoc): MongoDeleteResult;
+  /** Deletes every matching document. */
+  deleteMany(collection: string, filter: MongoDoc): MongoDeleteResult;
+}
+
+/** Document-database client. Present only when `config.mongo` is supplied. */
+declare const mongo: Mongo;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // `mail` — SMTP send (present when `config.mail` is set)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -478,28 +587,40 @@ interface Redis {
 declare const redis: Redis;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// `amq` — RabbitMQ producer (present when `config.amq` is set)
+// `amq` — messaging producer: RabbitMQ or NATS (present when `config.amq` is set)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** A single message: `[routingKey, payload]`. The payload is published as its JSON bytes. */
+/**
+ * A single message: `[routingKey, payload]`. The payload is published as its JSON bytes.
+ * `routingKey` is a RabbitMQ routing key (queue name on the default exchange) or, on the
+ * `nats` backend, the subject.
+ */
 type AmqMessage = [routingKey: string, payload: unknown];
 
 /**
- * RabbitMQ **producer** for `config.amq` (trusted, operator-supplied — no SSRF guard).
- * Producer only (no consume). Synchronous; the whole batch is one op against `max_ops`.
- * A broker outage throws a retryable `AMQ_CONNECTION` capability error; a batch larger
- * than `config.amq.max_batch` throws `AMQ_BATCH_TOO_LARGE`.
+ * Messaging **producer** for `config.amq` (trusted, operator-supplied — no SSRF guard).
+ * The backend is `config.amq.backend`: `"rabbitmq"` (default) or `"nats"`. **Producer-side
+ * only** — publish on both backends, request-reply on `nats`; there is no subscribe/consume.
+ * Synchronous; each call is one op against `max_ops`. A broker outage throws a retryable
+ * `AMQ_CONNECTION`; a batch larger than `config.amq.max_batch` throws `AMQ_BATCH_TOO_LARGE`.
  */
 interface Amq {
   /**
-   * Publishes a batch and returns the number published. `routingKey` is the queue name
-   * for the default exchange (override via `config.amq.exchange`).
+   * Publishes a batch and returns the number published. `routingKey` is the RabbitMQ queue
+   * name (default exchange; override via `config.amq.exchange`) or the NATS subject.
    * @example amq.send([["user.created", { id: 1 }], ["user.created", { id: 2 }]]); // → 2
    */
   send(messages: AmqMessage[]): number;
+  /**
+   * **NATS backend only.** Publishes a request to `subject` and returns the reply's parsed
+   * JSON body, bounded by `config.amq.request_timeout_ms`. Throws `AMQ_UNSUPPORTED` on the
+   * RabbitMQ backend and a retryable `AMQ_TIMEOUT` when no reply arrives in time.
+   * @example const pong = amq.request("service.ping", { hi: true });
+   */
+  request<T = any>(subject: string, payload?: unknown): T;
 }
 
-/** RabbitMQ producer. Present only when `config.amq` is supplied. */
+/** Messaging producer. Present only when `config.amq` is supplied. */
 declare const amq: Amq;
 
 // ─────────────────────────────────────────────────────────────────────────────

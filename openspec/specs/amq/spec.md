@@ -2,12 +2,17 @@
 
 ## Purpose
 
-The `amq` capability exposes a `RabbitMQ` **producer** to the `QuickJS` sandbox so a handler can
-publish messages to a broker. It follows the trusted-connection model of `db`/`mail`: the broker
-is operator-supplied in `config.amq`, so there is no SSRF guard. It is producer-only (publish; no
-consume/subscribe). The single JS surface is `amq.send(...)`, which publishes a batch in one
-connection trip and meters message count and payload bytes. Rationale: `src/amq.rs`,
-`src/js/amq.js`, and `docs/08-amq.md`.
+The `amq` capability is the system's **messaging** capability: it exposes a message producer to
+the `QuickJS` sandbox so a handler can publish messages to a broker. It supports two operator-
+selected backends — `RabbitMQ` (the default) and subject-based messaging (`NATS`) — chosen by
+`config.amq.backend`. Subject-based messaging is admitted as a *backend of this capability*, not a
+new top-level capability, per the capability-admission gate in `docs-sys/rfc.md` §3.5. It follows
+the trusted-connection model of `db`/`mail`: the broker is operator-supplied in `config.amq`, so
+there is no SSRF guard. It is **producer-side only** — publish for both backends, plus request-
+reply for the `NATS` backend; **subscribe / streaming consumption is explicitly out of scope** (it
+does not fit the bounded single-execution model). The JS surface is `amq.send(...)` (publish a
+batch in one connection trip) and `amq.request(...)` (request-reply, `NATS` backend only), metering
+message count and payload bytes. Rationale: `src/amq.rs`, `src/js/amq.js`, and `docs/08-amq.md`.
 
 ## Requirements
 
@@ -25,6 +30,28 @@ it does not exist in the sandbox.
 
 - **WHEN** a request omits `config.amq`
 - **THEN** `typeof amq === "undefined"` inside the handler
+
+### Requirement: Backend selection
+
+The capability SHALL select its messaging backend from `config.amq.backend`, one of `rabbitmq`
+(default) or `nats`. The selected backend determines how connection fields are interpreted and
+which operations are available, but the JS surface for publishing (`amq.send`) is identical across
+backends.
+
+#### Scenario: Default backend
+
+- **WHEN** `config.amq` omits `backend`
+- **THEN** the `rabbitmq` backend is used
+
+#### Scenario: NATS backend selected
+
+- **WHEN** `config.amq.backend` is `nats`
+- **THEN** the subject-based-messaging backend is used and routing keys are interpreted as subjects
+
+#### Scenario: Unknown backend rejected
+
+- **WHEN** `config.amq.backend` is a value other than `rabbitmq` or `nats`
+- **THEN** the request is rejected before execution as a malformed request
 
 ### Requirement: Trusted operator-supplied broker connection
 
@@ -80,6 +107,56 @@ routing key (the queue name under the default exchange).
 
 - **WHEN** the handler calls `amq.send` with no messages
 - **THEN** the call fails with an `amq` error indicating at least one message is required
+
+### Requirement: NATS backend connection and publish
+
+When `config.amq.backend` is `nats`, the capability SHALL connect to the operator-supplied
+`host`/`port` (default port `4222`), optionally authenticating with `username`/`password` or a
+`token`, optionally over TLS, and SHALL publish each `amq.send` pair as a message whose routing key
+is the NATS **subject** and whose body is the payload's JSON bytes. The `exchange` and `vhost`
+fields do not apply to the `nats` backend.
+
+#### Scenario: NATS publish via amq.send
+
+- **WHEN** the `nats` backend is selected and the handler calls `amq.send([["events.user", {id: 1}]])`
+- **THEN** the message is published to subject `events.user` and the call returns `1`
+
+#### Scenario: NATS default port and auth
+
+- **WHEN** `config.amq` omits `port` under the `nats` backend
+- **THEN** port `4222` is used, and `username`/`password` or `token` (when supplied) authenticate the connection
+
+### Requirement: NATS request-reply via amq.request
+
+When `config.amq.backend` is `nats`, the capability SHALL expose `amq.request(subject, payload)`
+that publishes a request to `subject` and returns the first reply's JSON body, bounded by
+`config.amq.request_timeout_ms` (default 5000). On any other backend `amq.request` SHALL fail with
+a non-retryable `AMQ_UNSUPPORTED` error owned by the developer.
+
+#### Scenario: Request-reply returns the reply body
+
+- **WHEN** the `nats` backend is selected and a responder is listening on the subject
+- **THEN** `amq.request(subject, payload)` returns the reply message's parsed JSON body
+
+#### Scenario: No responder within the timeout
+
+- **WHEN** no reply arrives within `request_timeout_ms`
+- **THEN** the call fails with a retryable `AMQ_TIMEOUT` error owned by the operator
+
+#### Scenario: Request-reply unsupported on RabbitMQ
+
+- **WHEN** the `rabbitmq` backend is selected and the handler calls `amq.request(...)`
+- **THEN** the call fails with code `AMQ_UNSUPPORTED`, non-retryable, owned by the developer
+
+### Requirement: Producer-only — no subscribe
+
+The capability SHALL NOT expose any subscribe, consume, or streaming-receive operation on either
+backend, because an open-ended subscription does not fit the bounded single-execution model.
+
+#### Scenario: No subscribe surface
+
+- **WHEN** a handler inspects the `amq` global
+- **THEN** it exposes only `send` (both backends) and `request` (NATS backend) and no subscribe/consume method
 
 ### Requirement: Batch size cap
 

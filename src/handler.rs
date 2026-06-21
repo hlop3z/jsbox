@@ -27,6 +27,7 @@ use crate::http::HttpMetric;
 use crate::kv::{RedisConfig, RedisMetric};
 use crate::mail::{MailConfig, MailMetric};
 use crate::metrics::{Capability, Metrics};
+use crate::mongo::{MongoConfig, MongoMetric};
 use crate::partition::PartitionLimiter;
 use crate::pool::JsPool;
 use crate::registry::ScriptRegistry;
@@ -117,6 +118,9 @@ pub(crate) struct RequestConfig {
     /// Database connection config (omit to disable `db` in JS).
     #[serde(default)]
     pub(crate) db: Option<DbConfig>,
+    /// Mongo (document DB) config (omit to disable `mongo` in JS).
+    #[serde(default)]
+    pub(crate) mongo: Option<MongoConfig>,
     /// Mail/SMTP config (omit to disable `mail` in JS).
     #[serde(default)]
     pub(crate) mail: Option<MailConfig>,
@@ -149,6 +153,8 @@ struct ExecMetrics {
     http: Vec<HttpMetric>,
     /// DB operation metrics.
     db: Vec<DbMetric>,
+    /// Mongo operation metrics.
+    mongo: Vec<MongoMetric>,
     /// Mail operation metrics.
     mail: Vec<MailMetric>,
     /// S3 presign metrics.
@@ -185,6 +191,8 @@ struct Meta {
     http_requests: Vec<HttpMetric>,
     /// Database operations made by the script.
     db_requests: Vec<DbMetric>,
+    /// Mongo operations made by the script.
+    mongo_requests: Vec<MongoMetric>,
     /// Mail operations made by the script.
     mail_requests: Vec<MailMetric>,
     /// S3 presign operations made by the script.
@@ -215,6 +223,7 @@ impl Meta {
             exec_time_us,
             http_requests: Vec::new(),
             db_requests: Vec::new(),
+            mongo_requests: Vec::new(),
             mail_requests: Vec::new(),
             s3_requests: Vec::new(),
             redis_requests: Vec::new(),
@@ -239,6 +248,7 @@ impl Meta {
     fn with_metrics(mut self, metrics: ExecMetrics) -> Self {
         self.http_requests = metrics.http;
         self.db_requests = metrics.db;
+        self.mongo_requests = metrics.mongo;
         self.mail_requests = metrics.mail;
         self.s3_requests = metrics.s3;
         self.redis_requests = metrics.redis;
@@ -291,6 +301,11 @@ fn raw_null_ref() -> &'static RawValue {
 /// Takes `Result<Json<…>, JsonRejection>` rather than `Json<…>` so a malformed or
 /// type-confused body is handled here as a structured `{data, error, meta}` envelope,
 /// instead of axum short-circuiting with its default plain-text rejection.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear request pipeline (auth → validate → admit → spawn → respond); \
+              splitting it would scatter the shared trace_id/meta/permit state"
+)]
 pub(crate) async fn execute(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -388,6 +403,7 @@ pub(crate) async fn execute(
             timeout: engine_cfg.timeout(),
             allowed_hosts: &config.allowed_hosts,
             db_config: db_config.as_ref(),
+            mongo_config: config.mongo.as_ref(),
             mail_config: config.mail.as_ref(),
             s3_config: config.s3.as_ref(),
             redis_config: config.redis.as_ref(),
@@ -450,6 +466,7 @@ fn build_response(
             let drained = ExecMetrics {
                 http: exec.http_metrics,
                 db: exec.db_metrics,
+                mongo: exec.mongo_metrics,
                 mail: exec.mail_metrics,
                 s3: exec.s3_metrics,
                 redis: exec.redis_metrics,
@@ -485,6 +502,9 @@ fn build_response(
 fn record_capability_latencies(metrics: &Metrics, exec: &ExecResult) {
     for metric in &exec.db_metrics {
         metrics.observe_op(Capability::Db, metric.duration_us());
+    }
+    for metric in &exec.mongo_metrics {
+        metrics.observe_op(Capability::Mongo, metric.duration_us());
     }
     for metric in &exec.http_metrics {
         metrics.observe_op(Capability::Http, metric.duration_us());

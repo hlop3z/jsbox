@@ -39,6 +39,8 @@ use crate::kv::{RedisConfig, RedisMetric};
 use crate::mail;
 use crate::mail::{MailConfig, MailMetric};
 use crate::modules;
+use crate::mongo;
+use crate::mongo::{MongoConfig, MongoMetric};
 use crate::s3;
 use crate::s3::{S3Config, S3Metric};
 use crate::sandbox::{self, Collector};
@@ -71,6 +73,8 @@ pub(crate) struct ExecParams<'a> {
     pub(crate) allowed_hosts: &'a [String],
     /// Database config (None = disabled).
     pub(crate) db_config: Option<&'a DbConfig>,
+    /// Mongo (document DB) config (None = disabled).
+    pub(crate) mongo_config: Option<&'a MongoConfig>,
     /// Mail config (None = disabled).
     pub(crate) mail_config: Option<&'a MailConfig>,
     /// S3 config (None = disabled).
@@ -103,6 +107,8 @@ pub(crate) struct ExecResult {
     pub(crate) http_metrics: Vec<HttpMetric>,
     /// DB operations made during execution.
     pub(crate) db_metrics: Vec<DbMetric>,
+    /// Mongo operations made during execution.
+    pub(crate) mongo_metrics: Vec<MongoMetric>,
     /// Mail operations made during execution.
     pub(crate) mail_metrics: Vec<MailMetric>,
     /// S3 operations made during execution.
@@ -158,8 +164,10 @@ pub(crate) enum EngineError {
         /// JS stack trace, when available.
         stack: Option<String>,
     },
-    /// A capability's native call failed and its wrapper threw a tagged error.
-    Capability(CapabilityErr),
+    /// A capability's native call failed and its wrapper threw a tagged error. Boxed: it
+    /// is by far the largest variant (it carries `details`/`raw`/`stack`), so boxing keeps
+    /// `EngineError` small in the common (non-capability) paths.
+    Capability(Box<CapabilityErr>),
 }
 
 /// A capability error read off a thrown JS error's `__jsbox` tag (or built for an
@@ -217,6 +225,7 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
 
     let mut http_collector: Option<Collector<HttpMetric>> = None;
     let mut db_collector: Option<Collector<DbMetric>> = None;
+    let mut mongo_collector: Option<Collector<MongoMetric>> = None;
     let mut mail_collector: Option<Collector<MailMetric>> = None;
     let mut s3_collector: Option<Collector<S3Metric>> = None;
     let mut redis_collector: Option<Collector<RedisMetric>> = None;
@@ -226,6 +235,7 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
     let mut collectors = Collectors {
         http: &mut http_collector,
         db: &mut db_collector,
+        mongo: &mut mongo_collector,
         mail: &mut mail_collector,
         s3: &mut s3_collector,
         redis: &mut redis_collector,
@@ -263,6 +273,7 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         outcome,
         http_metrics: sandbox::drain(http_collector.as_ref()),
         db_metrics: sandbox::drain(db_collector.as_ref()),
+        mongo_metrics: sandbox::drain(mongo_collector.as_ref()),
         mail_metrics: sandbox::drain(mail_collector.as_ref()),
         s3_metrics: sandbox::drain(s3_collector.as_ref()),
         redis_metrics: sandbox::drain(redis_collector.as_ref()),
@@ -300,6 +311,8 @@ struct Collectors<'a> {
     http: &'a mut Option<Collector<HttpMetric>>,
     /// DB metrics collector slot.
     db: &'a mut Option<Collector<DbMetric>>,
+    /// Mongo metrics collector slot.
+    mongo: &'a mut Option<Collector<MongoMetric>>,
     /// Mail metrics collector slot.
     mail: &'a mut Option<Collector<MailMetric>>,
     /// S3 metrics collector slot.
@@ -371,6 +384,20 @@ fn inject_apis(
                 params.max_ops,
             )
             .map_err(map_db_inject_error)?,
+        );
+    }
+    if let Some(mongo_cfg) = params.mongo_config {
+        *collectors.mongo = Some(
+            mongo::inject_mongo(
+                qctx,
+                mongo_cfg,
+                &mongo::MongoDeps {
+                    handle: params.tokio_handle,
+                    timeout: params.timeout,
+                },
+                params.max_ops,
+            )
+            .map_err(EngineError::internal)?,
         );
     }
     if let Some(mail_cfg) = params.mail_config {
@@ -587,7 +614,7 @@ fn classify_throw(qctx: &Ctx<'_>, timed_out: &AtomicBool, timeout: Duration) -> 
     let stack = read_str_prop(obj, "stack");
 
     if let Some(cap) = read_capability_tag(qctx, obj, stack.clone()) {
-        return EngineError::Capability(cap);
+        return EngineError::Capability(Box::new(cap));
     }
     let message = read_str_prop(obj, "message").unwrap_or_default();
     EngineError::Script { message, stack }
@@ -710,7 +737,7 @@ fn attach_debug(
 /// contain credentials / PII) out of the always-present `message`.
 const fn capability_message(source: ErrorSource) -> &'static str {
     match source {
-        ErrorSource::Db => "database request failed",
+        ErrorSource::Db | ErrorSource::Mongo => "database request failed",
         ErrorSource::Mail => "mail delivery failed",
         ErrorSource::S3 => "object storage request failed",
         ErrorSource::Api => "upstream request failed",
@@ -731,7 +758,7 @@ impl EngineError {
 
     /// Builds a capability error for an inject-time failure (no JS throw involved).
     fn capability_inject(source: ErrorSource, fault: Fault, raw: String) -> Self {
-        Self::Capability(CapabilityErr {
+        Self::Capability(Box::new(CapabilityErr {
             source,
             code: fault.code.to_owned(),
             retryable: fault.retryable,
@@ -739,7 +766,7 @@ impl EngineError {
             raw: Some(raw),
             stack: None,
             details: None,
-        })
+        }))
     }
 
     /// HTTP status for this error per `docs/99-errors.md`.

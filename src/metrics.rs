@@ -117,6 +117,8 @@ fn bucket_labels(extra: &str, le: &str) -> String {
 pub(crate) enum Capability {
     /// `db` (Postgres-family).
     Db,
+    /// `mongo` (document database).
+    Mongo,
     /// `api` (outbound HTTP).
     Http,
     /// `mail` (SMTP).
@@ -137,6 +139,8 @@ pub(crate) enum Capability {
 struct CapabilityLatencies {
     /// `db` op latency.
     db: LatencyHistogram,
+    /// `mongo` op latency.
+    mongo: LatencyHistogram,
     /// `api` request latency.
     http: LatencyHistogram,
     /// `mail` op latency.
@@ -156,6 +160,7 @@ impl CapabilityLatencies {
     const fn histogram(&self, cap: Capability) -> &LatencyHistogram {
         match cap {
             Capability::Db => &self.db,
+            Capability::Mongo => &self.mongo,
             Capability::Http => &self.http,
             Capability::Mail => &self.mail,
             Capability::S3 => &self.s3,
@@ -171,6 +176,7 @@ impl CapabilityLatencies {
         let name = "jsbox_capability_op_duration_seconds";
         let series: Vec<String> = [
             ("db", &self.db),
+            ("mongo", &self.mongo),
             ("http", &self.http),
             ("mail", &self.mail),
             ("s3", &self.s3),
