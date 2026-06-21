@@ -86,7 +86,11 @@ Each principle states when it applies and when it MUST NOT be applied.
   NOT:* be introduced speculatively for one use.
 - **Mirror the canonical form.** New code MUST follow the established shape of its peers rather
   than inventing a parallel idiom. *Applies:* adding a capability or surface. *MUST NOT:* deviate
-  without the deviation itself becoming the new canonical form, documented as such.
+  without the deviation itself becoming the new canonical form, documented as such. This includes
+  **naming**: a public surface MUST adopt the naming convention shared by its sibling surfaces of
+  the same kind, NOT the convention of whatever underlying library or vendor it wraps. A wrapper
+  translating an external API MUST rename to the house convention at the boundary; carrying the
+  dependency's casing or terminology inward is a parallel idiom and is forbidden.
 - **Single discoverable surface.** A public capability MUST have exactly one canonical, self-
   describing interface; no shadow shortcuts or duplicate entry points. *Applies:* all public
   surfaces. *MUST NOT:* be duplicated "for ergonomics."
