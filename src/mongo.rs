@@ -441,7 +441,7 @@ async fn do_count(
     collection: &Collection<Document>,
     payload: MongoPayload,
 ) -> Result<MongoOutcome, MongoError> {
-    let filter = json_to_doc(payload.filter)?;
+    let filter = json_to_doc(&payload.filter)?;
     let count = collection
         .count_documents(filter)
         .max_time(call.op_timeout)
@@ -508,7 +508,7 @@ async fn do_insert_one(
     collection: &Collection<Document>,
     payload: MongoPayload,
 ) -> Result<MongoOutcome, MongoError> {
-    let doc = json_to_doc(payload.doc)?;
+    let doc = json_to_doc(&payload.doc)?;
     let result = collection
         .insert_one(doc)
         .await
