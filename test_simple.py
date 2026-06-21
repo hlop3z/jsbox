@@ -285,6 +285,16 @@ PG_CONFIG = {"host": PG_HOST, "port": PG_PORT, "user": "test", "password": "test
 PGB_CONFIG = {"host": PGBOUNCER_HOST, "port": PGBOUNCER_PORT, "user": "test", "password": "test", "database": "testdb"}
 CR_CONFIG = {"host": CR_HOST, "port": CR_PORT, "user": "root", "password": "", "database": "testdb"}
 
+# -- Mongo + NATS endpoints (the `mongo` / `nats` services in docker-compose) ----------
+MONGO_HOST = os.environ.get("MONGO_HOST", "localhost")
+MONGO_PORT = int(os.environ.get("MONGO_PORT", "27017"))
+# Standalone dev node has no auth, so username/password are omitted.
+MONGO_CONFIG = {"host": MONGO_HOST, "port": MONGO_PORT, "database": "testdb"}
+
+NATS_HOST = os.environ.get("NATS_HOST", "localhost")
+NATS_PORT = int(os.environ.get("NATS_PORT", "4222"))
+NATS_CONFIG = {"backend": "nats", "host": NATS_HOST, "port": NATS_PORT}
+
 SETUP_SQL = """
     DROP TABLE IF EXISTS test_types;
     DROP TABLE IF EXISTS test_txn;
@@ -463,6 +473,85 @@ def test_db_engine(t: Runner, label: str, db: dict):
 
 
 # -- Script registry (execute by key) ----------------------------------------
+
+def _mongo_available(config: dict) -> bool:
+    """Check if MongoDB is reachable."""
+    resp = _post(h("mongo.count('t_probe', {}); return json('up', null);", config={"mongo": config}))
+    return resp is not None and resp.get("data") == "up"
+
+
+def test_mongo(t: Runner):
+    """Mongo capability — string `_id`s sidestep the ObjectId-filter caveat (a hex-string
+    filter is a BSON string, not an ObjectId, so explicit string ids match cleanly)."""
+    t.section("Mongo (document store)")
+    cfg = {"mongo": MONGO_CONFIG}
+
+    t.test("clean collection",
+           h("mongo.deleteMany('t_users', {}); return json('ok', null);", config=cfg),
+           data_eq("ok"))
+    t.test("insertOne returns id",
+           h("var r = mongo.insertOne('t_users', {_id:'u1', name:'Alice', active:true}); return json(r.inserted_id, null);", config=cfg),
+           data_eq("u1"))
+    t.test("insertMany returns count",
+           h("var r = mongo.insertMany('t_users', [{_id:'u2',name:'Bob',active:true},{_id:'u3',name:'Cy',active:false}]); return json(r.inserted_count, null);", config=cfg),
+           data_eq(2))
+    t.test("count all",
+           h("return json(mongo.count('t_users', {}), null);", config=cfg),
+           data_eq(3))
+    t.test("findOne by id",
+           h("return json(mongo.findOne('t_users', {_id:'u1'}).name, null);", config=cfg),
+           data_eq("Alice"))
+    t.test("findOne missing is null",
+           h("return json(mongo.findOne('t_users', {_id:'nope'}), null);", config=cfg),
+           data_is_none())
+    t.test("find filter + result shape",
+           h("var r = mongo.find('t_users', {active:true}, {sort:{_id:1}}); return json({n:r.count, trunc:r.truncated, first:r.docs[0]._id}, null);", config=cfg),
+           lambda r: r["data"]["n"] == 2 and r["data"]["trunc"] is False and r["data"]["first"] == "u1")
+    t.test("updateOne matched+modified",
+           h("var r = mongo.updateOne('t_users', {_id:'u1'}, {$set:{active:false}}); return json([r.matched, r.modified], null);", config=cfg),
+           data_eq([1, 1]))
+    t.test("count after update",
+           h("return json(mongo.count('t_users', {active:true}), null);", config=cfg),
+           data_eq(1))
+    t.test("aggregate group",
+           h("return json(mongo.aggregate('t_users', [{$group:{_id:'$active', n:{$sum:1}}}]).count, null);", config=cfg),
+           data_eq(2))
+    t.test("deleteOne",
+           h("return json(mongo.deleteOne('t_users', {_id:'u3'}).deleted, null);", config=cfg),
+           data_eq(1))
+    # Duplicate key is a developer write error.
+    t.test("duplicate key -> MONGO_WRITE",
+           h("mongo.insertOne('t_users', {_id:'u1'}); return json('nope', null);", config=cfg),
+           lambda r: r["data"] is None and _err_code(r) == "MONGO_WRITE")
+    # A malformed filter classifies as a developer query error (tolerant of the exact code).
+    t.test("bad filter -> MONGO_ classified error",
+           h("mongo.find('t_users', {$badOp: 1}); return json('nope', null);", config=cfg),
+           lambda r: r["data"] is None and str(_err_code(r) or "").startswith("MONGO_"))
+
+
+def _nats_available(config: dict) -> bool:
+    """Check if NATS is reachable (a publish to an unsubscribed subject still succeeds)."""
+    resp = _post(h("amq.send([['_probe', {p:1}]]); return json('up', null);", config={"amq": config}))
+    return resp is not None and resp.get("data") == "up"
+
+
+def test_nats(t: Runner):
+    """NATS backend of the `amq` capability: publish + request-reply (no subscribe)."""
+    t.section("NATS (amq backend)")
+    cfg = {"amq": NATS_CONFIG}
+
+    t.test("publish batch -> count",
+           h("return json(amq.send([['ev.a', {i:1}], ['ev.b', {i:2}]]), null);", config=cfg),
+           data_eq(2))
+    t.test("single-pair shorthand -> 1",
+           h("return json(amq.send(['ev.c', {i:3}]), null);", config=cfg),
+           data_eq(1))
+    # No responder on the subject -> a classified amq error (short timeout keeps it fast).
+    fast = {"amq": dict(NATS_CONFIG, request_timeout_ms=500)}
+    t.test("request with no responder -> AMQ_ error",
+           h("amq.request('no.responder.here', {ping:1}); return json('nope', null);", config=fast),
+           lambda r: r["data"] is None and str(_err_code(r) or "").startswith("AMQ_"))
+
 
 def test_registry(t: Runner):
     """Exercise `key` mode: XOR validation always; execution if the registry is loaded."""
@@ -1298,6 +1387,17 @@ def main():
         test_db_engine(t, "CockroachDB", CR_CONFIG)
     else:
         print("\n  \033[33mSKIP\033[0m CockroachDB tests (not running — use: docker compose up -d)\n")
+
+    # Mongo + NATS — only if their containers are running
+    if _mongo_available(MONGO_CONFIG):
+        test_mongo(t)
+    else:
+        print("\n  \033[33mSKIP\033[0m Mongo tests (not running — use: docker compose up -d mongo)\n")
+
+    if _nats_available(NATS_CONFIG):
+        test_nats(t)
+    else:
+        print("\n  \033[33mSKIP\033[0m NATS tests (not running — use: docker compose up -d nats)\n")
 
     # Auth tests — only against identity providers that are reachable
     run_auth_tests(t)

@@ -553,8 +553,8 @@ async fn do_update(
     payload: MongoPayload,
     many: bool,
 ) -> Result<MongoOutcome, MongoError> {
-    let filter = json_to_doc(payload.filter)?;
-    let update = json_to_doc(payload.update)?;
+    let filter = json_to_doc(&payload.filter)?;
+    let update = json_to_doc(&payload.update)?;
     let result = if many {
         collection.update_many(filter, update).await
     } else {
@@ -578,7 +578,7 @@ async fn do_delete(
     payload: MongoPayload,
     many: bool,
 ) -> Result<MongoOutcome, MongoError> {
-    let filter = json_to_doc(payload.filter)?;
+    let filter = json_to_doc(&payload.filter)?;
     let result = if many {
         collection.delete_many(filter).await
     } else {
@@ -709,6 +709,10 @@ fn bson_to_json(value: Bson) -> Value {
 
 /// Renders an inserted-id BSON value as a string (hex for `ObjectId`).
 fn id_to_string(id: Bson) -> String {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "mongodb::bson::Bson is #[non_exhaustive]; any non-id type falls back to its string form"
+    )]
     match id {
         Bson::ObjectId(oid) => oid.to_hex(),
         Bson::String(text) => text,

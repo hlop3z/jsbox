@@ -82,6 +82,33 @@ services:
       timeout: 10s
       retries: 15
 
+  # Document store for the `mongo` capability tests. No auth (standalone dev node) — the
+  # suite points `config.mongo` at host port 27017. In-network: mongo:27017.
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 5s
+      timeout: 10s
+      retries: 15
+
+  # Subject-based messaging server for the `amq` nats-backend tests. `-js` enables
+  # JetStream (harmless; the suite uses only core publish + request-reply). No auth — the
+  # suite points `config.amq` at host port 4222 with `backend: "nats"`. In-network: nats:4222.
+  nats:
+    image: nats:2-alpine
+    command: ["-js"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
   cockroach:
     image: cockroachdb/cockroach:latest-v24.3
     command: start-single-node --insecure --advertise-addr=cockroach

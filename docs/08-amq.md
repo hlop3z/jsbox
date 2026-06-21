@@ -9,8 +9,10 @@ a worker on the other side collects it when it's ready.
 This is great for slow or background jobs — "send a welcome email", "resize this image",
 "charge this card" — that you don't want to wait around for inside your handler.
 
-> jsbox talks to **RabbitMQ**. jsbox is a **producer** only: it _sends_ messages. It does
-> **not** receive/consume them — that's the worker's job, somewhere else.
+> jsbox talks to **RabbitMQ** (the default) or **NATS** — pick with `config.amq.backend`.
+> Either way jsbox is **producer-side** only: it _sends_ messages (and, on NATS, can _ask and
+> wait for one reply_). It does **not** subscribe/consume a stream — that's the worker's job,
+> somewhere else.
 
 ## Turn it on first 🔑
 
@@ -33,6 +35,25 @@ Give the robot the address of your broker with `config.amq`:
 ```
 
 No `config.amq` → `amq` is turned off.
+
+### Using NATS instead 🟢
+
+Set `"backend": "nats"`. Now the routing key is a **subject**, the port defaults to `4222`,
+and `vhost`/`exchange` don't apply. Auth is optional (`username`+`password`, or a `token`):
+
+```json
+{
+  "config": {
+    "amq": {
+      "backend": "nats",
+      "host": "localhost",
+      "port": 4222,
+      "token": "s3cr3t",
+      "request_timeout_ms": 5000
+    }
+  }
+}
+```
 
 > **Managed RabbitMQ (CloudAMQP, etc.)?** Add `"tls": true` (the port is usually `5671`)
 > for `amqps://`. For a self-hosted broker with a private certificate, also set
@@ -64,6 +85,24 @@ Sending just one? You can skip the outer list:
 ```js
 amq.send(["emails", { to: ctx.email, subject: "Welcome!" }]); // → 1
 ```
+
+## Ask and wait: `amq.request` (NATS only) 📨↩️
+
+Sometimes you don't just want to drop a message — you want to **ask a question and wait for
+one answer**. On the NATS backend, `amq.request(subject, payload)` sends a request and returns
+the first reply's JSON body:
+
+```js
+function handler(ctx) {
+  var pong = amq.request("service.ping", { hi: true });
+  return json({ reply: pong }, null);
+}
+```
+
+- It waits up to `config.amq.request_timeout_ms` (default 5000). No reply in time → a
+  retryable `AMQ_TIMEOUT` error.
+- On the **RabbitMQ** backend there's no request-reply, so calling it throws `AMQ_UNSUPPORTED`.
+- There's still **no subscribe/consume** — `amq` only ever sends.
 
 ## One batch = one trip 🚚
 

@@ -39,7 +39,7 @@ const AMQ_CONNECTION: Fault = Fault::new("AMQ_CONNECTION", true, ErrorOwner::Ope
 const AMQ_BATCH: Fault = Fault::new("AMQ_BATCH_TOO_LARGE", false, ErrorOwner::Developer);
 /// Fault for a request-reply that received no reply within the timeout (NATS backend).
 const AMQ_TIMEOUT: Fault = Fault::new("AMQ_TIMEOUT", true, ErrorOwner::Operator);
-/// Fault for an operation the selected backend does not support (e.g. `request` on RabbitMQ).
+/// Fault for an operation the selected backend does not support (e.g. `request` on `RabbitMQ`).
 const AMQ_UNSUPPORTED: Fault = Fault::new("AMQ_UNSUPPORTED", false, ErrorOwner::Developer);
 
 /// Messaging backend selected by `config.amq.backend`.
@@ -61,22 +61,22 @@ pub(crate) struct AmqConfig {
     pub(crate) backend: AmqBackend,
     /// Broker host.
     pub(crate) host: String,
-    /// Broker port (default 5672 for RabbitMQ, 4222 for NATS).
+    /// Broker port (default 5672 for `RabbitMQ`, 4222 for NATS).
     #[serde(default)]
     pub(crate) port: Option<u16>,
-    /// Username — RabbitMQ defaults to `guest`; NATS authenticates only when supplied.
+    /// Username — `RabbitMQ` defaults to `guest`; NATS authenticates only when supplied.
     #[serde(default)]
     pub(crate) username: Option<String>,
-    /// Password — RabbitMQ defaults to `guest`; NATS authenticates only when supplied.
+    /// Password — `RabbitMQ` defaults to `guest`; NATS authenticates only when supplied.
     #[serde(default)]
     pub(crate) password: Option<String>,
     /// Bearer token auth (NATS backend only).
     #[serde(default)]
     pub(crate) token: Option<String>,
-    /// Virtual host (RabbitMQ, default `/`).
+    /// Virtual host (`RabbitMQ`, default `/`).
     #[serde(default = "default_vhost")]
     pub(crate) vhost: String,
-    /// Exchange to publish to (RabbitMQ, default `""` — the default exchange).
+    /// Exchange to publish to (`RabbitMQ`, default `""` — the default exchange).
     #[serde(default)]
     pub(crate) exchange: String,
     /// Maximum messages per `send` call (default 100).

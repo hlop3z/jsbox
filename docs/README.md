@@ -29,15 +29,17 @@ Read these in order. Each one is short.
    straight to your bucket (S3, R2, MinIO…). 🔗
 7. **[`redis` — a super-fast notebook](07-redis.md)** — stash little bits of data by name
    (cache, counters, sessions). 📝
-8. **[`amq` — send messages to a queue](08-amq.md)** — drop jobs into RabbitMQ for a
-   worker to pick up later. 📮
+8. **[`amq` — send messages to a queue](08-amq.md)** — drop jobs into RabbitMQ or NATS for a
+   worker to pick up later (NATS can also ask-and-wait). 📮
 9. **[`$sys` — the built-in toolbox](09-sys.md)** — hashing, signing, dates, and
    use-but-never-see secrets. Always on (no setup) for `crypto` + `date`. 🧰
 10. **[`auth` — who is this person?](10-auth.md)** — check a login token and get the
     user's details from your identity server (Zitadel, Keycloak, Auth0…). 🪪
 11. **[Hasura — GraphQL the easy way](11-hasura.md)** — the `hasura/client` module:
     query Hasura with one line and never miss a hidden GraphQL error. 🚀
-12. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
+12. **[`mongo` — talk to a document database](12-mongo.md)** — read and save JSON-shaped
+    documents in MongoDB. 🍃
+13. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
     something fails, and how to read it. 🚦
 
 ## The super-powers 🦸
@@ -49,10 +51,11 @@ little `config` to your message. That keeps things safe.
 | ----------------------- | --------------------------- | ---------------------- |
 | `api`                   | Talk to other websites      | `config.allowed_hosts` |
 | `db`                    | Talk to a database          | `config.db`            |
+| `mongo`                 | Talk to a document database | `config.mongo`         |
 | `mail`                  | Send email                  | `config.mail`          |
 | `s3`                    | Signed upload links         | `config.s3`            |
 | `redis`                 | A super-fast notebook       | `config.redis`         |
-| `amq`                   | Send messages to a queue    | `config.amq`           |
+| `amq`                   | Send messages (RabbitMQ/NATS) | `config.amq`         |
 | `auth`                  | Check a login token         | `config.auth`          |
 | `$sys.env` / `.secrets` | Settings + use-only secrets | `config.sys`           |
 

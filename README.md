@@ -62,6 +62,7 @@ POST /execute
 | `context`              | no       | JSON object passed as `ctx` to the handler                               |
 | `config.allowed_hosts` | no       | Hosts the script can reach via `api.*` (`["*"]` = any, `[]` = disabled)  |
 | `config.db`            | no       | PostgreSQL/CockroachDB connection (omit to disable `db.*`)               |
+| `config.mongo`         | no       | MongoDB connection (omit to disable `mongo.*`)                           |
 | `config.mail`          | no       | SMTP relay connection (omit to disable `mail.*`)                         |
 | `config.s3`            | no       | S3/R2/MinIO connection for presigned URLs (omit to disable `s3.*`)       |
 | `config.auth`          | no       | OIDC/IAM issuer for `auth.*` token validation (omit to disable `auth.*`) |
@@ -162,7 +163,7 @@ flapping database without parsing logs:
 | `jsbox_bulkhead_permits_available`     | gauge     | —                                                                                                                            | Free global bulkhead permits right now.                                         |
 | `jsbox_bulkhead_permits_total`         | gauge     | —                                                                                                                            | Configured global bulkhead capacity.                                            |
 | `jsbox_execution_duration_seconds`     | histogram | `le`                                                                                                                         | Execution wall-clock latency (`_bucket`/`_sum`/`_count`; executions that ran).  |
-| `jsbox_capability_op_duration_seconds` | histogram | `capability` (`db`/`http`/`mail`/`s3`/`redis`/`amq`/`auth`), `le`                                                            | Per-capability op latency — which downstream is slow, not just total exec time. |
+| `jsbox_capability_op_duration_seconds` | histogram | `capability` (`db`/`mongo`/`http`/`mail`/`s3`/`redis`/`amq`/`auth`), `le`                                                            | Per-capability op latency — which downstream is slow, not just total exec time. |
 
 ## JS API
 
@@ -464,11 +465,12 @@ in the binary). A failure to reach Redis surfaces as a retryable
 `capability/redis/REDIS_CONNECTION` (HTTP 200), not a server fault. Each call is one op
 against `max_ops`.
 
-### amq.send — RabbitMQ producer
+### amq.send / amq.request — messaging producer (RabbitMQ or NATS)
 
-Publishes a **batch** of messages to RabbitMQ (`config.amq`, trusted — no SSRF guard).
-**Producer only.** List-always: `amq.send([[routingKey, payload], …])`; Rust opens one
-connection for the whole batch. Synchronous.
+Publishes a **batch** of messages (`config.amq`, trusted — no SSRF guard). **Producer-side
+only** (no subscribe/consume). The backend is `config.amq.backend`: `"rabbitmq"` (default) or
+`"nats"`. List-always: `amq.send([[routingKey, payload], …])`; Rust opens one connection for
+the whole batch. Synchronous.
 
 ```js
 function handler(ctx) {
@@ -480,16 +482,52 @@ function handler(ctx) {
 }
 ```
 
-The message **body is the JSON of each `payload`**; `routingKey` is the queue name for the
-default exchange (override with `config.amq.exchange`). The **whole batch is one op**
-against `max_ops` (a batch ≈ one round trip); a batch over `config.amq.max_batch` (default 100) is rejected with `AMQ_BATCH_TOO_LARGE`. A broker outage → retryable
+The message **body is the JSON of each `payload`**; `routingKey` is the RabbitMQ queue name for
+the default exchange (override with `config.amq.exchange`) or the NATS **subject**. The **whole
+batch is one op** against `max_ops`; a batch over `config.amq.max_batch` (default 100) is
+rejected with `AMQ_BATCH_TOO_LARGE`. A broker outage → retryable
 `capability/amq/AMQ_CONNECTION` (HTTP 200).
 
-Config: `{ "amq": { "host": "...", "port": 5672, "username": "guest", "password": "guest",
-"vhost": "/", "exchange": "", "max_batch": 100, "tls": false, "ca_cert": null } }`. Set
+**RabbitMQ config:** `{ "amq": { "host": "...", "port": 5672, "username": "guest", "password":
+"guest", "vhost": "/", "exchange": "", "max_batch": 100, "tls": false, "ca_cert": null } }`. Set
 **`"tls": true`** (port usually `5671`) for `amqps://` against managed brokers — validated
 against bundled public CA roots via the shared `aws-lc-rs` provider. For a self-hosted broker
 with a private CA, point `ca_cert` at the CA PEM (mounted into the container).
+
+**NATS** (`"backend": "nats"`): port defaults to `4222`; `routingKey` is the subject; `vhost`/
+`exchange` don't apply; auth is optional (`username`+`password` or `token`). Adds
+**request-reply**: `amq.request(subject, payload)` publishes and returns the first reply's
+parsed JSON body, bounded by `config.amq.request_timeout_ms` (default 5000) → retryable
+`AMQ_TIMEOUT` on no reply. `amq.request` on the RabbitMQ backend throws non-retryable
+`AMQ_UNSUPPORTED`. NATS config: `{ "amq": { "backend": "nats", "host": "...", "port": 4222,
+"token": "...", "request_timeout_ms": 5000, "tls": false, "ca_cert": null } }`.
+
+### mongo.find / findOne / count / aggregate / insert* / update* / delete* — document database
+
+MongoDB client (requires `config.mongo`, **operator-supplied** — trusted, no SSRF guard, like
+`db`/`mail`). Async under the hood (per-op client-side deadline anchored to the execution
+budget, like `db`). Filters/updates/pipelines are passed as data, never string-interpolated.
+Synchronous from JS.
+
+```js
+function handler(ctx) {
+  var users = mongo.find("users", { active: true }, { limit: 50, sort: { name: 1 } });
+  var one = mongo.findOne("users", { _id: ctx.id });
+  var ins = mongo.insertOne("users", { name: ctx.name, active: true }); // { inserted_id }
+  mongo.updateOne("users", { _id: ins.inserted_id }, { $set: { active: false } }); // { matched, modified }
+  mongo.deleteMany("logs", { at: { $lt: 2 } }); // { deleted }
+  return json({ users: users.docs, one: one }, null);
+}
+```
+
+`find`/`aggregate` return `{ docs, count, truncated }` capped at `max_docs` (default 1000).
+**Type fidelity** (same rule as `db`): values a JS number can't hold exactly come back as
+strings — `Int64`/`Decimal128` as strings, `ObjectId` as hex, `Date` as RFC 3339, `Binary` as
+base64; `Int32`/`Double` as numbers. Errors: retryable `MONGO_CONNECTION` (unreachable),
+`MONGO_WRITE` (duplicate key / constraint), `MONGO_QUERY` (bad filter/update/pipeline),
+retryable `MONGO_TIMEOUT` (deadline). Config: `{ "mongo": { "host": "...", "port": 27017,
+"username": null, "password": null, "database": "app", "auth_source": "admin",
+"op_timeout_ms": 5000, "max_docs": 1000, "tls": false, "ca_cert": null } }`.
 
 ### $sys — runtime stdlib (crypto, date, env, secrets)
 
