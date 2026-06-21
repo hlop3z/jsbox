@@ -502,7 +502,7 @@ parsed JSON body, bounded by `config.amq.request_timeout_ms` (default 5000) → 
 `AMQ_UNSUPPORTED`. NATS config: `{ "amq": { "backend": "nats", "host": "...", "port": 4222,
 "token": "...", "request_timeout_ms": 5000, "tls": false, "ca_cert": null } }`.
 
-### mongo.find / findOne / count / aggregate / insert* / update* / delete* — document database
+### mongo.find / find_one / count / aggregate / insert* / update* / delete* — document database
 
 MongoDB client (requires `config.mongo`, **operator-supplied** — trusted, no SSRF guard, like
 `db`/`mail`). Async under the hood (per-op client-side deadline anchored to the execution
@@ -512,10 +512,10 @@ Synchronous from JS.
 ```js
 function handler(ctx) {
   var users = mongo.find("users", { active: true }, { limit: 50, sort: { name: 1 } });
-  var one = mongo.findOne("users", { _id: ctx.id });
-  var ins = mongo.insertOne("users", { name: ctx.name, active: true }); // { inserted_id }
-  mongo.updateOne("users", { _id: ins.inserted_id }, { $set: { active: false } }); // { matched, modified }
-  mongo.deleteMany("logs", { at: { $lt: 2 } }); // { deleted }
+  var one = mongo.find_one("users", { _id: ctx.id });
+  var ins = mongo.insert_one("users", { name: ctx.name, active: true }); // { inserted_id }
+  mongo.update_one("users", { _id: ins.inserted_id }, { $set: { active: false } }); // { matched, modified }
+  mongo.delete_many("logs", { at: { $lt: 2 } }); // { deleted }
   return json({ users: users.docs, one: one }, null);
 }
 ```

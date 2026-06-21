@@ -487,28 +487,28 @@ def test_mongo(t: Runner):
     cfg = {"mongo": MONGO_CONFIG}
 
     t.test("clean collection",
-           h("mongo.deleteMany('t_users', {}); return json('ok', null);", config=cfg),
+           h("mongo.delete_many('t_users', {}); return json('ok', null);", config=cfg),
            data_eq("ok"))
-    t.test("insertOne returns id",
-           h("var r = mongo.insertOne('t_users', {_id:'u1', name:'Alice', active:true}); return json(r.inserted_id, null);", config=cfg),
+    t.test("insert_one returns id",
+           h("var r = mongo.insert_one('t_users', {_id:'u1', name:'Alice', active:true}); return json(r.inserted_id, null);", config=cfg),
            data_eq("u1"))
-    t.test("insertMany returns count",
-           h("var r = mongo.insertMany('t_users', [{_id:'u2',name:'Bob',active:true},{_id:'u3',name:'Cy',active:false}]); return json(r.inserted_count, null);", config=cfg),
+    t.test("insert_many returns count",
+           h("var r = mongo.insert_many('t_users', [{_id:'u2',name:'Bob',active:true},{_id:'u3',name:'Cy',active:false}]); return json(r.inserted_count, null);", config=cfg),
            data_eq(2))
     t.test("count all",
            h("return json(mongo.count('t_users', {}), null);", config=cfg),
            data_eq(3))
-    t.test("findOne by id",
-           h("return json(mongo.findOne('t_users', {_id:'u1'}).name, null);", config=cfg),
+    t.test("find_one by id",
+           h("return json(mongo.find_one('t_users', {_id:'u1'}).name, null);", config=cfg),
            data_eq("Alice"))
-    t.test("findOne missing is null",
-           h("return json(mongo.findOne('t_users', {_id:'nope'}), null);", config=cfg),
+    t.test("find_one missing is null",
+           h("return json(mongo.find_one('t_users', {_id:'nope'}), null);", config=cfg),
            data_is_none())
     t.test("find filter + result shape",
            h("var r = mongo.find('t_users', {active:true}, {sort:{_id:1}}); return json({n:r.count, trunc:r.truncated, first:r.docs[0]._id}, null);", config=cfg),
            lambda r: r["data"]["n"] == 2 and r["data"]["trunc"] is False and r["data"]["first"] == "u1")
-    t.test("updateOne matched+modified",
-           h("var r = mongo.updateOne('t_users', {_id:'u1'}, {$set:{active:false}}); return json([r.matched, r.modified], null);", config=cfg),
+    t.test("update_one matched+modified",
+           h("var r = mongo.update_one('t_users', {_id:'u1'}, {$set:{active:false}}); return json([r.matched, r.modified], null);", config=cfg),
            data_eq([1, 1]))
     t.test("count after update",
            h("return json(mongo.count('t_users', {active:true}), null);", config=cfg),
@@ -516,12 +516,12 @@ def test_mongo(t: Runner):
     t.test("aggregate group",
            h("return json(mongo.aggregate('t_users', [{$group:{_id:'$active', n:{$sum:1}}}]).count, null);", config=cfg),
            data_eq(2))
-    t.test("deleteOne",
-           h("return json(mongo.deleteOne('t_users', {_id:'u3'}).deleted, null);", config=cfg),
+    t.test("delete_one",
+           h("return json(mongo.delete_one('t_users', {_id:'u3'}).deleted, null);", config=cfg),
            data_eq(1))
     # Duplicate key is a developer write error.
     t.test("duplicate key -> MONGO_WRITE",
-           h("mongo.insertOne('t_users', {_id:'u1'}); return json('nope', null);", config=cfg),
+           h("mongo.insert_one('t_users', {_id:'u1'}); return json('nope', null);", config=cfg),
            lambda r: r["data"] is None and _err_code(r) == "MONGO_WRITE")
     # A malformed filter classifies as a developer query error (tolerant of the exact code).
     t.test("bad filter -> MONGO_ classified error",

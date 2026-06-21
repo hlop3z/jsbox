@@ -312,19 +312,19 @@ interface MongoFindResult {
   truncated: boolean;
 }
 
-/** Result of {@link Mongo.insertOne}. */
+/** Result of {@link Mongo.insert_one}. */
 interface MongoInsertOneResult {
   /** The new document's id as a string (hex for an `ObjectId`). */
   inserted_id: string;
 }
 
-/** Result of {@link Mongo.insertMany}. */
+/** Result of {@link Mongo.insert_many}. */
 interface MongoInsertManyResult {
   /** Number of documents inserted. */
   inserted_count: number;
 }
 
-/** Result of {@link Mongo.updateOne} / {@link Mongo.updateMany}. */
+/** Result of {@link Mongo.update_one} / {@link Mongo.update_many}. */
 interface MongoUpdateResult {
   /** Documents that matched the filter. */
   matched: number;
@@ -332,7 +332,7 @@ interface MongoUpdateResult {
   modified: number;
 }
 
-/** Result of {@link Mongo.deleteOne} / {@link Mongo.deleteMany}. */
+/** Result of {@link Mongo.delete_one} / {@link Mongo.delete_many}. */
 interface MongoDeleteResult {
   /** Documents removed. */
   deleted: number;
@@ -357,7 +357,7 @@ interface Mongo {
     options?: MongoFindOptions,
   ): MongoFindResult;
   /** Finds the first matching document, or `null`. */
-  findOne(collection: string, filter?: MongoDoc): MongoDoc | null;
+  find_one(collection: string, filter?: MongoDoc): MongoDoc | null;
   /** Counts documents matching `filter`. */
   count(collection: string, filter?: MongoDoc): number;
   /**
@@ -366,25 +366,25 @@ interface Mongo {
    */
   aggregate(collection: string, pipeline: MongoDoc[]): MongoFindResult;
   /** Inserts one document. */
-  insertOne(collection: string, doc: MongoDoc): MongoInsertOneResult;
+  insert_one(collection: string, doc: MongoDoc): MongoInsertOneResult;
   /** Inserts many documents. */
-  insertMany(collection: string, docs: MongoDoc[]): MongoInsertManyResult;
+  insert_many(collection: string, docs: MongoDoc[]): MongoInsertManyResult;
   /** Updates the first matching document (`update` needs atomic operators like `$set`). */
-  updateOne(
+  update_one(
     collection: string,
     filter: MongoDoc,
     update: MongoDoc,
   ): MongoUpdateResult;
   /** Updates every matching document. */
-  updateMany(
+  update_many(
     collection: string,
     filter: MongoDoc,
     update: MongoDoc,
   ): MongoUpdateResult;
   /** Deletes the first matching document. */
-  deleteOne(collection: string, filter: MongoDoc): MongoDeleteResult;
+  delete_one(collection: string, filter: MongoDoc): MongoDeleteResult;
   /** Deletes every matching document. */
-  deleteMany(collection: string, filter: MongoDoc): MongoDeleteResult;
+  delete_many(collection: string, filter: MongoDoc): MongoDeleteResult;
 }
 
 /** Document-database client. Present only when `config.mongo` is supplied. */

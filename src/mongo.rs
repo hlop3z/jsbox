@@ -1,7 +1,7 @@
 //! Document-database (`MongoDB`) client for the `QuickJS` sandbox (`mongo` global).
 //!
-//! JS API: `mongo.find/findOne/count/aggregate/insertOne/insertMany/updateOne/
-//! updateMany/deleteOne/deleteMany`.
+//! JS API: `mongo.find/find_one/count/aggregate/insert_one/insert_many/update_one/
+//! update_many/delete_one/delete_many`.
 //!
 //! Trust model matches `db`/`mail`: the connection is operator-supplied in
 //! `config.mongo`, so there is no SSRF guard. Admitted as a first-class capability
@@ -373,15 +373,15 @@ async fn run(
 ) -> Result<MongoOutcome, MongoError> {
     match action {
         "find" => do_find(call, collection, payload).await,
-        "findOne" => do_find_one(collection, payload).await,
+        "find_one" => do_find_one(collection, payload).await,
         "count" => do_count(call, collection, payload).await,
         "aggregate" => do_aggregate(call, collection, payload).await,
-        "insertOne" => do_insert_one(collection, payload).await,
-        "insertMany" => do_insert_many(collection, payload).await,
-        "updateOne" => do_update(collection, payload, false).await,
-        "updateMany" => do_update(collection, payload, true).await,
-        "deleteOne" => do_delete(collection, payload, false).await,
-        "deleteMany" => do_delete(collection, payload, true).await,
+        "insert_one" => do_insert_one(collection, payload).await,
+        "insert_many" => do_insert_many(collection, payload).await,
+        "update_one" => do_update(collection, payload, false).await,
+        "update_many" => do_update(collection, payload, true).await,
+        "delete_one" => do_delete(collection, payload, false).await,
+        "delete_many" => do_delete(collection, payload, true).await,
         other => Err(MongoError::query(format!("unknown mongo action: {other}"))),
     }
 }
@@ -412,7 +412,7 @@ async fn do_find(
     drain_cursor(cursor, call.max_docs).await
 }
 
-/// `findOne` — returns the first matching document, or `null`.
+/// `find_one` — returns the first matching document, or `null`.
 async fn do_find_one(
     collection: &Collection<Document>,
     payload: MongoPayload,
@@ -503,7 +503,7 @@ async fn drain_cursor(
 
 // -- Writes -----------------------------------------------------------------
 
-/// `insertOne` — returns `{inserted_id}`.
+/// `insert_one` — returns `{inserted_id}`.
 async fn do_insert_one(
     collection: &Collection<Document>,
     payload: MongoPayload,
@@ -523,7 +523,7 @@ async fn do_insert_one(
     })
 }
 
-/// `insertMany` — returns `{inserted_count}`.
+/// `insert_many` — returns `{inserted_count}`.
 async fn do_insert_many(
     collection: &Collection<Document>,
     payload: MongoPayload,
@@ -531,7 +531,7 @@ async fn do_insert_many(
     let docs = docs_to_docs(payload.docs)?;
     if docs.is_empty() {
         return Err(MongoError::query(
-            "mongo.insertMany requires at least one document".to_owned(),
+            "mongo.insert_many requires at least one document".to_owned(),
         ));
     }
     let result = collection
@@ -547,7 +547,7 @@ async fn do_insert_many(
     })
 }
 
-/// `updateOne` / `updateMany` — returns `{matched, modified}`.
+/// `update_one` / `update_many` — returns `{matched, modified}`.
 async fn do_update(
     collection: &Collection<Document>,
     payload: MongoPayload,
@@ -572,7 +572,7 @@ async fn do_update(
     })
 }
 
-/// `deleteOne` / `deleteMany` — returns `{deleted}`.
+/// `delete_one` / `delete_many` — returns `{deleted}`.
 async fn do_delete(
     collection: &Collection<Document>,
     payload: MongoPayload,
@@ -604,10 +604,10 @@ struct MongoPayload {
     /// Update document (updates).
     #[serde(default)]
     update: Value,
-    /// Document to insert (`insertOne`).
+    /// Document to insert (`insert_one`).
     #[serde(default)]
     doc: Value,
-    /// Documents to insert (`insertMany`).
+    /// Documents to insert (`insert_many`).
     #[serde(default)]
     docs: Value,
     /// Aggregation pipeline (`aggregate`).
@@ -648,7 +648,7 @@ fn json_to_doc(value: &Value) -> Result<Document, MongoError> {
     }
 }
 
-/// Converts a JSON array into a list of BSON documents (for pipelines / `insertMany`).
+/// Converts a JSON array into a list of BSON documents (for pipelines / `insert_many`).
 fn docs_to_docs(value: Value) -> Result<Vec<Document>, MongoError> {
     match value {
         Value::Null => Ok(Vec::new()),

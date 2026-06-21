@@ -44,7 +44,7 @@ function handler(ctx) {
   var active = mongo.find("users", { active: true }, { limit: 50, sort: { name: 1 } });
 
   // Find one — returns the document, or null
-  var me = mongo.findOne("users", { _id: ctx.id });
+  var me = mongo.find_one("users", { _id: ctx.id });
 
   // Count — returns a number
   var total = mongo.count("users", { active: true });
@@ -66,14 +66,14 @@ function handler(ctx) {
 
 ```js
 function handler(ctx) {
-  var ins = mongo.insertOne("users", { name: ctx.name, active: true }); // { inserted_id }
-  mongo.insertMany("logs", [{ at: 1 }, { at: 2 }]);                     // { inserted_count }
+  var ins = mongo.insert_one("users", { name: ctx.name, active: true }); // { inserted_id }
+  mongo.insert_many("logs", [{ at: 1 }, { at: 2 }]);                     // { inserted_count }
 
   // Updates need atomic operators like $set
-  var up = mongo.updateOne("users", { _id: ins.inserted_id }, { $set: { active: false } });
+  var up = mongo.update_one("users", { _id: ins.inserted_id }, { $set: { active: false } });
   // up === { matched, modified }
 
-  var del = mongo.deleteMany("logs", { at: { $lt: 2 } }); // { deleted }
+  var del = mongo.delete_many("logs", { at: { $lt: 2 } }); // { deleted }
 
   return json({ id: ins.inserted_id, up: up, del: del }, null);
 }
@@ -97,7 +97,7 @@ Just like `db`, any value that a JavaScript number can't hold exactly comes back
 
 ```js
 try {
-  mongo.insertOne("users", { _id: "taken", name: "dup" });
+  mongo.insert_one("users", { _id: "taken", name: "dup" });
 } catch (e) {
   return json(null, { message: "could not save", detail: e.message });
 }

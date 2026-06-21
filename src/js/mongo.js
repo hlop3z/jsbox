@@ -15,8 +15,8 @@
     find: function(collection, filter, options) {
       return call('find', collection, { filter: filter || {}, options: options || {} });
     },
-    findOne: function(collection, filter) {
-      return call('findOne', collection, { filter: filter || {} });
+    find_one: function(collection, filter) {
+      return call('find_one', collection, { filter: filter || {} });
     },
     count: function(collection, filter) {
       return call('count', collection, { filter: filter || {} }).count;
@@ -25,23 +25,23 @@
       return call('aggregate', collection, { pipeline: pipeline || [] });
     },
     // Writes.
-    insertOne: function(collection, doc) {
-      return call('insertOne', collection, { doc: doc || {} });
+    insert_one: function(collection, doc) {
+      return call('insert_one', collection, { doc: doc || {} });
     },
-    insertMany: function(collection, docs) {
-      return call('insertMany', collection, { docs: docs || [] });
+    insert_many: function(collection, docs) {
+      return call('insert_many', collection, { docs: docs || [] });
     },
-    updateOne: function(collection, filter, update) {
-      return call('updateOne', collection, { filter: filter || {}, update: update || {} });
+    update_one: function(collection, filter, update) {
+      return call('update_one', collection, { filter: filter || {}, update: update || {} });
     },
-    updateMany: function(collection, filter, update) {
-      return call('updateMany', collection, { filter: filter || {}, update: update || {} });
+    update_many: function(collection, filter, update) {
+      return call('update_many', collection, { filter: filter || {}, update: update || {} });
     },
-    deleteOne: function(collection, filter) {
-      return call('deleteOne', collection, { filter: filter || {} });
+    delete_one: function(collection, filter) {
+      return call('delete_one', collection, { filter: filter || {} });
     },
-    deleteMany: function(collection, filter) {
-      return call('deleteMany', collection, { filter: filter || {} });
+    delete_many: function(collection, filter) {
+      return call('delete_many', collection, { filter: filter || {} });
     }
   };
 })();

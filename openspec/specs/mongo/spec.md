@@ -3,8 +3,8 @@
 ## Purpose
 
 The `mongo` capability gives a handler a document-database client inside the QuickJS
-sandbox: `mongo.find`/`findOne`/`insertOne`/`insertMany`/`updateOne`/`updateMany`/
-`deleteOne`/`deleteMany`/`count`/`aggregate`. The connection is **operator-supplied** in
+sandbox: `mongo.find`/`find_one`/`insert_one`/`insert_many`/`update_one`/`update_many`/
+`delete_one`/`delete_many`/`count`/`aggregate`. The connection is **operator-supplied** in
 `config.mongo`, so this capability is trusted (it connects to whatever host the config
 names, with no SSRF guard) — the same trust model as `db`/`mail`, and unlike the
 script-controlled `api` capability. It is admitted as a first-class capability (not routed
@@ -26,7 +26,7 @@ that block the global is undefined.
 #### Scenario: Config present injects the global
 
 - **WHEN** a request includes a `config.mongo` block and the handler references `mongo`
-- **THEN** `mongo` is a defined object exposing `find`, `findOne`, `insertOne`, `insertMany`, `updateOne`, `updateMany`, `deleteOne`, `deleteMany`, `count`, and `aggregate`
+- **THEN** `mongo` is a defined object exposing `find`, `find_one`, `insert_one`, `insert_many`, `update_one`, `update_many`, `delete_one`, `delete_many`, `count`, and `aggregate`
 
 #### Scenario: Config absent leaves the global undefined
 
@@ -68,7 +68,7 @@ for a self-hosted database with a private certificate authority.
 ### Requirement: Read operations
 
 The system SHALL expose `mongo.find(collection, filter?, options?)`,
-`mongo.findOne(collection, filter?)`, `mongo.count(collection, filter?)`, and
+`mongo.find_one(collection, filter?)`, `mongo.count(collection, filter?)`, and
 `mongo.aggregate(collection, pipeline)`, passing the caller's `filter`/`pipeline`/`options`
 as data to the driver (never string-interpolated into a query language).
 
@@ -77,9 +77,9 @@ as data to the driver (never string-interpolated into a query language).
 - **WHEN** the handler calls `mongo.find(collection, filter, options)` and it succeeds
 - **THEN** it returns `{docs, count, truncated}` where `docs` is an array of documents
 
-#### Scenario: findOne returns a document or null
+#### Scenario: find_one returns a document or null
 
-- **WHEN** the handler calls `mongo.findOne(collection, filter)`
+- **WHEN** the handler calls `mongo.find_one(collection, filter)`
 - **THEN** it returns the first matching document, or `null` when nothing matches
 
 #### Scenario: find honors limit, skip, sort, and projection
@@ -99,27 +99,27 @@ as data to the driver (never string-interpolated into a query language).
 
 ### Requirement: Write operations
 
-The system SHALL expose `mongo.insertOne`/`insertMany`/`updateOne`/`updateMany`/
-`deleteOne`/`deleteMany`, returning a result describing what changed.
+The system SHALL expose `mongo.insert_one`/`insert_many`/`update_one`/`update_many`/
+`delete_one`/`delete_many`, returning a result describing what changed.
 
-#### Scenario: insertOne returns the inserted id
+#### Scenario: insert_one returns the inserted id
 
-- **WHEN** the handler calls `mongo.insertOne(collection, doc)` and it succeeds
+- **WHEN** the handler calls `mongo.insert_one(collection, doc)` and it succeeds
 - **THEN** it returns `{inserted_id}` with the new document's id as a string
 
-#### Scenario: insertMany returns the inserted count
+#### Scenario: insert_many returns the inserted count
 
-- **WHEN** the handler calls `mongo.insertMany(collection, docs)` and it succeeds
+- **WHEN** the handler calls `mongo.insert_many(collection, docs)` and it succeeds
 - **THEN** it returns `{inserted_count}` with the number of documents inserted
 
 #### Scenario: update returns matched and modified counts
 
-- **WHEN** the handler calls `mongo.updateOne`/`updateMany(collection, filter, update)`
+- **WHEN** the handler calls `mongo.update_one`/`update_many(collection, filter, update)`
 - **THEN** it returns `{matched, modified}` with the matched and modified document counts
 
 #### Scenario: delete returns the deleted count
 
-- **WHEN** the handler calls `mongo.deleteOne`/`deleteMany(collection, filter)`
+- **WHEN** the handler calls `mongo.delete_one`/`delete_many(collection, filter)`
 - **THEN** it returns `{deleted}` with the number of documents removed
 
 ### Requirement: BSON-to-JSON type mapping
