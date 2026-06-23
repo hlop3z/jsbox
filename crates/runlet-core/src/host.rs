@@ -22,6 +22,7 @@ use crate::amq::{AmqConfig, AmqMetric};
 #[cfg(feature = "auth")]
 use crate::auth::{AuthConfig, AuthMetric};
 use crate::breaker::CircuitBreaker;
+use crate::bytecode::BytecodeCacheStats;
 use crate::config::EngineConfig;
 #[cfg(feature = "db")]
 use crate::db::{DbConfig, DbMetric};
@@ -165,6 +166,10 @@ pub struct Invocation<'a> {
     /// Optional read-of-declared-dependencies hook (the deterministic-profile seam). `None`
     /// = no `read` global. The core never inspects what is read — opaque to it.
     pub read_hook: Option<Arc<ReadHook>>,
+    /// Partition/tenant namespace for the bytecode cache key. Identical source under different
+    /// namespaces gets separate cache entries (no cross-tenant dedup / compile-timing leak).
+    /// `None` = global. Typically the caller's partition key.
+    pub cache_namespace: Option<&'a str>,
 }
 
 impl fmt::Debug for Invocation<'_> {
@@ -180,6 +185,7 @@ impl fmt::Debug for Invocation<'_> {
             .field("profile", &self.profile)
             .field("caps", &self.caps)
             .field("read_hook", &self.read_hook.as_ref().map(|_hook| "<hook>"))
+            .field("cache_namespace", &self.cache_namespace)
             .finish()
     }
 }
@@ -285,6 +291,13 @@ impl LogicHost {
         &self.limits
     }
 
+    /// A snapshot of the compiled-bytecode cache's activity (resident entries + hit/miss/store
+    /// counters) — for metrics / observability of the autonomous size-gated caching.
+    #[must_use]
+    pub fn bytecode_cache_stats(&self) -> BytecodeCacheStats {
+        self.pool.bytecode_cache().stats()
+    }
+
     /// Executes one [`Invocation`] on a pooled runtime.
     ///
     /// # Errors
@@ -310,6 +323,8 @@ impl LogicHost {
         let exec = {
             let params = ExecParams {
                 runtime: &runtime,
+                bytecode_cache: Some(self.pool.bytecode_cache()),
+                cache_namespace: inv.cache_namespace,
                 #[cfg(any(feature = "db", feature = "mongo"))]
                 tokio_handle: &self.handle,
                 #[cfg(feature = "db")]

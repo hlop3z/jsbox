@@ -27,6 +27,9 @@ hmac.workspace = true
 sha2.workspace = true
 percent-encoding.workspace = true
 rust_decimal.workspace = true
+# Backs the always-on compiled-bytecode cache (bytecode.rs). Pure-Rust, no I/O — so it stays in
+# the deterministic-only `--no-default-features` core without pulling any network driver.
+moka.workspace = true
 
 # ── Optional, per-capability driver deps (enabled by the features below) ──
 tracing = { workspace = true, optional = true }
@@ -74,6 +77,10 @@ s3 = ["dep:reqwest", "_io", "_throws"]
 redis = ["dep:redis", "_io", "_throws"]
 amq = ["dep:amqprs", "dep:async-nats", "dep:bytes", "_io", "_throws"]
 auth = ["dep:reqwest", "_io", "_throws"]
+# The always-on compiled-bytecode cache (bytecode.rs) is unconditional — `moka` is a normal
+# dependency above, not a feature. It covers the ES-module source path only (classic scripts
+# still recompile). The declare-vs-load microbenchmark lives in the sibling `runlet-bench` crate
+# (kept out of this crate so the production lint gauntlet doesn't apply to criterion's code).
 
 [lints]
 workspace = true

@@ -370,6 +370,10 @@ pub(crate) async fn execute(
     // runtime, and applies the SSRF/wildcard policy. The HTTP front always runs the
     // full-capability profile with no read-hook.
     let host = state.host.clone();
+    // Namespace the bytecode cache by partition so identical source from different tenants
+    // never shares an entry (no cross-tenant dedup / compile-timing leak). Cloned because the
+    // closure is `move` and `partition` is still needed for `meta` after the await.
+    let cache_ns = partition.clone();
     let result = task::spawn_blocking(move || -> Result<Outcome, EngineError> {
         host.run(Invocation {
             code: CodeRef::Inline(source.as_str()),
@@ -387,6 +391,7 @@ pub(crate) async fn execute(
                 sys: config.sys.as_ref(),
             },
             read_hook: None,
+            cache_namespace: cache_ns.as_deref(),
         })
     })
     .await;
@@ -410,9 +415,10 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> impl IntoResponse 
         .db_breaker
         .as_ref()
         .map_or(0, |breaker| breaker.trips());
+    let cache = state.host.bytecode_cache_stats();
     let body = state
         .metrics
-        .render(available, state.bulkhead_capacity, trips);
+        .render(available, state.bulkhead_capacity, trips, cache);
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],

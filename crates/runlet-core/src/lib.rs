@@ -16,6 +16,7 @@ pub mod amq;
 #[cfg(feature = "auth")]
 pub mod auth;
 pub mod breaker;
+pub mod bytecode;
 pub mod bytesize;
 pub mod config;
 #[cfg(feature = "db")]

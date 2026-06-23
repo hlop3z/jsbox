@@ -8,6 +8,7 @@
 use core::array::from_fn;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::bytecode::BytecodeCacheStats;
 use crate::engine::EngineError;
 
 /// Upper bounds (inclusive, microseconds) of the execution-latency histogram buckets.
@@ -281,12 +282,14 @@ impl Metrics {
 
     /// Renders the Prometheus text exposition (v0.0.4). `bulkhead_available` /
     /// `bulkhead_total` are the live semaphore permits; `breaker_trips` is the cumulative
-    /// circuit-breaker open count (both read at scrape time, not stored here).
+    /// circuit-breaker open count; `cache` is a snapshot of the compiled-bytecode cache (all
+    /// read at scrape time, not stored here).
     pub fn render(
         &self,
         bulkhead_available: usize,
         bulkhead_total: usize,
         breaker_trips: u64,
+        cache: BytecodeCacheStats,
     ) -> String {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         format!(
@@ -315,7 +318,15 @@ impl Metrics {
              # HELP jsbox_bulkhead_permits_total Configured global bulkhead capacity.\n\
              # TYPE jsbox_bulkhead_permits_total gauge\n\
              jsbox_bulkhead_permits_total {bulkhead_total}\n\
-             {latency}{cap_latency}",
+             {latency}{cap_latency}\
+             # HELP jsbox_bytecode_cache_entries Compiled-bytecode cache: resident entries.\n\
+             # TYPE jsbox_bytecode_cache_entries gauge\n\
+             jsbox_bytecode_cache_entries {cache_entries}\n\
+             # HELP jsbox_bytecode_cache_events_total Compiled-bytecode cache events by kind (hit/miss/stored).\n\
+             # TYPE jsbox_bytecode_cache_events_total counter\n\
+             jsbox_bytecode_cache_events_total{{event=\"hit\"}} {cache_hits}\n\
+             jsbox_bytecode_cache_events_total{{event=\"miss\"}} {cache_misses}\n\
+             jsbox_bytecode_cache_events_total{{event=\"stored\"}} {cache_stored}\n",
             success = load(&self.success),
             script_error = load(&self.script_error),
             capability_error = load(&self.capability_error),
@@ -331,6 +342,10 @@ impl Metrics {
                 "Execution wall-clock latency."
             ),
             cap_latency = self.cap_latency.render(),
+            cache_entries = cache.entries,
+            cache_hits = cache.hits,
+            cache_misses = cache.misses,
+            cache_stored = cache.stored,
         )
     }
 }
@@ -339,14 +354,22 @@ impl Metrics {
 mod tests {
     //! Counter increments and exposition formatting.
 
-    use super::{Capability, Metrics};
+    use super::{BytecodeCacheStats, Capability, Metrics};
     use crate::engine::EngineError;
+
+    /// A zeroed cache snapshot for tests not exercising the cache family.
+    const NO_CACHE: BytecodeCacheStats = BytecodeCacheStats {
+        entries: 0,
+        hits: 0,
+        misses: 0,
+        stored: 0,
+    };
 
     /// A fresh registry renders all-zero counters with the expected metric lines.
     #[test]
     fn renders_zeroed_registry() {
         let metrics = Metrics::default();
-        let text = metrics.render(6, 6, 0);
+        let text = metrics.render(6, 6, 0, NO_CACHE);
         assert!(
             text.contains("jsbox_executions_total{outcome=\"success\"} 0"),
             "success line present and zeroed"
@@ -355,6 +378,23 @@ mod tests {
             text.contains("jsbox_bulkhead_permits_total 6"),
             "bulkhead capacity gauge present"
         );
+    }
+
+    /// The compiled-bytecode cache family renders its gauge + per-event counters.
+    #[test]
+    fn renders_bytecode_cache_family() {
+        let metrics = Metrics::default();
+        let stats = BytecodeCacheStats {
+            entries: 3,
+            hits: 10,
+            misses: 4,
+            stored: 2,
+        };
+        let text = metrics.render(1, 1, 0, stats);
+        assert!(text.contains("jsbox_bytecode_cache_entries 3"), "entries gauge");
+        assert!(text.contains("jsbox_bytecode_cache_events_total{event=\"hit\"} 10"));
+        assert!(text.contains("jsbox_bytecode_cache_events_total{event=\"miss\"} 4"));
+        assert!(text.contains("jsbox_bytecode_cache_events_total{event=\"stored\"} 2"));
     }
 
     /// Outcome counters increment independently and surface in the exposition.
@@ -367,7 +407,7 @@ mod tests {
         metrics.record_engine_error(&EngineError::MemoryLimit);
         metrics.record_rejection();
         metrics.record_overload_partition();
-        let text = metrics.render(5, 6, 2);
+        let text = metrics.render(5, 6, 2, NO_CACHE);
         assert!(text.contains("jsbox_executions_total{outcome=\"success\"} 2"));
         assert!(text.contains("jsbox_executions_total{outcome=\"timeout\"} 1"));
         assert!(text.contains("jsbox_executions_total{outcome=\"memory_limit\"} 1"));
@@ -384,7 +424,7 @@ mod tests {
         metrics.observe_execution(3_000); // 3ms  -> le="0.005" and up
         metrics.observe_execution(80_000); // 80ms -> le="0.1" and up
         metrics.observe_execution(50_000_000); // 50s -> only +Inf
-        let text = metrics.render(1, 1, 0);
+        let text = metrics.render(1, 1, 0, NO_CACHE);
         // le="0.005" has counted the 3ms observation only.
         assert!(
             text.contains("jsbox_execution_duration_seconds_bucket{le=\"0.005\"} 1"),
@@ -411,7 +451,7 @@ mod tests {
         metrics.observe_op(Capability::Db, 4_000); // 4ms
         metrics.observe_op(Capability::Db, 4_000);
         metrics.observe_op(Capability::Http, 120_000); // 120ms
-        let text = metrics.render(1, 1, 0);
+        let text = metrics.render(1, 1, 0, NO_CACHE);
         // One HELP/TYPE header for the whole family, series carry a `capability` label.
         assert_eq!(
             text.matches("# TYPE jsbox_capability_op_duration_seconds histogram")

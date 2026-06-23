@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rquickjs::module::Evaluated;
-use rquickjs::{Context, Ctx, Function, Module, Object, Runtime, Value as JsValue};
+use rquickjs::module::{Declared, Evaluated};
+use rquickjs::{Context, Ctx, Function, Module, Object, Runtime, Value as JsValue, WriteOptions};
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -30,6 +30,7 @@ use tokio::runtime::Handle;
 
 #[cfg(feature = "amq")]
 use crate::amq::{self, AmqConfig, AmqMetric};
+use crate::bytecode::{self, BytecodeCache};
 #[cfg(feature = "auth")]
 use crate::auth::{self, AuthConfig, AuthMetric};
 #[cfg(feature = "db")]
@@ -100,6 +101,12 @@ pub type ReadHook = dyn Fn(&str) -> Result<String, String> + Send + Sync;
 pub(crate) struct ExecParams<'a> {
     /// The pooled runtime.
     pub(crate) runtime: &'a Runtime,
+    /// Shared compiled-bytecode cache (parse/compile reuse for the ES-module path).
+    /// `None` = always recompile (e.g. a consumer that opts out).
+    pub(crate) bytecode_cache: Option<&'a BytecodeCache>,
+    /// Partition/tenant namespace mixed into the bytecode cache key, so identical source from
+    /// different tenants does not share an entry. `None` = global (no namespace).
+    pub(crate) cache_namespace: Option<&'a str>,
     /// Tokio runtime handle — drives async capability I/O (e.g. `db`) from this blocking
     /// thread via `block_on` (Tier 2, see `docs/design/resilience.md`).
     #[cfg(any(feature = "db", feature = "mongo"))]
@@ -350,7 +357,7 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         }
         #[cfg(feature = "_io")]
         inject_apis(&qctx, params, &mut collectors)?;
-        let handler = match resolve_handler(&qctx, params.script, params.profile) {
+        let handler = match resolve_handler(&qctx, params) {
             Ok(func) => func,
             Err(outcome) => return Ok(outcome),
         };
@@ -621,11 +628,11 @@ fn sanitize_globals(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
 /// `eval`/`Proxy`-removed execution environment.
 fn resolve_handler<'js>(
     qctx: &Ctx<'js>,
-    script: &str,
-    profile: Profile,
+    params: &ExecParams<'_>,
 ) -> Result<Function<'js>, ExecOutcome> {
+    let (script, profile) = (params.script, params.profile);
     if is_es_module(script) {
-        let module = eval_module(qctx, script).map_err(ExecOutcome::Error)?;
+        let module = eval_module(qctx, params).map_err(ExecOutcome::Error)?;
         harden(qctx, profile).map_err(|err| ExecOutcome::Error(EngineError::internal(err)))?;
         module_handler(&module).ok_or(ExecOutcome::Error(EngineError::HandlerNotDefined))
     } else {
@@ -752,16 +759,72 @@ fn is_es_module(script: &str) -> bool {
 /// never truly suspends. Imports resolve through the per-runtime registry loader. On failure
 /// the pending exception is classified into a [`EngineError`] (`MODULE_NOT_FOUND` for an
 /// unresolved `import`, else a syntax/top-level error).
-fn eval_module<'js>(qctx: &Ctx<'js>, script: &str) -> Result<Module<'js, Evaluated>, EngineError> {
-    try_eval_module(qctx, script).map_err(|()| classify_module_error(qctx))
+fn eval_module<'js>(
+    qctx: &Ctx<'js>,
+    params: &ExecParams<'_>,
+) -> Result<Module<'js, Evaluated>, EngineError> {
+    try_eval_module(qctx, params).map_err(|()| classify_module_error(qctx))
 }
 
 /// The raw eval attempt; `Err(())` leaves the pending exception set for classification.
-fn try_eval_module<'js>(qctx: &Ctx<'js>, script: &str) -> Result<Module<'js, Evaluated>, ()> {
-    let declared = Module::declare(qctx.clone(), "handler", script).map_err(drop)?;
+fn try_eval_module<'js>(
+    qctx: &Ctx<'js>,
+    params: &ExecParams<'_>,
+) -> Result<Module<'js, Evaluated>, ()> {
+    let declared = obtain_declared(qctx, params)?;
     let (module, promise) = declared.eval().map_err(drop)?;
     promise.finish::<()>().map_err(drop)?;
     Ok(module)
+}
+
+/// Obtains the declared (compiled-but-not-evaluated) handler module: a plain
+/// `Module::declare` (parse + compile) when no bytecode cache is wired, or — with a cache
+/// present — a `Module::load` of previously-compiled bytecode on a hit, and on a miss a compile
+/// that is admitted to the cache only if the source clears the size floor. Either way the
+/// returned module is then evaluated by the caller, so behavior (including thrown syntax/
+/// top-level errors, which are classified from the pending exception) is identical to the
+/// uncached path.
+fn obtain_declared<'js>(
+    qctx: &Ctx<'js>,
+    params: &ExecParams<'_>,
+) -> Result<Module<'js, Declared>, ()> {
+    let Some(cache) = params.bytecode_cache else {
+        return Module::declare(qctx.clone(), "handler", params.script).map_err(drop);
+    };
+    let namespace = params.cache_namespace.unwrap_or("");
+    let key = bytecode::digest(namespace.as_bytes(), params.script.as_bytes());
+    if let Some(bytecode) = cache.get(&key) {
+        cache.note_hit();
+        return load_bytecode(qctx, &bytecode);
+    }
+    cache.note_miss();
+    let declared = Module::declare(qctx.clone(), "handler", params.script).map_err(drop)?;
+    // Autonomous, size-based admission: cache only scripts large enough to be worth it (small
+    // handlers recompile every call and never touch the `unsafe` load path). A failed
+    // serialization just forgoes caching this script — it never fails the request.
+    if cache.should_store(params.script.len())
+        && let Ok(bytes) = declared.write(WriteOptions::default())
+    {
+        cache.insert(key, Arc::from(bytes.into_boxed_slice()));
+    }
+    Ok(declared)
+}
+
+/// Loads a handler module from previously-cached `QuickJS` bytecode.
+///
+/// The lone `unsafe` in the workspace: `Module::load` is `unsafe` because it trusts the bytes
+/// are valid bytecode (malformed input is UB). Here the bytes are *self-produced* — they came
+/// only from `Module::write` on a module this same process compiled from source, held in an
+/// in-memory `BytecodeCache`, never crossing a trust boundary or a `QuickJS`-version boundary.
+#[expect(
+    unsafe_code,
+    reason = "Module::load deserializes self-produced, in-process bytecode (see fn docs); the \
+              bytes originate only from our own Module::write earlier this process"
+)]
+fn load_bytecode<'js>(qctx: &Ctx<'js>, bytecode: &[u8]) -> Result<Module<'js, Declared>, ()> {
+    // SAFETY: `bytecode` was produced by `Module::write` on a module compiled in this process
+    // and stored verbatim in the cache; it is therefore valid QuickJS bytecode for this build.
+    unsafe { Module::load(qctx.clone(), bytecode) }.map_err(drop)
 }
 
 /// Classifies a module eval failure from the pending exception: the resolver's
@@ -1138,5 +1201,91 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "regex was not preempted promptly (interrupt did not fire during matching)"
         );
+    }
+}
+
+/// The bytecode cache must populate on the first run and produce a byte-identical result on
+/// the second (the `Module::load` path), and must autonomously skip caching sources below its
+/// size floor. The extra `cfg` gates to the capability-free build so `ExecParams` has no I/O
+/// fields to populate; the separate `#[cfg(test)]` keeps `tests_outside_test_module` satisfied.
+#[cfg(test)]
+#[cfg(not(feature = "_io"))]
+mod bytecode_cache_tests {
+    use super::{ExecOutcome, ExecParams, Profile, run};
+    use crate::bytecode::BytecodeCache;
+    use rquickjs::Runtime;
+    use std::time::Duration;
+
+    /// An ES-module handler — only the module path is cached. Adds 1 to `ctx.n`.
+    const SCRIPT: &str = "export default function handler(ctx) { return json(ctx.n + 1); }";
+
+    /// Builds `ExecParams` for the minimal (no-capability) build with the cache wired in.
+    fn params<'a>(runtime: &'a Runtime, cache: &'a BytecodeCache) -> ExecParams<'a> {
+        ExecParams {
+            runtime,
+            bytecode_cache: Some(cache),
+            cache_namespace: None,
+            script: SCRIPT,
+            context_json: "{\"n\":41}",
+            timeout: Duration::from_secs(5),
+            profile: Profile::Full,
+            sys_config: None,
+            read_hook: None,
+            max_ops: 64,
+            max_output_size: 0,
+        }
+    }
+
+    /// Extracts the success envelope; a non-success outcome fails the test.
+    fn success_json(outcome: ExecOutcome) -> String {
+        let ExecOutcome::Success(json) = outcome else {
+            unreachable!("expected a success outcome");
+        };
+        json
+    }
+
+    /// With a zero floor (cache everything): the cold run compiles + stores, the warm run loads
+    /// bytecode and returns a byte-identical result.
+    #[test]
+    fn warm_run_loads_bytecode_with_identical_result() {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let cache = BytecodeCache::new(8, 0);
+
+        let cold = run(&params(&runtime, &cache)).unwrap_or_else(|_err| unreachable!());
+        let cold_json = success_json(cold.outcome);
+        let after_cold = cache.stats();
+        assert_eq!(after_cold.misses, 1, "cold run compiles (miss)");
+        assert_eq!(after_cold.stored, 1, "cold run caches the compiled module");
+
+        let warm = run(&params(&runtime, &cache)).unwrap_or_else(|_err| unreachable!());
+        let warm_json = success_json(warm.outcome);
+        let after_warm = cache.stats();
+        assert_eq!(
+            cold_json, warm_json,
+            "bytecode-load result matches the compiled result"
+        );
+        assert!(cold_json.contains("42"), "handler computed ctx.n + 1 = 42");
+        assert_eq!(after_warm.hits, 1, "warm run is a cache hit");
+        assert_eq!(after_warm.stored, 1, "warm run re-uses, doesn't re-store");
+        assert_eq!(after_warm.entries, 1, "exactly one entry cached");
+    }
+
+    /// Autonomy: a sub-floor source is never cached — both runs miss and nothing is stored,
+    /// so the `unsafe` load path is never exercised for a tiny handler.
+    #[test]
+    fn small_source_is_never_cached() {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        // Floor far above the ~60-byte SCRIPT, so admission is refused.
+        let cache = BytecodeCache::new(8, 4096);
+
+        for _ in 0..2 {
+            let outcome = run(&params(&runtime, &cache)).unwrap_or_else(|_err| unreachable!());
+            assert!(success_json(outcome.outcome).contains("42"), "still correct");
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.misses, 2, "every run recompiles (sub-floor, never cached)");
+        assert_eq!(stats.stored, 0, "nothing admitted below the size floor");
+        assert_eq!(stats.hits, 0, "no cache hits");
+        assert_eq!(stats.entries, 0, "cache stays empty");
     }
 }

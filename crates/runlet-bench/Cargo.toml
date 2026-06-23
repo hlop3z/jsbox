@@ -1,0 +1,25 @@
+[package]
+name = "runlet-bench"
+description = "Microbenchmarks for runlet-core internals (not published)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# Benches the raw QuickJS declare-vs-load primitives that runlet-core's `bytecode-cache`
+# trades on (see runlet-core `engine.rs`: `obtain_declared` / `load_bytecode`).
+rquickjs.workspace = true
+
+[dev-dependencies]
+# HTML/plotting backend trimmed to keep the dev-dep graph small.
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "bytecode"
+harness = false
+
+# Intentionally NOT `[lints] workspace = true`: this is dev-only benchmark scaffolding, exempt
+# from the production gauntlet (criterion's macros generate undocumented items, the harness
+# uses `unsafe Module::load` by design, etc.). Default lint levels apply.
