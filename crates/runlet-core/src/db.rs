@@ -35,7 +35,7 @@ const DB_FALLBACK: Fault = Fault::new("DB_ERROR", true, ErrorOwner::Operator);
 const DB_OP_LIMIT: Fault = Fault::new("DB_OP_LIMIT", false, ErrorOwner::Developer);
 /// Fault for a failure to reach the database — used for inject-time connect failures
 /// (a query-time `08xxx` drop is classified the same way in [`classify_by_class`]).
-pub(crate) const DB_CONNECTION_FAULT: Fault =
+pub const DB_CONNECTION_FAULT: Fault =
     Fault::new("DB_CONNECTION", true, ErrorOwner::Operator);
 /// Fault for a query that exceeded the client-side execution deadline (Tier 2). Frees
 /// the blocking thread even when the server-side `statement_timeout` was lost through a
@@ -43,7 +43,7 @@ pub(crate) const DB_CONNECTION_FAULT: Fault =
 const DB_TIMEOUT: Fault = Fault::new("DB_TIMEOUT", true, ErrorOwner::Operator);
 /// Fault for a `db` request refused because the circuit breaker is open (Tier 3) — the
 /// target has been failing to connect, so we fast-fail instead of waiting on the timeout.
-pub(crate) const DB_CIRCUIT_OPEN_FAULT: Fault =
+pub const DB_CIRCUIT_OPEN_FAULT: Fault =
     Fault::new("DB_CIRCUIT_OPEN", true, ErrorOwner::Operator);
 
 /// Marker error returned at inject time when the breaker is open (no connect attempted).
@@ -153,27 +153,27 @@ fn classify_by_class(code: &str) -> Fault {
 
 /// Per-request database configuration.
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DbConfig {
+pub struct DbConfig {
     /// Database host.
-    pub(crate) host: String,
+    pub host: String,
     /// Database port (default 5432).
     #[serde(default = "default_port")]
-    pub(crate) port: u16,
+    pub port: u16,
     /// Database user.
-    pub(crate) user: String,
+    pub user: String,
     /// Database password.
-    pub(crate) password: String,
+    pub password: String,
     /// Database name.
-    pub(crate) database: String,
+    pub database: String,
     /// Use SSL/TLS.
     #[serde(default)]
-    pub(crate) ssl: bool,
+    pub ssl: bool,
     /// Query timeout in milliseconds (default 5000).
     #[serde(default = "default_statement_timeout")]
-    pub(crate) statement_timeout_ms: u64,
+    pub statement_timeout_ms: u64,
     /// Max rows returned (default 1000).
     #[serde(default = "default_max_rows")]
-    pub(crate) max_rows: usize,
+    pub max_rows: usize,
 }
 
 /// Default port.
@@ -191,7 +191,7 @@ const fn default_max_rows() -> usize {
 
 /// Metric recorded for each DB operation.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct DbMetric {
+pub struct DbMetric {
     /// Operation type.
     action: String,
     /// Duration in microseconds.
@@ -206,7 +206,8 @@ pub(crate) struct DbMetric {
 
 impl DbMetric {
     /// Operation duration in microseconds (for the per-capability latency histogram).
-    pub(crate) const fn duration_us(&self) -> u128 {
+    #[must_use]
+    pub const fn duration_us(&self) -> u128 {
         self.duration_us
     }
 }

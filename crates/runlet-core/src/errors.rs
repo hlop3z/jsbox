@@ -22,7 +22,7 @@ use serde_json::Value;
 /// Coarse category a client branches on (the response `error.type`).
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum ErrorCategory {
+pub enum ErrorCategory {
     /// Caller's fault — the submitted request is invalid.
     Request,
     /// Engine / `QuickJS` level (syntax, timeout, memory, internal).
@@ -37,7 +37,7 @@ pub(crate) enum ErrorCategory {
 /// response envelope.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum ErrorSource {
+pub enum ErrorSource {
     /// Request validation, before the engine.
     Request,
     /// The execution engine itself.
@@ -87,7 +87,7 @@ impl ErrorSource {
 /// (the action). Routes alerts: don't page ops for a developer's bug.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum ErrorOwner {
+pub enum ErrorOwner {
     /// The API client sent a bad request (fix the request).
     Caller,
     /// The script author's code/logic/usage (fix the script).
@@ -108,22 +108,24 @@ impl ErrorOwner {
     }
 }
 
-/// A classified fault: a stable machine `code`, a retry hint, and the responsible
-/// `owner` — derived from a typed error *above the stringify cliff*. Capability-agnostic;
-/// the `code` constants live with the capability that owns them.
+/// A classified fault: a stable machine `code`, a retry hint, and a responsible `owner`.
+///
+/// Derived from a typed error *above the stringify cliff*. Capability-agnostic; the `code`
+/// constants live with the capability that owns them.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Fault {
+pub struct Fault {
     /// Stable `SCREAMING_SNAKE` code, safe for a client to switch on.
-    pub(crate) code: &'static str,
+    pub code: &'static str,
     /// `true` ⇒ a retry may succeed (transient); `false` ⇒ deterministic.
-    pub(crate) retryable: bool,
+    pub retryable: bool,
     /// Who should act on this fault.
-    pub(crate) owner: ErrorOwner,
+    pub owner: ErrorOwner,
 }
 
 impl Fault {
     /// Builds a fault from a `code`, retry hint, and responsible owner.
-    pub(crate) const fn new(code: &'static str, retryable: bool, owner: ErrorOwner) -> Self {
+    #[must_use]
+    pub const fn new(code: &'static str, retryable: bool, owner: ErrorOwner) -> Self {
         Self {
             code,
             retryable,
@@ -137,6 +139,7 @@ impl Fault {
 /// Serializes to `{ error, code, retryable, owner, source, details? }`. The JS wrapper
 /// throws `new Error(error)` and tags it (`e.__jsbox = res`) so the engine classifies
 /// the throw structurally (docs/99-errors.md).
+#[cfg(feature = "_throws")]
 #[derive(Debug, Serialize)]
 struct CapabilityFault {
     /// Raw driver message (the human-readable cause — surfaced gated, in `debug.raw`).
@@ -156,6 +159,7 @@ struct CapabilityFault {
 
 /// In-band `api` transport-error payload (§13): HTTP never throws, so a transport
 /// failure is returned as data the script can inspect, not an exception.
+#[cfg(feature = "http")]
 #[derive(Debug, Serialize)]
 struct ApiInbandError {
     /// Always `0` — signals "no HTTP response" (transport failed before a status).
@@ -165,6 +169,7 @@ struct ApiInbandError {
 }
 
 /// The `error` object embedded in an [`ApiInbandError`].
+#[cfg(feature = "http")]
 #[derive(Debug, Serialize)]
 struct InbandFault {
     /// Stable machine code.
@@ -181,9 +186,11 @@ struct InbandFault {
 }
 
 /// Last-resort JSON if a [`CapabilityFault`] ever fails to serialize.
+#[cfg(feature = "_throws")]
 const FALLBACK_FAULT_JSON: &str = r#"{"error":"internal error","code":"INTERNAL","retryable":true,"owner":"operator","source":"engine"}"#;
 
 /// Last-resort JSON if an [`ApiInbandError`] ever fails to serialize.
+#[cfg(feature = "http")]
 const FALLBACK_API_JSON: &str = r#"{"status":0,"error":{"code":"HTTP_ERROR","retryable":true,"owner":"operator","source":"api"}}"#;
 
 /// Builds the FFI failure JSON a *throwing* capability returns (`db`/`mail`/`s3`).
@@ -191,6 +198,7 @@ const FALLBACK_API_JSON: &str = r#"{"status":0,"error":{"code":"HTTP_ERROR","ret
 /// The single place the `{ error, code, retryable, owner, source, details? }` shape is
 /// produced, so every capability stays DRY: it supplies its [`ErrorSource`], a classified
 /// [`Fault`], the raw message, and any structured `details`.
+#[cfg(feature = "_throws")]
 pub(crate) fn capability_fault_json(
     source: ErrorSource,
     fault: Fault,
@@ -212,6 +220,7 @@ pub(crate) fn capability_fault_json(
 ///
 /// The non-throwing twin of [`capability_fault_json`] — `api` returns this as data so
 /// the script can inspect `res.error` without a `try/catch` (§13).
+#[cfg(feature = "http")]
 pub(crate) fn api_inband_error_json(fault: Fault, message: &str) -> String {
     let payload = ApiInbandError {
         status: 0,
@@ -228,13 +237,13 @@ pub(crate) fn api_inband_error_json(fault: Fault, message: &str) -> String {
 
 /// Internal-only debug context; gated by `error_debug`. Never surface to end users.
 #[derive(Debug, Serialize)]
-pub(crate) struct ErrorDebug {
+pub struct ErrorDebug {
     /// JS stack trace, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) stack: Option<String>,
+    pub stack: Option<String>,
     /// Raw driver/internal cause (may contain secrets/PII — why it's gated).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) raw: Option<String>,
+    pub raw: Option<String>,
 }
 
 impl ErrorDebug {
@@ -249,7 +258,7 @@ impl ErrorDebug {
 /// Built only for *system-generated* errors; a developer's `return json(null, x)`
 /// payload passes through verbatim and never becomes one of these (D1).
 #[derive(Debug, Serialize)]
-pub(crate) struct ErrorEnvelope {
+pub struct ErrorEnvelope {
     /// Coarse category for client branching.
     #[serde(rename = "type")]
     category: ErrorCategory,
@@ -275,7 +284,8 @@ pub(crate) struct ErrorEnvelope {
 
 impl ErrorEnvelope {
     /// Creates an envelope with the always-present fields.
-    pub(crate) const fn new(
+    #[must_use]
+    pub const fn new(
         category: ErrorCategory,
         source: ErrorSource,
         code: String,
@@ -296,21 +306,21 @@ impl ErrorEnvelope {
 
     /// Attaches a human-safe message.
     #[must_use]
-    pub(crate) fn with_message(mut self, message: String) -> Self {
+    pub fn with_message(mut self, message: String) -> Self {
         self.message = Some(message);
         self
     }
 
     /// Attaches structured, ungated machine context.
     #[must_use]
-    pub(crate) fn with_details(mut self, details: Option<Value>) -> Self {
+    pub fn with_details(mut self, details: Option<Value>) -> Self {
         self.details = details;
         self
     }
 
     /// Attaches internal-only debug context, dropping it entirely if empty.
     #[must_use]
-    pub(crate) fn with_debug(mut self, debug: ErrorDebug) -> Self {
+    pub fn with_debug(mut self, debug: ErrorDebug) -> Self {
         self.debug = if debug.is_empty() { None } else { Some(debug) };
         self
     }

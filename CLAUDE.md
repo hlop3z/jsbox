@@ -4,16 +4,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-jsbox is a sandboxed JavaScript execution service in Rust. Clients `POST /execute` a JS
+A sandboxed JavaScript execution service in Rust. Clients `POST /execute` a JS
 `handler(ctx)` function plus a JSON context; the server runs it in an isolated QuickJS
 context and returns `{data, error, meta}`. The single endpoint is the whole product.
+
+**Cargo workspace (two crates):**
+
+- **`runlet-core`** (`crates/runlet-core/`) — the reusable logic host: the QuickJS engine,
+  runtime pool, sandbox, resilience, error taxonomy, capabilities, and the callable
+  [`LogicHost`] port (`Invocation` → `Outcome`). Knows nothing about HTTP. The public entry
+  is `runlet_core::host::LogicHost`; each I/O capability is a cargo **feature** (`db`, `http`,
+  `mongo`, `mail`, `s3`, `redis`, `amq`, `auth`), so a deterministic-only consumer builds with
+  `default-features = false` and links no network drivers. See `TODO.md` for the extraction
+  brief and `docs/design/` for the design.
+- **`runlet`** (`crates/runlet/`) — the binary: the axum HTTP `/execute` front + server config,
+  a thin adapter over `LogicHost::run`. Enables all `runlet-core` features. Behavior is
+  unchanged from the pre-workspace `jsbox` (the binary/image are renamed to `runlet`; the
+  `jsbox_*` Prometheus metric names and internal `__jsbox` error tag are kept for compatibility).
 
 ## Commands
 
 The project uses [Task](https://taskfile.dev) (`Taskfile.yml`). Raw `cargo` equivalents in parens.
 
-- **Build:** `task build` (`cargo build`) · release: `task build-release` (`cargo build --release`)
-- **Run:** `task run` (`cargo run`) — serves on `http://127.0.0.1:3000`
+- **Build:** `task build` (`cargo build`, whole workspace) · release: `task build-release` (`cargo build --release`)
+- **Run:** `task run` (`cargo run -p runlet`) — serves on `http://127.0.0.1:3000`
+- **Deterministic-only core build (no network drivers):** `cargo build -p runlet-core --no-default-features` (optionally `--features db,http,…` to opt specific capabilities back in)
 - **Format:** `task fmt` / `task fmt-check`
 - **Lint:** `task clippy` (`cargo clippy`) — see the lint warning below
 - **Unit tests:** `cargo test`
@@ -34,23 +49,30 @@ The strict lint contract lives in `[lints.clippy]` in `Cargo.toml`, and **`cargo
 
 ## Architecture (request lifecycle)
 
-`src/main.rs` wires an axum router (`/execute`, `/health`) with an `AppState` (a `JsPool` + a read-only `ScriptRegistry`) as shared state.
+Module paths below are under `crates/runlet-core/src/` unless prefixed with `runlet/`.
 
-1. **`handler.rs`** — `execute()` resolves the script source — exactly one of inline `script` or registered `key` (looked up in `registry.rs`, a startup-loaded map of `scripts_dir/**/*.js`; see `docs/design/script-registry.md`) — validates input sizes, then `tokio::task::spawn_blocking` (QuickJS is synchronous/single-threaded and must run off the async runtime).
-2. **`pool.rs`** — `JsPool` is a fixed pool of pre-warmed `Runtime`s (sized to CPU cores). `acquire()`/`release()`; a fresh `Context` is created per request (cheap) so global scope never leaks between requests. `release()` runs GC.
-3. **`engine.rs`** — `run()` is the orchestrator: sets a timeout interrupt handler, makes a `Context`, injects the `json()` bridge → injects `$`/Decimal → injects capabilities (`inject_apis`) → evals the user script → removes `eval`/`Proxy` → calls `handler(ctx)` → extracts the JSON result. Returns `ExecResult { js_json, http_metrics, db_metrics, mail_metrics }`.
-4. **`handler.rs`** — parses the JS `{data, error}` envelope (zero-copy via `RawValue`), attaches the Rust-computed `meta`, returns `{data, error, meta}`.
+`runlet/src/main.rs` wires an axum router (`/execute`, `/health`, `/metrics`) with an
+`AppState` holding a `LogicHost` (+ the bulkhead/partition/breaker/metrics it doesn't own).
 
-`config.rs` loads optional `config.json` (server bind + engine sandbox limits, with human-readable byte sizes like `"32mb"`). Sandbox limits: memory, stack, wall-clock timeout, max script/context bytes, and `max_ops` (caps total external operations per execution).
+1. **`runlet/src/handler.rs`** — `execute()` resolves the script source — exactly one of inline `script` or registered `key` (looked up in `registry.rs`, a startup-loaded map of `scripts_dir/**/*.js`; see `docs/design/script-registry.md`) — validates input sizes, admits via the bulkhead, then `tokio::task::spawn_blocking` (QuickJS is synchronous/single-threaded and must run off the async runtime) builds an `Invocation` and calls `host.run`.
+2. **`host.rs`** — `LogicHost::run(Invocation) -> Outcome` is the callable port (no HTTP assumption): resolves the `CodeRef`, acquires a pooled runtime, builds `ExecParams`, calls `engine::run`, releases the runtime, and maps `ExecResult` → `Outcome { result, effects, metrics }`. The HTTP front and any non-HTTP scheduler both go through this.
+3. **`pool.rs`** — `JsPool` is a fixed pool of pre-warmed `Runtime`s (sized to CPU cores). `acquire()`/`release()`; a fresh `Context` is created per request (cheap) so global scope never leaks between requests. `release()` runs GC.
+4. **`engine.rs`** — `run()` is the orchestrator: sets a timeout interrupt handler, makes a `Context`, injects the `json()` bridge → `$`/Decimal → `$sys` → `emit`/`read` → capabilities (`inject_apis`, gated by `Profile`) → evals the user script → removes `eval`/`Proxy` (+ determinism sanitizer under `Profile::Deterministic`) → calls `handler(ctx)` → extracts the JSON result. Returns `ExecResult { outcome, effects, *_metrics }`.
+5. **`runlet/src/handler.rs`** — parses the JS `{data, error}` envelope (zero-copy via `RawValue`), attaches the Rust-computed `meta`, returns `{data, error, meta}` (ignores `Outcome.effects`).
+
+**`Profile` + `emit` (engine-disposes model):** `Profile::Full` is the jsbox capability set + `emit`; `Profile::Deterministic` injects **no** I/O capabilities and neutralizes nondeterminism (`Math.random`/`Date`/`$sys` time+random — see `js/determinism.js`). `emit(value)` appends opaque JSON to a per-invocation buffer surfaced as `Outcome.effects` (logic proposes, the engine disposes). `Invocation.read_hook` is the consumer-wired read-of-declared-dependencies seam (exposed as the `read()` global). The HTTP front always uses `Profile::Full` with no read-hook.
+
+`config.rs` (core) owns `EngineConfig` (engine sandbox limits, human-readable byte sizes like `"32mb"`: memory, stack, wall-clock timeout, max script/context bytes, `max_ops`). The server `Config` (bind address, `/execute` auth token, `scripts_dir`/`modules_dir`) lives in `runlet/src/config.rs` and embeds `EngineConfig`.
 
 ### The capability pattern (how `api`, `db`, `mail` work)
 
 Each capability is a near-identical module. To add or modify one, follow the existing shape:
 
-- A native function registered with `Function::new` named `__<cap>`, with a **string-in / string-out JSON FFI contract** (no rich types cross the QuickJS boundary). The matching JS wrapper lives in `src/js/<cap>.js`, embedded via `include_str!` and `eval`'d after registration to expose a clean global (`api`, `db`, `mail`, `$`).
-- **Per-request, opt-in:** the capability is injected only if its config block is present in the request (`engine.rs::inject_apis`). No config → the global simply doesn't exist (`typeof mail === "undefined"`). `$`/Decimal is the exception — it's pure (no I/O) and **always injected**, no config.
+- A native function registered with `Function::new` named `__<cap>`, with a **string-in / string-out JSON FFI contract** (no rich types cross the QuickJS boundary). The matching JS wrapper lives in `crates/runlet-core/src/js/<cap>.js`, embedded via `include_str!` and `eval`'d after registration to expose a clean global (`api`, `db`, `mail`, `$`).
+- **Per-request, opt-in:** the capability is injected only if its config block is present in the request (`engine.rs::inject_apis`) **and** the `Profile` allows I/O. No config → the global simply doesn't exist (`typeof mail === "undefined"`). `$`/Decimal/`$sys` are the exception — pure (no I/O), **always injected**, no config.
 - **Metered:** each op goes through `sandbox.rs` (`check_op_limit`, `record`); metrics collect into a `Collector<T>` and drain into the response `meta.<cap>_requests`.
-- Files touched when adding a capability: new `src/<cap>.rs` + `src/js/<cap>.js`, `mod` in `main.rs`, a branch in `engine.rs::inject_apis` + fields in `ExecParams`/`ExecResult`, and `RequestConfig` + `Meta` in `handler.rs`.
+- **Cargo-feature gated:** each I/O capability is a feature on `runlet-core`. A new capability adds a `[features]` entry (with `"_io"` and any `dep:` driver crates) and `#[cfg(feature = "<cap>")]` on its module, its `ExecParams`/`ExecResult`/`Collectors`/`CapabilitySet`/`ExecMetrics` fields, and its `inject_apis` block.
+- Files touched when adding a capability: new `crates/runlet-core/src/<cap>.rs` + `src/js/<cap>.js`, a `#[cfg]`'d `pub mod` in `lib.rs`, the feature in `crates/runlet-core/Cargo.toml`, a `#[cfg]`'d branch in `engine.rs::inject_apis` + cfg'd fields in `ExecParams`/`ExecResult`/`Collectors`, cfg'd fields in `host.rs` (`CapabilitySet`/`ExecMetrics` + the `run` wiring), and `RequestConfig` + `Meta` in `runlet/src/handler.rs`.
 
 ### Two trust models — pick the right one
 
@@ -74,7 +96,7 @@ template; other capabilities (`mail`/`s3`/`redis`/`amq`) remain sync. See
 
 ## Conventions
 
-- **Lint gauntlet:** `[lints]` in `Cargo.toml` forbids `unsafe`, denies `clippy::{all,pedantic,nursery,cargo}` plus many restriction lints (no `unwrap`/`expect`/`panic`, no bare arithmetic — use `checked_*`/`saturating_*`, no `as` casts, `missing_docs_in_private_items`, no `#[allow]` — use `#[expect(..., reason="...")]`). Mirror an existing module (`db.rs` is the canonical template) and keep functions small (cognitive-complexity and line thresholds in `clippy.toml`).
+- **Lint gauntlet:** `[workspace.lints]` in the root `Cargo.toml` (inherited by both crates via `[lints] workspace = true`) forbids `unsafe`, denies `clippy::{all,pedantic,nursery,cargo}` plus many restriction lints (no `unwrap`/`expect`/`panic`, no bare arithmetic — use `checked_*`/`saturating_*`, no `as` casts, `missing_docs_in_private_items`, no `#[allow]` — use `#[expect(..., reason="...")]`). Mirror an existing module (`db.rs` is the canonical template) and keep functions small (cognitive-complexity and line thresholds in `clippy.toml`).
 - **Beginner docs** live in `docs/` (a kid-friendly guide to each capability). Keep them in sync with API changes; `README.md` is the reference version.
 - **Capability method names are `snake_case` — always.** Every method on a capability global (`api`/`db`/`mongo`/`mail`/`s3`/`redis`/`amq`/`auth`, and any future one) uses `snake_case`, e.g. `s3.upload_url`, `auth.user_info`, `mongo.find_one`/`insert_many`/`update_one`. **Do not** copy the underlying library's casing — MongoDB's `findOne`/`insertMany` etc. become `find_one`/`insert_many`. The internal string-in/string-out FFI **action token** (the first arg to `__<cap>`) must use the same `snake_case` name as the JS method, kept in sync between `src/js/<cap>.js` and the Rust dispatch `match`. (Exception: the value-util globals `$`/`Decimal` use JS-idiomatic camelCase fluent methods like `toCents`/`toString` — see the next bullet. The snake_case rule is for the I/O capabilities only.)
 - **Util API surface — one canonical, IntelliSense-discoverable form.** New helpers on a value-util global like `$`/`Decimal` (and any future util we add) are exposed as **chainable instance methods only** (e.g. `$(x).toCents()`, camelCase to match JS natives like `toString`), never duplicated as static shortcuts on the factory (no `$.toCents(x)`). Every public method must be declared in `container/types.d.ts` so editor autocomplete (the bundled `tsconfig.json` runs `checkJs`) is the single source of truth for what's callable. One way to do a thing, and it shows up in IntelliSense.

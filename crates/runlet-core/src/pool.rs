@@ -17,17 +17,13 @@ use crate::modules::{ModuleRegistry, RegistryLoader, RegistryResolver};
 
 /// A pool of pre-configured `QuickJS` runtimes.
 #[derive(Debug, Clone)]
-pub(crate) struct JsPool {
+pub struct JsPool {
     /// The inner pool of runtimes.
     inner: Arc<ArrayQueue<Runtime>>,
     /// Number of slots in the pool.
     size: usize,
     /// Engine config applied to each runtime.
     engine_config: EngineConfig,
-    /// Local-dev flag: relax the SSRF private-IP block when `true`.
-    debug: bool,
-    /// Include `error.debug` (stack traces) in responses when `true`.
-    error_debug: bool,
     /// Injectable ES modules, wired as the per-runtime `import` loader.
     modules: Arc<ModuleRegistry>,
 }
@@ -38,10 +34,8 @@ impl JsPool {
     /// # Errors
     ///
     /// Returns an error if runtime creation fails.
-    pub(crate) fn new(
+    pub fn new(
         engine_config: EngineConfig,
-        debug: bool,
-        error_debug: bool,
         modules: Arc<ModuleRegistry>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let size = if engine_config.pool_size > 0 {
@@ -63,8 +57,6 @@ impl JsPool {
             inner: Arc::new(queue),
             size,
             engine_config,
-            debug,
-            error_debug,
             modules,
         })
     }
@@ -74,36 +66,28 @@ impl JsPool {
     /// # Errors
     ///
     /// Returns an error if creating a fallback runtime fails.
-    pub(crate) fn acquire(&self) -> Result<Runtime, Box<dyn Error + Send + Sync>> {
+    pub fn acquire(&self) -> Result<Runtime, Box<dyn Error + Send + Sync>> {
         self.inner
             .pop()
             .map_or_else(|| create_runtime(&self.engine_config, &self.modules), Ok)
     }
 
     /// Returns a runtime to the pool. Drops it if the pool is full.
-    pub(crate) fn release(&self, runtime: Runtime) {
+    pub fn release(&self, runtime: Runtime) {
         runtime.run_gc();
         drop(self.inner.push(runtime));
     }
 
     /// Returns the pool size.
-    pub(crate) const fn size(&self) -> usize {
+    #[must_use]
+    pub const fn size(&self) -> usize {
         self.size
     }
 
     /// Returns the engine config.
-    pub(crate) const fn engine_config(&self) -> &EngineConfig {
+    #[must_use]
+    pub const fn engine_config(&self) -> &EngineConfig {
         &self.engine_config
-    }
-
-    /// Returns whether debug mode (relaxed SSRF guard) is enabled.
-    pub(crate) const fn debug(&self) -> bool {
-        self.debug
-    }
-
-    /// Returns whether `error.debug` (stack traces) should be included in responses.
-    pub(crate) const fn error_debug(&self) -> bool {
-        self.error_debug
     }
 }
 

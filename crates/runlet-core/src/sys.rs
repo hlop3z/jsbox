@@ -58,13 +58,13 @@ use crate::sandbox;
 /// `env` values are returnable plain config; `secrets` plaintext never reaches JS —
 /// it stays Rust-side in the [`SecretStore`] and surfaces only as opaque handles.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct SysConfig {
+pub struct SysConfig {
     /// Plain config values, exposed (and returnable) at `$sys.env`.
     #[serde(default)]
-    pub(crate) env: Map<String, Value>,
+    pub env: Map<String, Value>,
     /// Secret values: plaintext kept Rust-side; `$sys.secrets` exposes opaque handles.
     #[serde(default)]
-    pub(crate) secrets: Map<String, Value>,
+    pub secrets: Map<String, Value>,
 }
 
 impl SysConfig {
@@ -110,7 +110,7 @@ const SECONDS_PER_DAY: u64 = 86_400;
 /// # Errors
 ///
 /// Returns an error if registration or JS eval fails.
-pub(crate) fn inject_sys(
+pub fn inject_sys(
     qctx: &Ctx<'_>,
     sys_config: Option<&SysConfig>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {

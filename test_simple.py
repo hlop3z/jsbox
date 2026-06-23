@@ -1329,8 +1329,9 @@ def _start_server() -> subprocess.Popen:
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
         json.dump(config, fh)
-    # cargo walks up from cwd to find the workspace Cargo.toml.
-    return subprocess.Popen(["cargo", "run"], cwd=run_dir,
+    # cargo walks up from cwd to find the workspace Cargo.toml; `-p runlet` selects the
+    # HTTP-front binary (the workspace has multiple members).
+    return subprocess.Popen(["cargo", "run", "-p", "runlet"], cwd=run_dir,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 

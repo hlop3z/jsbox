@@ -69,7 +69,7 @@ const fn default_max_docs() -> usize {
 
 /// Per-request `MongoDB` configuration.
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct MongoConfig {
+pub struct MongoConfig {
     /// Database host.
     host: String,
     /// Database port (default 27017).
@@ -102,7 +102,7 @@ pub(crate) struct MongoConfig {
 
 /// Metric recorded for each mongo operation.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct MongoMetric {
+pub struct MongoMetric {
     /// Operation type.
     action: String,
     /// Duration in microseconds.
@@ -117,7 +117,8 @@ pub(crate) struct MongoMetric {
 
 impl MongoMetric {
     /// Operation duration in microseconds (for the per-capability latency histogram).
-    pub(crate) const fn duration_us(&self) -> u128 {
+    #[must_use]
+    pub const fn duration_us(&self) -> u128 {
         self.duration_us
     }
 }

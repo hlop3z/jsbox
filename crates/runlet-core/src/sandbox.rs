@@ -3,19 +3,26 @@
 //! Provides generic metric collection, error JSON building,
 //! and input validation used by both `http.rs` and `db.rs`.
 
+// The metric-collection apparatus is used only by the I/O capabilities; a deterministic-only
+// build (no capability features) compiles without it.
+#[cfg(feature = "_io")]
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "_io")]
 use serde::Serialize;
 
 /// Generic metrics collector — shared between HTTP and DB modules.
-pub(crate) type Collector<T> = Arc<Mutex<Vec<T>>>;
+#[cfg(feature = "_io")]
+pub type Collector<T> = Arc<Mutex<Vec<T>>>;
 
 /// Creates a new empty metrics collector.
+#[cfg(feature = "_io")]
 pub(crate) fn new_collector<T>() -> Collector<T> {
     Arc::new(Mutex::new(Vec::new()))
 }
 
 /// Pushes a metric into the collector.
+#[cfg(feature = "_io")]
 pub(crate) fn record<T>(collector: &Collector<T>, metric: T) {
     if let Ok(mut vec) = collector.lock() {
         vec.push(metric);
@@ -23,6 +30,7 @@ pub(crate) fn record<T>(collector: &Collector<T>, metric: T) {
 }
 
 /// Extracts all collected metrics, returning an empty vec if unavailable.
+#[cfg(feature = "_io")]
 pub(crate) fn drain<T: Clone>(collector: Option<&Collector<T>>) -> Vec<T> {
     collector
         .and_then(|coll| coll.lock().ok().map(|guard| guard.clone()))
@@ -44,7 +52,7 @@ pub(crate) fn error_json(message: &str) -> String {
 ///
 /// Returns `(code, message)` if a limit is exceeded — the stable `request`-category
 /// code (`SCRIPT_TOO_LARGE` / `CONTEXT_TOO_LARGE`) plus a human-safe message.
-pub(crate) fn validate_input_sizes(
+pub fn validate_input_sizes(
     script_bytes: usize,
     context_bytes: usize,
     max_script: usize,
@@ -66,6 +74,7 @@ pub(crate) fn validate_input_sizes(
 }
 
 /// Checks if the operation count exceeds the per-execution limit.
+#[cfg(feature = "_io")]
 pub(crate) fn check_op_limit<T: Serialize>(
     collector: &Collector<T>,
     max_ops: usize,

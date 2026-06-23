@@ -24,7 +24,7 @@ const DECIMAL_WRAPPER: &str = include_str!("js/decimal.js");
 /// # Errors
 ///
 /// Returns an error if registration or JS eval fails.
-pub(crate) fn inject_decimal(qctx: &Ctx<'_>) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub fn inject_decimal(qctx: &Ctx<'_>) -> Result<(), Box<dyn Error + Send + Sync>> {
     let decimal_fn = Function::new(
         qctx.clone(),
         |op: String, lhs: String, rhs: String| -> String {

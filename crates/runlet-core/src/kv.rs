@@ -29,17 +29,17 @@ const REDIS_OP_LIMIT: Fault = Fault::new("REDIS_OP_LIMIT", false, ErrorOwner::De
 /// Fault for a Redis command that timed out.
 const REDIS_TIMEOUT: Fault = Fault::new("REDIS_TIMEOUT", true, ErrorOwner::Operator);
 /// Fault for a failure to reach Redis (inject-time connect, or a mid-session IO error).
-pub(crate) const REDIS_CONNECTION_FAULT: Fault =
+pub const REDIS_CONNECTION_FAULT: Fault =
     Fault::new("REDIS_CONNECTION", true, ErrorOwner::Operator);
 
 /// Per-request Redis configuration.
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct RedisConfig {
+pub struct RedisConfig {
     /// Connection URL, e.g. `redis://user:pass@host:6379/0`.
-    pub(crate) url: String,
+    pub url: String,
     /// Connect + command timeout in milliseconds (default 5000).
     #[serde(default = "default_timeout")]
-    pub(crate) timeout_ms: u64,
+    pub timeout_ms: u64,
 }
 
 /// Default command timeout in milliseconds.
@@ -49,7 +49,7 @@ const fn default_timeout() -> u64 {
 
 /// Metric recorded for each Redis operation.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct RedisMetric {
+pub struct RedisMetric {
     /// Operation type.
     action: String,
     /// Duration in microseconds.
@@ -62,7 +62,8 @@ pub(crate) struct RedisMetric {
 
 impl RedisMetric {
     /// Operation duration in microseconds (for the per-capability latency histogram).
-    pub(crate) const fn duration_us(&self) -> u128 {
+    #[must_use]
+    pub const fn duration_us(&self) -> u128 {
         self.duration_us
     }
 }
@@ -120,7 +121,7 @@ fn classify(err: &redis::RedisError) -> Fault {
 /// # Errors
 ///
 /// Returns an error if connection or registration fails.
-pub(crate) fn inject_redis(
+pub fn inject_redis(
     qctx: &Ctx<'_>,
     config: &RedisConfig,
     max_ops: usize,

@@ -75,7 +75,7 @@ impl Visitor<'_> for ByteSizeVisitor {
 ///
 /// Returns an error if the value is neither a non-negative integer nor a valid
 /// human-readable size string.
-pub(crate) fn deserialize_byte_size<'de, D: Deserializer<'de>>(
+pub fn deserialize_byte_size<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<usize, D::Error> {
     deserializer.deserialize_any(ByteSizeVisitor)

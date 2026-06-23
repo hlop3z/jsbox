@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 /// Immutable key → script-source map, loaded at startup.
 #[derive(Debug, Default)]
-pub(crate) struct ScriptRegistry {
+pub struct ScriptRegistry {
     /// Registered scripts: key (relative path, no extension) → source.
     scripts: HashMap<String, Arc<str>>,
 }
@@ -30,7 +30,7 @@ impl ScriptRegistry {
     ///
     /// Returns an error if the directory or a file can't be read, a script exceeds
     /// `max_script_size`, or a script path isn't valid UTF-8.
-    pub(crate) fn load(
+    pub fn load(
         dir: &Path,
         max_script_size: usize,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
@@ -60,12 +60,13 @@ impl ScriptRegistry {
     }
 
     /// Looks up a registered script by key.
-    pub(crate) fn get(&self, key: &str) -> Option<Arc<str>> {
+    pub fn get(&self, key: &str) -> Option<Arc<str>> {
         self.scripts.get(key).map(Arc::clone)
     }
 
     /// Number of registered scripts.
-    pub(crate) fn count(&self) -> usize {
+    #[must_use]
+    pub fn count(&self) -> usize {
         self.scripts.len()
     }
 }

@@ -134,38 +134,38 @@ const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
 
 /// Per-request S3 configuration (operator-supplied, like `db`/`mail`).
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct S3Config {
+pub struct S3Config {
     /// Endpoint URL including scheme, e.g. `https://s3.us-east-1.amazonaws.com`
     /// or `http://localhost:9000` (`MinIO`). The bucket is added per addressing mode.
-    pub(crate) endpoint: String,
+    pub endpoint: String,
     /// `SigV4` region scope (e.g. `us-east-1`; Cloudflare R2 uses `auto`).
-    pub(crate) region: String,
+    pub region: String,
     /// Bucket name.
-    pub(crate) bucket: String,
+    pub bucket: String,
     /// Access key id.
-    pub(crate) access_key: String,
+    pub access_key: String,
     /// Secret access key.
-    pub(crate) secret_key: String,
+    pub secret_key: String,
     /// Path-style addressing (`host/bucket/key`). Default `false` = virtual-hosted
     /// (`bucket.host/key`). `MinIO` and most self-hosted stores need `true`.
     #[serde(default)]
-    pub(crate) path_style: bool,
+    pub path_style: bool,
     /// Default link lifetime in seconds when a call omits `expires`.
     #[serde(default = "default_expires")]
-    pub(crate) expires: u64,
+    pub expires: u64,
     /// Hard cap on link lifetime in seconds (`SigV4` max is 604800 = 7 days).
     #[serde(default = "default_max_expires")]
-    pub(crate) max_expires: u64,
+    pub max_expires: u64,
     /// Maximum upload size for `upload_form`, human-readable (`"25mb"`, `"50gb"`, or
     /// bytes). Operator-supplied — the script can never raise or set it. Required for
     /// `upload_form` (0 = unset → `upload_form` errors). Unused by `upload_url`/`download_url`.
     #[serde(default, deserialize_with = "deserialize_byte_size")]
-    pub(crate) max_upload_size: usize,
+    pub max_upload_size: usize,
     /// Allow object deletion (`s3.delete(...)` and presigning a `DELETE` URL).
     /// **Off by default** — deletion is destructive, so the operator must opt in
     /// per request even when `s3` is otherwise configured.
     #[serde(default)]
-    pub(crate) allow_delete: bool,
+    pub allow_delete: bool,
 }
 
 /// Default presigned-link lifetime in seconds (15 minutes).
@@ -179,7 +179,7 @@ const fn default_max_expires() -> u64 {
 
 /// Metric recorded for each S3 operation.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct S3Metric {
+pub struct S3Metric {
     /// Operation type (`presign`, `presign_post`, `usage`, or `delete`).
     action: String,
     /// HTTP method the URL is signed for.
@@ -198,7 +198,8 @@ pub(crate) struct S3Metric {
 
 impl S3Metric {
     /// Operation duration in microseconds (for the per-capability latency histogram).
-    pub(crate) const fn duration_us(&self) -> u128 {
+    #[must_use]
+    pub const fn duration_us(&self) -> u128 {
         self.duration_us
     }
 }
@@ -265,7 +266,7 @@ struct PresignOutcome {
 /// # Errors
 ///
 /// Returns an error if function registration or JS eval fails.
-pub(crate) fn inject_s3(
+pub fn inject_s3(
     qctx: &Ctx<'_>,
     config: &S3Config,
     max_ops: usize,

@@ -45,7 +45,7 @@ const AMQ_UNSUPPORTED: Fault = Fault::new("AMQ_UNSUPPORTED", false, ErrorOwner::
 /// Messaging backend selected by `config.amq.backend`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum AmqBackend {
+pub enum AmqBackend {
     /// `RabbitMQ` (default) — AMQP producer.
     #[default]
     Rabbitmq,
@@ -55,43 +55,43 @@ pub(crate) enum AmqBackend {
 
 /// Per-request messaging configuration (`RabbitMQ` or `NATS`, by `backend`).
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct AmqConfig {
+pub struct AmqConfig {
     /// Messaging backend (default `rabbitmq`).
     #[serde(default)]
-    pub(crate) backend: AmqBackend,
+    pub backend: AmqBackend,
     /// Broker host.
-    pub(crate) host: String,
+    pub host: String,
     /// Broker port (default 5672 for `RabbitMQ`, 4222 for NATS).
     #[serde(default)]
-    pub(crate) port: Option<u16>,
+    pub port: Option<u16>,
     /// Username — `RabbitMQ` defaults to `guest`; NATS authenticates only when supplied.
     #[serde(default)]
-    pub(crate) username: Option<String>,
+    pub username: Option<String>,
     /// Password — `RabbitMQ` defaults to `guest`; NATS authenticates only when supplied.
     #[serde(default)]
-    pub(crate) password: Option<String>,
+    pub password: Option<String>,
     /// Bearer token auth (NATS backend only).
     #[serde(default)]
-    pub(crate) token: Option<String>,
+    pub token: Option<String>,
     /// Virtual host (`RabbitMQ`, default `/`).
     #[serde(default = "default_vhost")]
-    pub(crate) vhost: String,
+    pub vhost: String,
     /// Exchange to publish to (`RabbitMQ`, default `""` — the default exchange).
     #[serde(default)]
-    pub(crate) exchange: String,
+    pub exchange: String,
     /// Maximum messages per `send` call (default 100).
     #[serde(default = "default_max_batch")]
-    pub(crate) max_batch: usize,
+    pub max_batch: usize,
     /// Request-reply timeout in milliseconds (NATS backend, default 5000).
     #[serde(default = "default_request_timeout")]
-    pub(crate) request_timeout_ms: u64,
+    pub request_timeout_ms: u64,
     /// Use TLS. Reuses the `aws-lc-rs` rustls provider.
     #[serde(default)]
-    pub(crate) tls: bool,
+    pub tls: bool,
     /// Path to a custom CA cert (PEM) for a self-hosted broker. Omit for managed services
     /// (their public CAs are covered by the bundled webpki roots).
     #[serde(default)]
-    pub(crate) ca_cert: Option<String>,
+    pub ca_cert: Option<String>,
 }
 
 impl AmqConfig {
@@ -119,7 +119,7 @@ const fn default_request_timeout() -> u64 {
 
 /// Metric recorded for each `amq.send` op.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct AmqMetric {
+pub struct AmqMetric {
     /// Operation type.
     action: String,
     /// Duration in microseconds.
@@ -134,7 +134,8 @@ pub(crate) struct AmqMetric {
 
 impl AmqMetric {
     /// Operation duration in microseconds (for the per-capability latency histogram).
-    pub(crate) const fn duration_us(&self) -> u128 {
+    #[must_use]
+    pub const fn duration_us(&self) -> u128 {
         self.duration_us
     }
 }
@@ -193,7 +194,7 @@ struct SendOutcome {
 /// # Errors
 ///
 /// Returns an error if function registration or JS eval fails.
-pub(crate) fn inject_amq(
+pub fn inject_amq(
     qctx: &Ctx<'_>,
     config: &AmqConfig,
     max_ops: usize,

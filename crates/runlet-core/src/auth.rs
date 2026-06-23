@@ -44,29 +44,29 @@ const fn default_timeout() -> u64 {
 
 /// Per-request auth configuration (operator-supplied, trusted).
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct AuthConfig {
+pub struct AuthConfig {
     /// OIDC issuer base URL (used for discovery + the metric host).
-    pub(crate) issuer: String,
+    pub issuer: String,
     /// Explicit userinfo endpoint (skips discovery when set).
     #[serde(default)]
-    pub(crate) userinfo_url: Option<String>,
+    pub userinfo_url: Option<String>,
     /// Explicit introspection endpoint (skips discovery when set).
     #[serde(default)]
-    pub(crate) introspect_url: Option<String>,
+    pub introspect_url: Option<String>,
     /// OAuth client id for introspection Basic auth (empty = introspect disabled).
     #[serde(default)]
-    pub(crate) client_id: String,
+    pub client_id: String,
     /// OAuth client secret for introspection Basic auth.
     #[serde(default)]
-    pub(crate) client_secret: String,
+    pub client_secret: String,
     /// Connect + read timeout in milliseconds (default 10000).
     #[serde(default = "default_timeout")]
-    pub(crate) timeout_ms: u64,
+    pub timeout_ms: u64,
 }
 
 /// Metric recorded for each auth operation.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct AuthMetric {
+pub struct AuthMetric {
     /// Operation type (`user_info` / `introspect`).
     action: String,
     /// Issuer host only (no path/query — privacy).
@@ -79,7 +79,8 @@ pub(crate) struct AuthMetric {
 
 impl AuthMetric {
     /// Operation duration in microseconds (for the per-capability latency histogram).
-    pub(crate) const fn duration_us(&self) -> u128 {
+    #[must_use]
+    pub const fn duration_us(&self) -> u128 {
         self.duration_us
     }
 }
@@ -159,7 +160,7 @@ struct AuthState {
 /// # Errors
 ///
 /// Returns an error if client construction or registration fails.
-pub(crate) fn inject_auth(
+pub fn inject_auth(
     qctx: &Ctx<'_>,
     config: &AuthConfig,
     max_ops: usize,

@@ -72,7 +72,7 @@ fn classify(err: &SmtpError) -> Fault {
 /// Transport security mode for the SMTP connection.
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum TlsMode {
+pub enum TlsMode {
     /// Upgrade a plaintext connection with STARTTLS (default; usually port 587).
     #[default]
     Starttls,
@@ -84,38 +84,38 @@ pub(crate) enum TlsMode {
 
 /// Per-request mail configuration.
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct MailConfig {
+pub struct MailConfig {
     /// SMTP relay host.
-    pub(crate) host: String,
+    pub host: String,
     /// SMTP relay port (default 587).
     #[serde(default = "default_port")]
-    pub(crate) port: u16,
+    pub port: u16,
     /// SMTP auth user (empty = no authentication).
     #[serde(default)]
-    pub(crate) user: String,
+    pub user: String,
     /// SMTP auth password.
     #[serde(default)]
-    pub(crate) password: String,
+    pub password: String,
     /// Transport security mode (default STARTTLS).
     #[serde(default)]
-    pub(crate) tls: TlsMode,
+    pub tls: TlsMode,
     /// Default From address (used when a send omits `from`).
-    pub(crate) from: String,
+    pub from: String,
     /// Maximum recipients (to + cc + bcc) per send (default 50).
     #[serde(default = "default_max_recipients")]
-    pub(crate) max_recipients: usize,
+    pub max_recipients: usize,
     /// Recipient-domain allowlist: when non-empty, every recipient's domain (to/cc/bcc) must
     /// be in this list (case-insensitive). Empty (default) = unrestricted. Set it for
     /// untrusted scripts so a handler can't turn the operator's relay into an open spam cannon.
     #[serde(default)]
-    pub(crate) allowed_recipient_domains: Vec<String>,
+    pub allowed_recipient_domains: Vec<String>,
     /// Per-execution cap on `mail.send` calls. `0` (default) = bounded only by the global
     /// `max_ops` budget; when set, the effective cap is `min(max_sends, max_ops)`.
     #[serde(default)]
-    pub(crate) max_sends: usize,
+    pub max_sends: usize,
     /// Connect + send timeout in milliseconds (default 10000).
     #[serde(default = "default_timeout")]
-    pub(crate) timeout_ms: u64,
+    pub timeout_ms: u64,
 }
 
 /// Default SMTP port.
@@ -133,7 +133,7 @@ const fn default_timeout() -> u64 {
 
 /// Metric recorded for each mail operation.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct MailMetric {
+pub struct MailMetric {
     /// Operation type.
     action: String,
     /// Duration in microseconds.
@@ -148,7 +148,8 @@ pub(crate) struct MailMetric {
 
 impl MailMetric {
     /// Operation duration in microseconds (for the per-capability latency histogram).
-    pub(crate) const fn duration_us(&self) -> u128 {
+    #[must_use]
+    pub const fn duration_us(&self) -> u128 {
         self.duration_us
     }
 }
@@ -214,7 +215,7 @@ struct SendCtx<'a> {
 /// # Errors
 ///
 /// Returns an error if transport construction or registration fails.
-pub(crate) fn inject_mail(
+pub fn inject_mail(
     qctx: &Ctx<'_>,
     config: &MailConfig,
     max_ops: usize,

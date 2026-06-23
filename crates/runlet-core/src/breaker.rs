@@ -18,11 +18,11 @@ use std::time::{Duration, Instant};
 
 /// Breaker tunables.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct BreakerConfig {
+pub struct BreakerConfig {
     /// Consecutive connect failures that trip the breaker open.
-    pub(crate) threshold: u32,
+    pub threshold: u32,
     /// How long the breaker stays open before allowing a half-open probe.
-    pub(crate) cooldown: Duration,
+    pub cooldown: Duration,
 }
 
 /// Per-target failure/open state.
@@ -36,7 +36,7 @@ struct TargetState {
 
 /// Per-target circuit breaker. Build via [`CircuitBreaker::new`]; `None` = disabled.
 #[derive(Debug)]
-pub(crate) struct CircuitBreaker {
+pub struct CircuitBreaker {
     /// Tunables.
     config: BreakerConfig,
     /// Target key → state.
@@ -47,7 +47,8 @@ pub(crate) struct CircuitBreaker {
 
 impl CircuitBreaker {
     /// Builds a breaker, or `None` when disabled (`threshold == 0`).
-    pub(crate) fn new(config: BreakerConfig) -> Option<Self> {
+    #[must_use]
+    pub fn new(config: BreakerConfig) -> Option<Self> {
         if config.threshold == 0 {
             return None;
         }
@@ -59,14 +60,14 @@ impl CircuitBreaker {
     }
 
     /// Total number of times any target has tripped open since startup.
-    pub(crate) fn trips(&self) -> u64 {
+    pub fn trips(&self) -> u64 {
         self.trips.load(Ordering::Relaxed)
     }
 
     /// Returns `true` if a call to `target` is allowed (closed, or a half-open probe).
     /// On the first call after the cool-down elapses, re-arms the open window so only that
     /// one request probes while others keep fast-failing until the probe resolves.
-    pub(crate) fn allow(&self, target: &str) -> bool {
+    pub fn allow(&self, target: &str) -> bool {
         let now = Instant::now();
         let Ok(mut map) = self.targets.lock() else {
             return true; // poisoned lock: fail open, never wedge the service
@@ -86,7 +87,7 @@ impl CircuitBreaker {
 
     /// Records the outcome of a connect to `target`: success resets the breaker; a failure
     /// increments the count and trips the breaker open once it reaches the threshold.
-    pub(crate) fn record(&self, target: &str, success: bool) {
+    pub fn record(&self, target: &str, success: bool) {
         let Ok(mut map) = self.targets.lock() else {
             return;
         };

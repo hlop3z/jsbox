@@ -1,0 +1,79 @@
+[package]
+name = "runlet-core"
+description = "Reusable sandboxed JavaScript logic host powered by QuickJS — engine, runtime pool, sandbox, resilience, and capabilities"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# ── Always-compiled core (engine, sandbox, $sys, decimal, host) ──
+# These pull no network driver, so a deterministic-only consumer can depend on the crate
+# with `default-features = false` and link none of the heavy I/O stacks below.
+[dependencies]
+crossbeam-queue.workspace = true
+rquickjs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+base64.workspace = true
+chrono.workspace = true
+hex.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+percent-encoding.workspace = true
+rust_decimal.workspace = true
+
+# ── Optional, per-capability driver deps (enabled by the features below) ──
+tracing = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, optional = true }
+postgres_rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+mongodb = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+amqprs = { workspace = true, optional = true }
+async-nats = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
+lettre = { workspace = true, optional = true }
+
+# ── Capability features ──
+# Each I/O capability is a cargo feature gating its module + driver crates. A consumer that
+# only needs a deterministic host builds with `default-features = false` (no network drivers
+# compiled). `runlet` (the HTTP front) enables `full`.
+[features]
+default = ["full"]
+full = ["http", "db", "mongo", "mail", "s3", "redis", "amq", "auth"]
+# Internal markers (not for direct use): `_io` is enabled by every capability (gates the
+# metric collector apparatus); `_throws` is enabled by every *throwing* capability — all
+# except `http`/`api`, which reports transport errors in-band rather than by throwing — and
+# gates the `capability_fault_json` tag machinery.
+_io = []
+_throws = []
+http = ["dep:reqwest", "_io"]
+db = [
+    "dep:tokio-postgres",
+    "dep:postgres_rustls",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:webpki-roots",
+    "dep:bytes",
+    "dep:tracing",
+    "_io",
+    "_throws",
+]
+mongo = ["dep:mongodb", "_io", "_throws"]
+mail = ["dep:lettre", "_io", "_throws"]
+s3 = ["dep:reqwest", "_io", "_throws"]
+redis = ["dep:redis", "_io", "_throws"]
+amq = ["dep:amqprs", "dep:async-nats", "dep:bytes", "_io", "_throws"]
+auth = ["dep:reqwest", "_io", "_throws"]
+
+[lints]
+workspace = true

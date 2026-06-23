@@ -114,7 +114,7 @@ fn bucket_labels(extra: &str, le: &str) -> String {
 /// A metered capability, used to route a per-op latency observation to the right
 /// histogram. Mirrors the `meta.<cap>_requests` families.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Capability {
+pub enum Capability {
     /// `db` (Postgres-family).
     Db,
     /// `mongo` (document database).
@@ -196,7 +196,7 @@ impl CapabilityLatencies {
 
 /// All process-wide counters. One instance lives in `AppState`, shared across requests.
 #[derive(Debug, Default)]
-pub(crate) struct Metrics {
+pub struct Metrics {
     /// Executions that returned a handler result.
     success: AtomicU64,
     /// Executions that failed with a script/syntax/handler error.
@@ -225,14 +225,15 @@ pub(crate) struct Metrics {
 
 impl Metrics {
     /// Records a successful execution.
-    pub(crate) fn record_success(&self) {
+    pub fn record_success(&self) {
         let _ = self.success.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records an execution that ended in a classified [`EngineError`], bucketing it by kind.
-    pub(crate) fn record_engine_error(&self, err: &EngineError) {
+    pub fn record_engine_error(&self, err: &EngineError) {
         let counter = match *err {
             EngineError::Syntax(_)
+            | EngineError::ScriptNotFound(_)
             | EngineError::ModuleNotFound(_)
             | EngineError::HandlerNotDefined
             | EngineError::Script { .. } => &self.script_error,
@@ -250,29 +251,29 @@ impl Metrics {
     }
 
     /// Records a request rejected before execution (validation / routing).
-    pub(crate) fn record_rejection(&self) {
+    pub fn record_rejection(&self) {
         let _ = self.rejections.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records a request shed by the global bulkhead.
-    pub(crate) fn record_overload_global(&self) {
+    pub fn record_overload_global(&self) {
         let _ = self.overload_global.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records a request shed by a partition's fairness cap.
-    pub(crate) fn record_overload_partition(&self) {
+    pub fn record_overload_partition(&self) {
         let _ = self.overload_partition.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Observes the wall-clock latency (microseconds) of an execution that ran. Clamps a
     /// (practically impossible) `u128` overflow to `u64::MAX` rather than wrapping.
-    pub(crate) fn observe_execution(&self, micros: u128) {
+    pub fn observe_execution(&self, micros: u128) {
         self.exec_latency
             .observe(u64::try_from(micros).unwrap_or(u64::MAX));
     }
 
     /// Observes one capability operation's latency (microseconds) in `cap`'s histogram.
-    pub(crate) fn observe_op(&self, cap: Capability, micros: u128) {
+    pub fn observe_op(&self, cap: Capability, micros: u128) {
         self.cap_latency
             .histogram(cap)
             .observe(u64::try_from(micros).unwrap_or(u64::MAX));
@@ -281,7 +282,7 @@ impl Metrics {
     /// Renders the Prometheus text exposition (v0.0.4). `bulkhead_available` /
     /// `bulkhead_total` are the live semaphore permits; `breaker_trips` is the cumulative
     /// circuit-breaker open count (both read at scrape time, not stored here).
-    pub(crate) fn render(
+    pub fn render(
         &self,
         bulkhead_available: usize,
         bulkhead_total: usize,

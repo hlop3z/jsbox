@@ -1,28 +1,7 @@
-//! jsbox: A sandboxed JS execution service powered by `QuickJS`.
+//! runlet: A sandboxed JS execution service powered by `QuickJS` (HTTP front for `runlet-core`).
 
-mod amq;
-mod auth;
-mod breaker;
-mod bytesize;
 mod config;
-mod db;
-mod decimal;
-mod engine;
-mod errors;
 mod handler;
-mod http;
-mod kv;
-mod mail;
-mod metrics;
-mod modules;
-mod mongo;
-mod partition;
-mod pool;
-mod registry;
-mod s3;
-mod sandbox;
-mod ssrf;
-mod sys;
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -35,19 +14,22 @@ use axum::routing::{get, post};
 use axum::serve::ListenerExt as _;
 use rustls::crypto::aws_lc_rs;
 use tokio::net::TcpListener;
+use tokio::runtime::Handle;
 use tokio::signal;
 use tokio::sync::Semaphore;
 use tracing::info;
 use tracing_subscriber::fmt::init as init_tracing;
 
-use crate::breaker::{BreakerConfig, CircuitBreaker};
+use runlet_core::breaker::{BreakerConfig, CircuitBreaker};
+use runlet_core::host::{HostSettings, LogicHost};
+use runlet_core::metrics::Metrics;
+use runlet_core::modules::ModuleRegistry;
+use runlet_core::partition::PartitionLimiter;
+use runlet_core::pool::JsPool;
+use runlet_core::registry::ScriptRegistry;
+
 use crate::config::Config;
 use crate::handler::AppState;
-use crate::metrics::Metrics;
-use crate::modules::ModuleRegistry;
-use crate::partition::PartitionLimiter;
-use crate::pool::JsPool;
-use crate::registry::ScriptRegistry;
 
 /// Use `mimalloc` as the global allocator for better small-allocation performance.
 /// `QuickJS` benefits significantly (~20-40%) from this via the `rust-alloc` feature.
@@ -60,6 +42,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 ///
 /// Returns an error if config is invalid or the server fails to start.
 #[tokio::main]
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear startup wiring (config → registries → pool → host → bulkhead → serve); \
+              splitting it would scatter the one-shot setup state across helpers"
+)]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_tracing();
 
@@ -121,15 +108,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         "/execute bearer auth"
     );
 
-    let js_pool = JsPool::new(config.engine, config.debug, config.error_debug, modules)?;
+    let js_pool = JsPool::new(config.engine, modules)?;
     info!("JS runtime pool: {} slots", js_pool.size());
 
-    let body_limit = js_pool.engine_config().max_body_size();
-    let max_concurrent = js_pool
-        .engine_config()
-        .resolved_max_concurrent(js_pool.size());
-    let per_partition = js_pool.engine_config().max_concurrent_per_partition;
-    let partition_buckets = js_pool.engine_config().resolved_partition_buckets();
+    // `EngineConfig` is `Copy`, so read the resolved limits out once for the server-side
+    // wiring before the pool moves into the `LogicHost`.
+    let engine_cfg = *js_pool.engine_config();
+    let body_limit = engine_cfg.max_body_size();
+    let max_concurrent = engine_cfg.resolved_max_concurrent(js_pool.size());
+    let per_partition = engine_cfg.max_concurrent_per_partition;
+    let partition_buckets = engine_cfg.resolved_partition_buckets();
     info!("execution bulkhead: {max_concurrent} concurrent");
     let partition_limiter = PartitionLimiter::new(partition_buckets, per_partition);
     if partition_limiter.is_some() {
@@ -137,8 +125,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             "per-partition fairness: {per_partition} concurrent/partition across {partition_buckets} buckets"
         );
     }
-    let breaker_threshold = js_pool.engine_config().db_breaker_threshold;
-    let breaker_cooldown_ms = js_pool.engine_config().resolved_breaker_cooldown_ms();
+    let breaker_threshold = engine_cfg.db_breaker_threshold;
+    let breaker_cooldown_ms = engine_cfg.resolved_breaker_cooldown_ms();
     let db_breaker = CircuitBreaker::new(BreakerConfig {
         threshold: breaker_threshold,
         cooldown: Duration::from_millis(breaker_cooldown_ms),
@@ -149,9 +137,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             "db circuit breaker: trip after {breaker_threshold} fails, {breaker_cooldown_ms}ms cool-down"
         );
     }
+
+    let registry = Arc::new(script_registry);
+    // The callable logic host owns the pool + resilience wiring; the HTTP front is one
+    // consumer of it (a non-HTTP scheduler could be another).
+    let host = LogicHost::new(
+        js_pool,
+        Handle::current(),
+        db_breaker.clone(),
+        Arc::clone(&registry),
+        HostSettings {
+            limits: engine_cfg,
+            allow_private_targets: config.debug,
+        },
+    );
     let state = AppState {
-        pool: js_pool,
-        registry: Arc::new(script_registry),
+        host,
+        registry,
+        engine_cfg,
+        error_debug: config.error_debug,
         limiter: Arc::new(Semaphore::new(max_concurrent)),
         partition_limiter,
         db_breaker,

@@ -25,7 +25,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// Fixed array of per-partition concurrency buckets. A partition key hashes to one
 /// bucket; a request must hold a bucket permit (plus the global bulkhead permit) to run.
 #[derive(Debug, Clone)]
-pub(crate) struct PartitionLimiter {
+pub struct PartitionLimiter {
     /// One semaphore per bucket, each with `max_concurrent_per_partition` permits.
     buckets: Arc<[Arc<Semaphore>]>,
 }
@@ -33,7 +33,8 @@ pub(crate) struct PartitionLimiter {
 impl PartitionLimiter {
     /// Builds a limiter with `count` buckets of `per_partition` permits each. Returns
     /// `None` when disabled (`per_partition == 0`) so the caller can skip the gating.
-    pub(crate) fn new(count: usize, per_partition: usize) -> Option<Self> {
+    #[must_use]
+    pub fn new(count: usize, per_partition: usize) -> Option<Self> {
         if per_partition == 0 || count == 0 {
             return None;
         }
@@ -45,7 +46,8 @@ impl PartitionLimiter {
 
     /// Tries to take a permit for `partition`. `Some(permit)` to proceed, `None` when the
     /// partition's bucket is saturated (caller should reject with `PARTITION_OVERLOADED`).
-    pub(crate) fn try_acquire(&self, partition: &str) -> Option<OwnedSemaphorePermit> {
+    #[must_use]
+    pub fn try_acquire(&self, partition: &str) -> Option<OwnedSemaphorePermit> {
         self.bucket_for(partition)
             .and_then(|bucket| Arc::clone(bucket).try_acquire_owned().ok())
     }

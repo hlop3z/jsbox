@@ -26,7 +26,7 @@ pub(crate) const UNRESOLVED_MARKER: &str = "module not in registry";
 
 /// Immutable specifier → module-source map, loaded at startup.
 #[derive(Debug, Default)]
-pub(crate) struct ModuleRegistry {
+pub struct ModuleRegistry {
     /// Registered modules: specifier (relative path, no extension) → ESM source.
     modules: HashMap<String, Arc<str>>,
 }
@@ -40,7 +40,7 @@ impl ModuleRegistry {
     ///
     /// Returns an error if the directory or a file can't be read, a module exceeds
     /// `max_size`, or a module path isn't valid UTF-8.
-    pub(crate) fn load(dir: &Path, max_size: usize) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    pub fn load(dir: &Path, max_size: usize) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let mut modules = HashMap::new();
         let mut pending: Vec<PathBuf> = vec![dir.to_path_buf()];
         while let Some(current) = pending.pop() {
@@ -79,7 +79,8 @@ impl ModuleRegistry {
     }
 
     /// Number of registered modules.
-    pub(crate) fn count(&self) -> usize {
+    #[must_use]
+    pub fn count(&self) -> usize {
         self.modules.len()
     }
 }

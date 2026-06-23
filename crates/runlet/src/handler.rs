@@ -11,38 +11,44 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::amq::{AmqConfig, AmqMetric};
-use crate::auth::{AuthConfig, AuthMetric};
-use crate::breaker::CircuitBreaker;
-use crate::db::{DbConfig, DbMetric};
-use crate::engine::{self, EngineError, ExecOutcome, ExecParams, ExecResult};
-use crate::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
-use crate::http::HttpMetric;
-use crate::kv::{RedisConfig, RedisMetric};
-use crate::mail::{MailConfig, MailMetric};
-use crate::metrics::{Capability, Metrics};
-use crate::mongo::{MongoConfig, MongoMetric};
-use crate::partition::PartitionLimiter;
-use crate::pool::JsPool;
-use crate::registry::ScriptRegistry;
-use crate::s3::{S3Config, S3Metric};
-use crate::sandbox;
-use crate::sys::SysConfig;
+use runlet_core::amq::{AmqConfig, AmqMetric};
+use runlet_core::auth::{AuthConfig, AuthMetric};
+use runlet_core::breaker::CircuitBreaker;
+use runlet_core::config::EngineConfig;
+use runlet_core::db::{DbConfig, DbMetric};
+use runlet_core::engine::{EngineError, ExecOutcome, Profile};
+use runlet_core::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
+use runlet_core::host::{CapabilitySet, CodeRef, ExecMetrics, Invocation, LogicHost, Outcome};
+use runlet_core::http::HttpMetric;
+use runlet_core::kv::{RedisConfig, RedisMetric};
+use runlet_core::mail::{MailConfig, MailMetric};
+use runlet_core::metrics::{Capability, Metrics};
+use runlet_core::mongo::{MongoConfig, MongoMetric};
+use runlet_core::partition::PartitionLimiter;
+use runlet_core::registry::ScriptRegistry;
+use runlet_core::s3::{S3Config, S3Metric};
+use runlet_core::sandbox;
+use runlet_core::sys::SysConfig;
 
-/// Shared application state for the router: the runtime pool, the script registry, and
+/// Shared application state for the router: the logic host, the script registry, and
 /// the concurrency bulkhead.
 #[derive(Debug, Clone)]
 pub(crate) struct AppState {
-    /// Pool of pre-warmed `QuickJS` runtimes.
-    pub(crate) pool: JsPool,
-    /// Read-only registry of scripts loaded at startup (execute-by-key).
+    /// The callable logic host (pool + resilience + engine limits) — runs each request.
+    pub(crate) host: LogicHost,
+    /// Read-only registry of scripts loaded at startup (execute-by-key). Resolved here for
+    /// input-sizing/meta before the source is handed to the host as inline code.
     pub(crate) registry: Arc<ScriptRegistry>,
+    /// Engine sandbox limits, used outside the host for input-size validation and the
+    /// `statement_timeout` clamp.
+    pub(crate) engine_cfg: EngineConfig,
+    /// Include `error.debug` (stack traces + raw causes) in responses.
+    pub(crate) error_debug: bool,
     /// Bulkhead bounding concurrent executions: a permit is held across the blocking
     /// execution span, and acquisition fast-fails (`429 OVERLOADED`) when saturated so a
     /// slow downstream can't exhaust blocking threads / DB connections.
@@ -144,27 +150,6 @@ pub(crate) struct RequestConfig {
 /// Returns a clone of the pre-allocated default context.
 fn default_context() -> Box<RawValue> {
     DEFAULT_CONTEXT.clone()
-}
-
-/// Per-capability metrics drained from one execution.
-#[derive(Debug, Default)]
-struct ExecMetrics {
-    /// HTTP request metrics.
-    http: Vec<HttpMetric>,
-    /// DB operation metrics.
-    db: Vec<DbMetric>,
-    /// Mongo operation metrics.
-    mongo: Vec<MongoMetric>,
-    /// Mail operation metrics.
-    mail: Vec<MailMetric>,
-    /// S3 presign metrics.
-    s3: Vec<S3Metric>,
-    /// Redis operation metrics.
-    redis: Vec<RedisMetric>,
-    /// `RabbitMQ` operation metrics.
-    amq: Vec<AmqMetric>,
-    /// Auth operation metrics.
-    auth: Vec<AuthMetric>,
 }
 
 /// Metadata computed by Rust.
@@ -301,11 +286,6 @@ fn raw_null_ref() -> &'static RawValue {
 /// Takes `Result<Json<…>, JsonRejection>` rather than `Json<…>` so a malformed or
 /// type-confused body is handled here as a structured `{data, error, meta}` envelope,
 /// instead of axum short-circuiting with its default plain-text rejection.
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear request pipeline (auth → validate → admit → spawn → respond); \
-              splitting it would scatter the shared trace_id/meta/permit state"
-)]
 pub(crate) async fn execute(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -334,9 +314,8 @@ pub(crate) async fn execute(
     let partition = header_partition(&headers).or(body_partition);
     let context_bytes = context.get().len();
 
-    let engine_cfg = state.pool.engine_config().clone();
-    let error_debug = state.pool.error_debug();
-    let allow_private_targets = state.pool.debug();
+    let engine_cfg = state.engine_cfg;
+    let error_debug = state.error_debug;
     let trace_id = Uuid::new_v4().to_string();
 
     // Resolve exactly one of `script` / `key` into the source to execute.
@@ -386,38 +365,29 @@ pub(crate) async fn execute(
         Err(shed) => return *shed,
     };
 
-    // Handle for the blocking task to drive async capability I/O (db) via `block_on` (Tier 2).
-    let tokio_handle = Handle::current();
-
-    let result = task::spawn_blocking(move || -> Result<ExecResult, EngineError> {
-        let runtime = state
-            .pool
-            .acquire()
-            .map_err(|err| EngineError::Internal(err.to_string()))?;
-        let res = engine::run(&ExecParams {
-            runtime: &runtime,
-            tokio_handle: &tokio_handle,
-            db_breaker: state.db_breaker.as_deref(),
-            script: source.as_str(),
+    // Build the invocation inside the blocking task (owned data moved in). The host drives
+    // async capability I/O via its captured tokio handle (Tier 2), acquires/releases the
+    // runtime, and applies the SSRF/wildcard policy. The HTTP front always runs the
+    // full-capability profile with no read-hook.
+    let host = state.host.clone();
+    let result = task::spawn_blocking(move || -> Result<Outcome, EngineError> {
+        host.run(Invocation {
+            code: CodeRef::Inline(source.as_str()),
             context_json: &context_json,
-            timeout: engine_cfg.timeout(),
-            allowed_hosts: &config.allowed_hosts,
-            db_config: db_config.as_ref(),
-            mongo_config: config.mongo.as_ref(),
-            mail_config: config.mail.as_ref(),
-            s3_config: config.s3.as_ref(),
-            redis_config: config.redis.as_ref(),
-            amq_config: config.amq.as_ref(),
-            auth_config: config.auth.as_ref(),
-            sys_config: config.sys.as_ref(),
-            max_ops: engine_cfg.max_ops,
-            max_output_size: engine_cfg.max_output_size,
-            allow_private_targets,
-            // `*` honored only as explicit opt-in, never in SSRF-relaxed debug mode.
-            wildcard_hosts_allowed: engine_cfg.allow_wildcard_hosts && !allow_private_targets,
-        });
-        state.pool.release(runtime);
-        res
+            profile: Profile::Full,
+            caps: CapabilitySet {
+                allowed_hosts: &config.allowed_hosts,
+                db: db_config.as_ref(),
+                mongo: config.mongo.as_ref(),
+                mail: config.mail.as_ref(),
+                s3: config.s3.as_ref(),
+                redis: config.redis.as_ref(),
+                amq: config.amq.as_ref(),
+                auth: config.auth.as_ref(),
+                sys: config.sys.as_ref(),
+            },
+            read_hook: None,
+        })
     })
     .await;
 
@@ -453,7 +423,7 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> impl IntoResponse 
 /// Turns the `spawn_blocking` result into the final HTTP response, attaching metrics to
 /// `meta` on success and classifying the error otherwise.
 fn build_response(
-    result: Result<Result<ExecResult, EngineError>, task::JoinError>,
+    result: Result<Result<Outcome, EngineError>, task::JoinError>,
     base_meta: Meta,
     error_debug: bool,
     metrics: &Metrics,
@@ -462,19 +432,11 @@ fn build_response(
     metrics.observe_execution(base_meta.exec_time_us);
     match result {
         Ok(Ok(exec)) => {
-            record_capability_latencies(metrics, &exec);
-            let drained = ExecMetrics {
-                http: exec.http_metrics,
-                db: exec.db_metrics,
-                mongo: exec.mongo_metrics,
-                mail: exec.mail_metrics,
-                s3: exec.s3_metrics,
-                redis: exec.redis_metrics,
-                amq: exec.amq_metrics,
-                auth: exec.auth_metrics,
-            };
-            let meta = base_meta.with_metrics(drained);
-            match exec.outcome {
+            record_capability_latencies(metrics, &exec.metrics);
+            // `exec.effects` (the declarative `emit` buffer) is intentionally ignored by the
+            // HTTP front — it is for non-HTTP consumers of `runlet-core`.
+            let meta = base_meta.with_metrics(exec.metrics);
+            match exec.result {
                 ExecOutcome::Success(js_json) => {
                     metrics.record_success();
                     success_response(&js_json, meta, error_debug)
@@ -499,29 +461,29 @@ fn build_response(
 
 /// Feeds every per-op duration from a finished execution into its capability's latency
 /// histogram, so `/metrics` can show which downstream is slow, not just total exec time.
-fn record_capability_latencies(metrics: &Metrics, exec: &ExecResult) {
-    for metric in &exec.db_metrics {
+fn record_capability_latencies(metrics: &Metrics, exec: &ExecMetrics) {
+    for metric in &exec.db {
         metrics.observe_op(Capability::Db, metric.duration_us());
     }
-    for metric in &exec.mongo_metrics {
+    for metric in &exec.mongo {
         metrics.observe_op(Capability::Mongo, metric.duration_us());
     }
-    for metric in &exec.http_metrics {
+    for metric in &exec.http {
         metrics.observe_op(Capability::Http, metric.duration_us());
     }
-    for metric in &exec.mail_metrics {
+    for metric in &exec.mail {
         metrics.observe_op(Capability::Mail, metric.duration_us());
     }
-    for metric in &exec.s3_metrics {
+    for metric in &exec.s3 {
         metrics.observe_op(Capability::S3, metric.duration_us());
     }
-    for metric in &exec.redis_metrics {
+    for metric in &exec.redis {
         metrics.observe_op(Capability::Redis, metric.duration_us());
     }
-    for metric in &exec.amq_metrics {
+    for metric in &exec.amq {
         metrics.observe_op(Capability::Amq, metric.duration_us());
     }
-    for metric in &exec.auth_metrics {
+    for metric in &exec.auth {
         metrics.observe_op(Capability::Auth, metric.duration_us());
     }
 }
@@ -574,7 +536,7 @@ fn malformed_request_response(state: &AppState, rejection: &JsonRejection) -> Ax
         "MALFORMED_REQUEST",
         "request body is not valid for /execute".to_owned(),
     );
-    let envelope = if state.pool.error_debug() {
+    let envelope = if state.error_debug {
         base.with_debug(ErrorDebug {
             stack: None,
             raw: Some(rejection.body_text()),

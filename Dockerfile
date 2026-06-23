@@ -23,14 +23,14 @@ RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path r
 # Build the real app (only recompiles our code)
 COPY . .
 RUN cargo build --release --target x86_64-unknown-linux-musl \
-    && strip target/x86_64-unknown-linux-musl/release/jsbox
+    && strip target/x86_64-unknown-linux-musl/release/runlet
 
 # ── Runtime (distroless static — no glibc needed) ────────
 FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /app
 
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/jsbox .
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/runlet .
 COPY config.example.json config.example.json
 
 # Default config: bind 0.0.0.0 so container is reachable
@@ -40,4 +40,4 @@ EOF
 
 EXPOSE 3000
 
-ENTRYPOINT ["./jsbox"]
+ENTRYPOINT ["./runlet"]

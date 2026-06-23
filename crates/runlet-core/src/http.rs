@@ -90,7 +90,7 @@ fn classify(err: &reqwest::Error) -> Fault {
 
 /// Metric recorded for each HTTP request.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct HttpMetric {
+pub struct HttpMetric {
     /// HTTP method.
     method: String,
     /// Host only (no path/query — privacy).
@@ -107,7 +107,8 @@ pub(crate) struct HttpMetric {
 
 impl HttpMetric {
     /// Operation duration in microseconds (for the per-capability latency histogram).
-    pub(crate) const fn duration_us(&self) -> u128 {
+    #[must_use]
+    pub const fn duration_us(&self) -> u128 {
         self.duration_us
     }
 }
@@ -117,7 +118,7 @@ impl HttpMetric {
 /// # Errors
 ///
 /// Returns an error if client creation, registration, or JS eval fails.
-pub(crate) fn inject_api(
+pub fn inject_api(
     qctx: &Ctx<'_>,
     allowed_hosts: &[String],
     max_ops: usize,
