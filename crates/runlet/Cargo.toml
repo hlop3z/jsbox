@@ -17,10 +17,10 @@ path = "src/main.rs"
 [dependencies]
 runlet-core = { path = "../runlet-core" }
 # The driver-backed egress backends (the `*Config`/`*Metric` types + the in-process `BackendSet`)
-# the binary wires behind the egress port. The drivers the binary links now come through
-# `fabric-backends`, not `runlet-core`. The shared wire types (Egress/CircuitBreaker) are reached
-# via `runlet-core`'s re-exports, so no direct `fabric-wire` dep is needed.
+# the binary wires behind the egress port; the drivers the binary links come through here, not
+# `runlet-core`. `fabric-wire` gives the `Egress`/`EgressError` the UDS client (`uds.rs`) implements.
 fabric-backends = { path = "../fabric-backends" }
+fabric-wire = { path = "../fabric-wire" }
 axum.workspace = true
 mimalloc.workspace = true
 serde.workspace = true

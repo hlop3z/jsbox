@@ -12,6 +12,7 @@
 //! driver host (`fabric-backends`, eventually `fabricd`) can implement it without linking the
 //! sandbox.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::errors::{self, DynamicFault, ErrorOwner};
@@ -41,7 +42,9 @@ pub trait Egress: Send + Sync {
 ///
 /// `source` should be a known capability tag (`"db"`, `"mongo"`, …) so the engine classifies
 /// the throw as a capability error; an unrecognized source degrades to a script error.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` so it round-trips a sidecar (`fabricd`) call result over the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EgressError {
     /// Stable machine code (e.g. `"DB_TIMEOUT"`).
     pub code: String,

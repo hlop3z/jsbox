@@ -2,6 +2,7 @@
 
 mod config;
 mod handler;
+mod uds;
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -147,6 +148,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         info!("logical resources: {} declared", resources.len());
     }
 
+    // Optional egress sidecar: when set, driver-backed capabilities route over UDS to `fabricd`
+    // (with in-process fallback). Captured before the engine config moves into the pool.
+    let fabricd_socket = config.fabricd_socket.clone();
+    if let Some(socket) = fabricd_socket.as_deref() {
+        info!(socket, "fabricd egress sidecar configured (UDS, in-process fallback)");
+    }
+
     let registry = Arc::new(script_registry);
     // The callable logic host owns the pool + resilience wiring; the HTTP front is one
     // consumer of it (a non-HTTP scheduler could be another).
@@ -172,6 +180,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         partition_limiter,
         db_breaker,
         resources,
+        fabricd_socket,
         metrics: Arc::new(Metrics::default()),
         bulkhead_capacity: max_concurrent,
         access_token,

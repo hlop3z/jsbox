@@ -76,6 +76,12 @@ pub(crate) struct Config {
     /// capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`).
     #[serde(default)]
     pub(crate) resources: HashMap<String, ResourceBinding>,
+    /// Optional path to a `fabricd` egress sidecar's Unix-domain socket. When set, the
+    /// driver-backed capabilities route over UDS to the daemon (which holds the drivers), with an
+    /// automatic fallback to the in-process backends if the daemon is unreachable. Omit (default)
+    /// to always run the backends in-process. See `docs/design/resource-egress.md` step 4b.
+    #[serde(default)]
+    pub(crate) fabricd_socket: Option<String>,
 }
 
 /// One operator-declared logical resource: a driver `kind` tag plus that driver's connection

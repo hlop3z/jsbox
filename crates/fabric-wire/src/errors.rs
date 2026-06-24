@@ -10,12 +10,12 @@
 //! the throwing-capability `capability_fault_json`) stays in `runlet-core` — it is HTTP-front /
 //! assembly concern, not part of the wire contract a sidecar needs.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// *Who* should act on an error — orthogonal to the error category (the layer) and `retryable`
 /// (the action). Routes alerts: don't page ops for a developer's bug.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ErrorOwner {
     /// The API client sent a bad request (fix the request).

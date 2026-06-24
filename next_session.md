@@ -20,9 +20,10 @@ pure compute (`$`/Decimal/determinism), `http` (SSRF-guarded), and `s3` (SigV4 s
   `config.io`). The in-process adapter is **`BackendSet`** (was `InProcessEgress`).
 - `Gate` (engine.rs) = a 2-variant `Off`/`On` enum for the per-capability inject gates.
 
-## Crate layout (AS OF Step 4a — the current shape)
+## Crate layout (AS OF Step 4b — the current shape)
 
-Five workspace members (`Cargo.toml`):
+Six workspace members (`Cargo.toml`): `fabric-wire`, `fabric-backends`, `fabricd`, `runlet-core`,
+`runlet`, `runlet-bench`.
 - **`fabric-wire`** — shared leaf, no drivers/QuickJS: `Egress` trait + `EgressError`, the error
   taxonomy (`ErrorOwner`/`Fault`/`DynamicFault` + `dynamic_fault_json`), `CircuitBreaker`/
   `BreakerConfig`, and the metric `Collector`. Depended on by both core and backends.
@@ -36,55 +37,62 @@ Five workspace members (`Cargo.toml`):
   `fabric-wire`; `errors.rs` re-exports `ErrorOwner`/`Fault`/`DynamicFault`/`dynamic_fault_json`;
   `sandbox.rs` re-exports the `Collector` apparatus (gated `any(http, s3)`). `http`/`s3` stay
   in-engine.
-- **`runlet`** — the binary. Wires `fabric_backends::BackendSet` as the egress; imports `*Config`/
-  `*Metric` from `fabric_backends`, the wire types via `runlet_core` re-exports (so no direct
-  `fabric-wire` dep).
+- **`fabricd`** — NEW bin (Step 4b): the egress sidecar. Hosts `BackendSet` behind a UDS wire
+  protocol (`fabric_backends::wire`); one connection = one box-request session
+  (`Init`→`Call`*→`Drain`). Dispatches each call on `spawn_blocking` (the backends `block_on`).
+- **`runlet`** — the binary. `build_adapter` (in `handler.rs`) wires either an in-process
+  `BackendSet` or a `uds::UdsEgress` client (when `config.fabricd_socket` is set) with in-process
+  fallback — both as `Arc<dyn MeteredEgress>`, built + drained INSIDE the `spawn_blocking` task
+  (UDS connect/calls/drain all `block_on`). Imports `*Config`/`*Metric`/`BackendMetrics`/`WireInit`
+  from `fabric_backends`, `Egress`/`EgressError` from `fabric_wire`.
 - **`runlet-bench`** — unchanged (no runlet-core dep).
 
 ## Branch / commits
 
 On branch **`resource-egress`** (off `main`). Prior commits did steps 1–3 + the in-box trust-flip
-+ Egress/io rename + docs/live-smoke. **Step 4a is implemented in the working tree but NOT yet
-committed** — review `git status`/`git diff` and commit it (suggested message:
-"Step 4a: extract fabric-wire + fabric-backends; drivers leave runlet-core").
++ Egress/io rename + docs/live-smoke. **Step 4a committed** as `88a1eff` (extract fabric-wire +
+fabric-backends). **Step 4b is implemented in the working tree** (fabricd + UdsEgress) — commit it
+(suggested: "Step 4b: fabricd UDS egress sidecar + UdsEgress client with in-process fallback").
 
-## Status: Step 4a DONE & verified (this session)
+## Status: Steps 4a + 4b DONE & verified (this session)
 
-- Two crates extracted (above). Drivers fully gone from `runlet-core` (`cargo tree -p runlet-core`
-  with `full` shows none; `fabric-backends` carries them all). `runlet` wires an in-process
-  `BackendSet` — provable no-op (behavior unchanged).
-- The driver-backed `ExecMetrics`/`ExecResult` fields left the engine; `host::ExecMetrics` now
-  carries only `http`/`s3`. The binary drains the driver metrics straight from the `BackendSet`
-  (`drain_backend_metrics` → `Meta`), so the response `meta.<cap>_requests` is unchanged.
-- `inject_apis` reworked: cfg-params for the `http`/`s3` collectors; driver caps just inject their
-  wrapper (no engine collector). The `Collectors` struct is gone.
+- **4a:** Drivers fully gone from `runlet-core` (`cargo tree -p runlet-core` with `full` shows none;
+  `fabric-backends` carries them all). The driver-backed `ExecMetrics`/`ExecResult` fields left the
+  engine (`host::ExecMetrics` = `http`/`s3` only); the binary drains driver metrics from the
+  adapter. `inject_apis` reworked (cfg-params for `http`/`s3` collectors; the `Collectors` struct is
+  gone).
+- **4b:** `fabricd` sidecar hosts `BackendSet` over UDS; `runlet::uds::UdsEgress` is the client with
+  in-process fallback; wire protocol in `fabric_backends::wire`. `*Config` gained `Serialize`,
+  `*Metric` + `EgressError` gained `Deserialize` so they round-trip. The adapter is built + drained
+  INSIDE the `spawn_blocking` task (UDS connect/call/drain all `block_on`).
 - **Verified (Docker `rust:1.92-alpine`, the only way to build on this Windows host):**
   - `cargo clippy` whole workspace — clean.
-  - Per-cap cfg sweep `runlet-core --no-default-features [--features <db|mongo|mail|redis|amq|auth|
-    http|s3>]` + NONE — all clean (`sweep.sh` in repo root; `fabric-backends` is featureless, not
-    swept). NOTE: the gate is plain `cargo clippy`, NOT `--all-targets`.
-  - `cargo test` — green (fabric-wire 5, fabric-backends 13, runlet-core 40, runlet 12).
-  - NOT live-smoked this session (no backends up). The dispatch code moved verbatim, so behavior
-    should be identical — a live smoke of `db` via `config.io` is worth doing before 4b.
+  - Per-cap cfg sweep `runlet-core --no-default-features [--features …]` + NONE — clean
+    (`sweep.sh`; `fabric-backends`/`fabricd` are featureless, not swept). Gate is plain `cargo
+    clippy`, NOT `--all-targets`.
+  - `cargo test` — green (fabric-wire 5, fabric-backends 16, runlet-core 40, runlet 12).
+  - **Live-smoke (`smoke_4b.sh`)** box→UDS→`fabricd`→Postgres PASSED: `db.query` returned `n=41`
+    through the daemon with `db_requests` metrics; after killing `fabricd` the box fell back to
+    in-process and still returned `n=41`. (Ran a throwaway `postgres:17-alpine` on a dedicated
+    docker network aliased `postgres` — host 5432 is taken by another project.)
 
 ## What's next (in order)
 
-1. **Commit Step 4a** (see above) if not already done.
-2. **Step 4b (Task #3) — `fabricd`:** new sidecar bin hosting `BackendSet` behind UDS
-   (length-prefixed JSON envelope; the existing `__jsbox` error JSON IS the wire error; metrics
-   ride back in the response so the binary's `drain_backend_metrics` stays unchanged). Add a
-   UDS-client `Egress` impl in `runlet` doing `block_on(timeout(deadline, roundtrip))`; swap
-   `BackendSet` for it (with in-process fallback). Live-smoke box→UDS→fabricd→Postgres. Because
-   `fabric-backends` is already `runlet-core`-free, `fabricd` can depend on it without pulling
-   QuickJS.
-3. **DEFERRED — rewrite `test_simple.py`:** the in-box hard cut (steps 1–3) broke it (it still
+1. **Commit Step 4b** (see above) if not already done.
+2. **DEFERRED — rewrite `test_simple.py`:** the in-box hard cut (steps 1–3) broke it (it still
    sends `config.db`). Needs a generated server `config.json` `resources` map for the named
    variants (pg, pg-maxrows5, pg-badhost, pg-fast, pgbouncer, redis, mongo, nats, nats-fast, mail)
    and ~40 `config={"db":creds}` → `config={"io":{"db":["name"]}}` rewrites, plus reordering
    `main()` so auth/zitadel discovery runs BEFORE `_start_server`. Needs all backends up.
-4. **Step 5 finalize (Task #4):** remove the vestigial `#[expect(dead_code)]` `handle`/`db_breaker`
-   from `LogicHost::new` + struct (coordinate the one-time signature break with external consumer
-   `reactive-database-pg`; update `CONSUMER_NOTES.md` — see new item #7 for the 4a API moves).
+3. **Step 5 (Task #4) — trust-flip finalize:** the box still resolves creds and ships them to
+   `fabricd` in `WireInit` (local UDS, fine for 4b). The full flip: `fabricd` holds the operator
+   `resources` table and resolves creds itself; the box sends only logical names — then `runlet`
+   can drop the `fabric-backends` dep entirely (no drivers in the box binary). Also remove the
+   vestigial `#[expect(dead_code)]` `handle`/`db_breaker` from `LogicHost::new` + struct (coordinate
+   the one-time signature break with external consumer `reactive-database-pg`; update
+   `CONSUMER_NOTES.md` — see item #7 for the 4a API moves).
+4. **`smoke_4b.sh`** in repo root is the reusable live-smoke (run a `postgres:17-alpine` on a docker
+   network aliased `postgres`, then `docker run --network <net> … sh smoke_4b.sh`).
 
 ## How to build/test/smoke (Windows host — native cargo CAN'T build; use Docker via PowerShell)
 

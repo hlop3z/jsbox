@@ -8,7 +8,7 @@ A sandboxed JavaScript execution service in Rust. Clients `POST /execute` a JS
 `handler(ctx)` function plus a JSON context; the server runs it in an isolated QuickJS
 context and returns `{data, error, meta}`. The single endpoint is the whole product.
 
-**Cargo workspace (four crates + a bench crate):**
+**Cargo workspace (five crates + a bench crate):**
 
 - **`fabric-wire`** (`crates/fabric-wire/`) — the shared egress-port contract: the `Egress`
   trait + `EgressError`, the error taxonomy (`ErrorOwner`/`Fault`/`DynamicFault` + the `__jsbox`
@@ -31,10 +31,16 @@ context and returns `{data, error, meta}`. The single endpoint is the whole prod
   `js/*.js`) here and route through the egress port to `fabric-backends`; only `http` (SSRF-guarded)
   and `s3` (pure SigV4 signing) stay in-engine. See `docs/design/` for the design.
 - **`runlet`** (`crates/runlet/`) — the binary: the axum HTTP `/execute` front + server config,
-  a thin adapter over `LogicHost::run`. Enables `runlet-core`'s `full` and wires an in-process
-  `fabric_backends::BackendSet` as the egress port. Behavior is unchanged from the pre-workspace
-  `jsbox` (the binary/image are renamed to `runlet`; the `jsbox_*` Prometheus metric names and
-  internal `__jsbox` error tag are kept for compatibility).
+  a thin adapter over `LogicHost::run`. Enables `runlet-core`'s `full` and wires the egress port —
+  either an in-process `fabric_backends::BackendSet`, or (when `config.fabricd_socket` is set) a
+  `uds::UdsEgress` client to `fabricd` with automatic in-process fallback. Behavior is unchanged
+  from the pre-workspace `jsbox` (the binary/image are renamed to `runlet`; the `jsbox_*`
+  Prometheus metric names and internal `__jsbox` error tag are kept for compatibility).
+- **`fabricd`** (`crates/fabricd/`) — the optional local egress **sidecar** (bin): hosts
+  `fabric_backends::BackendSet` behind a Unix-domain-socket wire protocol
+  (`fabric_backends::wire`), so the box can reach `db`/`mongo`/`mail`/`redis`/`amq`/`auth` without
+  linking the drivers. One client connection = one box-request session (`Init`→`Call`\*→`Drain`).
+  The on-ramp to the network fabric (`docs/design/network-fabric.md`).
 
 ## Commands
 

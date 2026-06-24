@@ -24,7 +24,7 @@ use fabric_backends::db::{DbConfig, DbMetric};
 use fabric_backends::kv::{RedisConfig, RedisMetric};
 use fabric_backends::mail::{MailConfig, MailMetric};
 use fabric_backends::mongo::{MongoConfig, MongoMetric};
-use fabric_backends::{AsyncDeps, BackendSet};
+use fabric_backends::{AsyncDeps, BackendMetrics, BackendSet, MeteredEgress, WireInit};
 use runlet_core::breaker::CircuitBreaker;
 use runlet_core::config::EngineConfig;
 use runlet_core::egress::Egress;
@@ -40,6 +40,7 @@ use runlet_core::sandbox;
 use runlet_core::sys::SysConfig;
 
 use crate::config::ResourceBinding;
+use crate::uds::UdsEgress;
 
 /// Shared application state for the router: the logic host, the script registry, and
 /// the concurrency bulkhead.
@@ -70,6 +71,10 @@ pub(crate) struct AppState {
     /// allowlist. The endpoint/credentials live here (operator-supplied at startup), never in
     /// the request body — a script names `"orders-db"`, never a host or password.
     pub(crate) resources: Arc<HashMap<String, ResourceBinding>>,
+    /// Optional `fabricd` egress sidecar socket path. When set, each request routes its
+    /// driver-backed capabilities over UDS to the daemon (which holds the drivers), falling back to
+    /// the in-process `BackendSet` if the daemon is unreachable. `None` = always in-process.
+    pub(crate) fabricd_socket: Option<String>,
     /// Process-wide observability counters, exposed at `GET /metrics`.
     pub(crate) metrics: Arc<Metrics>,
     /// Configured global bulkhead capacity, surfaced as the `_total` permit gauge.
@@ -452,26 +457,40 @@ fn raw_null_ref() -> &'static RawValue {
     &RAW_NULL
 }
 
-/// Builds the per-request in-process [`Egress`](runlet_core::egress::Egress) port from the
-/// operator configs already resolved from the request's logical-resource names — each connecting
-/// lazily on first use. Dispatch + metrics live in the adapter rather than the engine. `timeout`
-/// is the per-execution wall-clock budget (the per-query/op deadline).
-fn build_egress(
-    state: &AppState,
+/// Builds the per-request egress adapter (on the blocking thread): a UDS client to `fabricd` when a
+/// socket is configured, falling back to the in-process [`BackendSet`] if the daemon is
+/// unreachable; else the in-process `BackendSet`. Either connects each backend lazily on first use,
+/// so dispatch + metrics live in the adapter, not the engine. `deps`/`timeout` carry the runtime
+/// handle, optional breaker, and per-execution deadline.
+///
+/// Returns `dyn MeteredEgress` so the caller can pass it as `dyn Egress` to the invocation and
+/// drain its metrics after — uniform across the UDS and in-process paths.
+fn build_adapter(
     resolved: &ResolvedEgress,
+    socket: Option<&str>,
+    deps: &AsyncDeps,
     timeout: Duration,
-) -> Arc<BackendSet> {
-    let deps = AsyncDeps {
-        handle: Handle::current(),
-        breaker: state.db_breaker.clone(),
-        timeout,
-    };
+) -> Arc<dyn MeteredEgress> {
+    if let Some(path) = socket {
+        match UdsEgress::connect(path, wire_init(resolved, timeout), &deps.handle, timeout) {
+            Ok(egress) => return Arc::new(egress),
+            Err(err) => warn!(
+                error = %err.message,
+                "fabricd unreachable; falling back to in-process backends"
+            ),
+        }
+    }
+    Arc::new(build_backend_set(resolved, deps))
+}
+
+/// Builds the in-process `BackendSet` from the resolved operator configs (lazy connect per backend).
+fn build_backend_set(resolved: &ResolvedEgress, deps: &AsyncDeps) -> BackendSet {
     let mut adapter = BackendSet::new();
     if let Some(cfg) = resolved.db.clone() {
-        adapter = adapter.with_db(cfg, &deps);
+        adapter = adapter.with_db(cfg, deps);
     }
     if let Some(cfg) = resolved.mongo.clone() {
-        adapter = adapter.with_mongo(cfg, &deps);
+        adapter = adapter.with_mongo(cfg, deps);
     }
     if let Some(cfg) = resolved.mail.clone() {
         adapter = adapter.with_mail(cfg);
@@ -485,38 +504,20 @@ fn build_egress(
     if let Some(cfg) = resolved.auth.clone() {
         adapter = adapter.with_auth(cfg);
     }
-    Arc::new(adapter)
+    adapter
 }
 
-/// The driver-backed capability metrics, drained from the egress adapter after a run — they ran
-/// in the adapter (`fabric_backends::BackendSet`), not the engine. `http`/`s3` metrics still come
-/// from the engine outcome ([`ExecMetrics`]).
-#[derive(Debug, Default)]
-struct BackendMetrics {
-    /// `db` operation metrics.
-    db: Vec<DbMetric>,
-    /// `mongo` operation metrics.
-    mongo: Vec<MongoMetric>,
-    /// `mail` operation metrics.
-    mail: Vec<MailMetric>,
-    /// `redis` operation metrics.
-    redis: Vec<RedisMetric>,
-    /// `amq` operation metrics.
-    amq: Vec<AmqMetric>,
-    /// `auth` operation metrics.
-    auth: Vec<AuthMetric>,
-}
-
-/// Drains the driver-backed capability metrics from the egress adapter (empty for any capability
-/// the run never touched).
-fn drain_backend_metrics(adapter: &BackendSet) -> BackendMetrics {
-    BackendMetrics {
-        db: adapter.db_metrics(),
-        mongo: adapter.mongo_metrics(),
-        mail: adapter.mail_metrics(),
-        redis: adapter.redis_metrics(),
-        amq: adapter.amq_metrics(),
-        auth: adapter.auth_metrics(),
+/// Builds the `fabricd` session-open message ([`WireInit`]) from the resolved operator configs +
+/// the per-execution deadline.
+fn wire_init(resolved: &ResolvedEgress, timeout: Duration) -> WireInit {
+    WireInit {
+        db: resolved.db.clone(),
+        mongo: resolved.mongo.clone(),
+        mail: resolved.mail.clone(),
+        redis: resolved.redis.clone(),
+        amq: resolved.amq.clone(),
+        auth: resolved.auth.clone(),
+        timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
     }
 }
 
@@ -627,60 +628,68 @@ pub(crate) async fn execute(
         Err(shed) => return *shed,
     };
 
-    // Build the invocation inside the blocking task (owned data moved in). The host drives
-    // async capability I/O via its captured tokio handle (Tier 2), acquires/releases the
-    // runtime, and applies the SSRF/wildcard policy. The HTTP front always runs the
-    // full-capability profile with no read-hook.
+    // Everything happens inside the blocking task: it builds the egress adapter (a UDS client to
+    // `fabricd`, or the in-process `BackendSet` fallback), runs the invocation, then drains the
+    // adapter's driver-backed metrics — all on the same blocking thread, because both the lazy
+    // connect and the UDS round-trips `block_on` (forbidden on a runtime worker). The driver
+    // metrics come back with the outcome so the response `meta.<cap>_requests` is unchanged.
     let host = state.host.clone();
-    // The in-process `Egress` egress: `db` now dispatches through it (connecting lazily on
-    // first use and recording its own metrics), instead of the engine connecting directly. A
-    // fresh adapter per request carries the per-execution deadline; its `db` metrics are merged
-    // into the outcome after the run. The concrete `Arc` is kept here for that drain; a `dyn`
-    // clone moves into the blocking task.
-    let adapter = build_egress(&state, &resolved, engine_cfg.timeout());
-    let adapter_run: Arc<dyn Egress> = Arc::<BackendSet>::clone(&adapter);
+    let handle = Handle::current();
+    let breaker = state.db_breaker.clone();
+    let timeout = engine_cfg.timeout();
+    let socket = state.fabricd_socket.clone();
     // Namespace the bytecode cache by partition so identical source from different tenants
     // never shares an entry (no cross-tenant dedup / compile-timing leak). Cloned because the
     // closure is `move` and `partition` is still needed for `meta` after the await.
     let cache_ns = partition.clone();
-    let result = task::spawn_blocking(move || -> Result<Outcome, EngineError> {
-        // `Invocation` is `#[non_exhaustive]`; build via the constructor + builder setters. The
-        // HTTP front always runs the full-capability profile (the default) with no read-hook, so
-        // only `caps`, the egress port, and the cache namespace differ from the defaults.
-        let caps = CapabilitySet {
-            allowed_hosts: &config.allowed_hosts,
-            db: gates.db,
-            mongo: gates.mongo,
-            mail: gates.mail,
-            s3: config.s3.as_ref(),
-            redis: gates.redis,
-            amq: gates.amq,
-            auth: gates.auth,
-            sys: config.sys.as_ref(),
-        };
-        let mut invocation = Invocation::inline(source.as_str(), &context_json)
-            .caps(caps)
-            .egress(adapter_run);
-        if let Some(namespace) = cache_ns.as_deref() {
-            invocation = invocation.cache_namespace(namespace);
-        }
-        host.run(invocation)
-    })
+    let result = task::spawn_blocking(
+        move || -> (Result<Outcome, EngineError>, BackendMetrics) {
+            let deps = AsyncDeps {
+                handle: handle.clone(),
+                breaker,
+                timeout,
+            };
+            let adapter = build_adapter(&resolved, socket.as_deref(), &deps, timeout);
+            // Clone the ref-counted adapter, then upcast `dyn MeteredEgress` → `dyn Egress` for the
+            // invocation (the original `adapter` stays for the post-run metric drain).
+            let metered = Arc::clone(&adapter);
+            let egress: Arc<dyn Egress> = metered;
+            // `Invocation` is `#[non_exhaustive]`; build via the constructor + builder setters. The
+            // HTTP front always runs the full-capability profile (the default) with no read-hook,
+            // so only `caps`, the egress port, and the cache namespace differ from the defaults.
+            let caps = CapabilitySet {
+                allowed_hosts: &config.allowed_hosts,
+                db: gates.db,
+                mongo: gates.mongo,
+                mail: gates.mail,
+                s3: config.s3.as_ref(),
+                redis: gates.redis,
+                amq: gates.amq,
+                auth: gates.auth,
+                sys: config.sys.as_ref(),
+            };
+            let mut invocation = Invocation::inline(source.as_str(), &context_json)
+                .caps(caps)
+                .egress(egress);
+            if let Some(namespace) = cache_ns.as_deref() {
+                invocation = invocation.cache_namespace(namespace);
+            }
+            let outcome = host.run(invocation);
+            let metrics = adapter.drain_metrics();
+            (outcome, metrics)
+        },
+    )
     .await;
 
     // Execution finished — free the bulkhead + per-partition permits for the next request.
     drop(permit);
     drop(partition_permit);
 
-    // The driver-backed capabilities recorded into the adapter (not the engine outcome); drain
-    // them here so the response `meta.<cap>_requests` is unchanged.
-    let backend_metrics = drain_backend_metrics(&adapter);
-
     let exec_time_us = start.elapsed().as_micros();
     let base_meta = Meta::new(trace_id, script_bytes, context_bytes, exec_time_us)
         .with_key(key)
         .with_partition(partition);
-    build_response(result, base_meta, backend_metrics, error_debug, &state.metrics)
+    build_response(result, base_meta, error_debug, &state.metrics)
 }
 
 /// `GET /metrics` — Prometheus text exposition of the process-wide counters and live
@@ -705,16 +714,15 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> impl IntoResponse 
 /// Turns the `spawn_blocking` result into the final HTTP response, attaching metrics to
 /// `meta` on success and classifying the error otherwise.
 fn build_response(
-    result: Result<Result<Outcome, EngineError>, task::JoinError>,
+    result: Result<(Result<Outcome, EngineError>, BackendMetrics), task::JoinError>,
     base_meta: Meta,
-    backend: BackendMetrics,
     error_debug: bool,
     metrics: &Metrics,
 ) -> AxumResponse {
     // Record latency for every execution that ran (shed/rejected requests return earlier).
     metrics.observe_execution(base_meta.exec_time_us);
     match result {
-        Ok(Ok(exec)) => {
+        Ok((Ok(exec), backend)) => {
             record_capability_latencies(metrics, &exec.metrics, &backend);
             // `exec.effects` (the declarative `emit` buffer) is intentionally ignored by the
             // HTTP front — it is for non-HTTP consumers of `runlet-core`.
@@ -730,7 +738,7 @@ fn build_response(
                 }
             }
         }
-        Ok(Err(engine_err)) => {
+        Ok((Err(engine_err), _backend)) => {
             metrics.record_engine_error(&engine_err);
             engine_error_response(engine_err, base_meta, error_debug)
         }

@@ -191,11 +191,21 @@ calls them directly (see step 2).
      host. `runlet` wires an in-process `BackendSet` (provable no-op: clippy clean across the full
      cfg matrix, all tests green, behavior unchanged). The driver-backed `ExecMetrics` fields left
      the engine — the binary drains them straight from the `BackendSet`.
-   - **4b — next.** Adapter impl #2: a local `fabricd` sidecar hosting `BackendSet` over UDS
-     (length-prefixed JSON; the `__jsbox` error JSON *is* the wire error; metrics ride back in the
-     response). Add a UDS-client `Egress` impl in `runlet` doing `block_on(timeout(deadline,
-     roundtrip))` and swap `BackendSet` for it (with in-process fallback). localhost-QUIC (`quinn`)
-     is the cross-node step (Project B).
+   - ✅ **4b — done.** Adapter impl #2: a local **`fabricd`** sidecar (new bin crate) hosts
+     `BackendSet` over a Unix-domain socket. Wire protocol in `fabric_backends::wire`
+     (length-prefixed JSON frames): one connection = one box-request session — `Init`
+     (resolved configs + deadline) → `Call`(kind, action, payload)\* → `Drain`(metrics); the
+     `__jsbox` error JSON *is* the wire error (`WireResponse::Reply(Result<String, EgressError>)`),
+     and the metrics ride back in the `Drain` response so the box's `meta.<cap>_requests` is
+     unchanged. The daemon dispatches each call on `spawn_blocking` (the backends `block_on`
+     internally, forbidden on a runtime worker) and drops the `BackendSet` on EOF (tearing down
+     driver connections). The box's `runlet::uds::UdsEgress` implements `Egress` + `MeteredEgress`
+     by `block_on(timeout(deadline, roundtrip))` over the socket; `build_adapter` wires it when
+     `config.fabricd_socket` is set, **with automatic in-process fallback** if the daemon is
+     unreachable. All of it runs on the `spawn_blocking` thread (connect + calls + drain all
+     `block_on`). **Live-smoked** box→UDS→`fabricd`→Postgres: a `db.query` returned through the
+     daemon with metrics, and after killing `fabricd` the box fell back to in-process and still
+     served the query. localhost-QUIC (`quinn`) is the cross-node step (Project B).
 5. **Trust-model flip.** `CapabilitySet` driver configs → logical resource allowlist; all
    creds move into `fabricd`. Remove operator-secret fields from the request surface. *(The
    in-box half already landed — the request carries `config.io` logical names, not creds; step 5
