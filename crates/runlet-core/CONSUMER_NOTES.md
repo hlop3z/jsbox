@@ -144,6 +144,28 @@ runtimes' resolver/loader read live (behind the existing `Arc`):
 Relates to #3 (a `LogicHost`/registry *port* would let the consumer supply its own DB-backed
 resolver without forking the concrete types).
 
+## 7. Driver-backed capability types moved out of `runlet-core`  — *FYI 2026-06-24 (Step 4a)*
+
+> Heads-up for any consumer enabling the driver features (not the deterministic-only embed).
+
+**What changed:** the driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) were
+split out of `runlet-core` into a new **`fabric-backends`** crate, and the egress wire contract
+(the `Egress` trait, `EgressError`, the error taxonomy, the circuit breaker, the metric collector)
+into a new leaf **`fabric-wire`** crate. `runlet-core` now links **no** network driver even with
+`full`; it keeps only the JS wrappers + the engine seam (see `docs/design/resource-egress.md`).
+
+**Consumer impact:**
+- **Deterministic-only embedders (reactive-database-pg, `default-features = false`): unaffected.**
+  The blessed surface — `LogicHost`, `Invocation`, `CapabilitySet`, `Outcome`, and `Egress`/
+  `EgressError` (still re-exported from `runlet_core::egress`) — is unchanged. No driver feature →
+  nothing moved that you referenced.
+- **Driver-feature embedders:** the per-capability types relocated. `runlet_core::db::DbConfig`/
+  `DbMetric` (and the `mongo`/`mail`/`kv`/`amq`/`auth` equivalents) are now
+  `fabric_backends::<cap>::*`; the in-process adapter `runlet_core::inproc::InProcessEgress` is now
+  `fabric_backends::BackendSet` (`AsyncDeps` likewise). `host::ExecMetrics` now carries only the
+  in-engine `http`/`s3` metrics; the driver-backed metrics are drained directly from the
+  `BackendSet` (`.db_metrics()` etc.). The `runlet` binary is converted as the reference.
+
 ---
 
 *Maintainer: triage/close items here as they're addressed; this file is a consumer-feedback inbox, not

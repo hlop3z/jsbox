@@ -17,25 +17,13 @@ use std::sync::Arc;
 use serde_json::value::RawValue;
 use tokio::runtime::Handle;
 
-#[cfg(feature = "amq")]
-use crate::amq::AmqMetric;
-#[cfg(feature = "auth")]
-use crate::auth::AuthMetric;
 use crate::breaker::CircuitBreaker;
 use crate::bytecode::BytecodeCacheStats;
 use crate::config::EngineConfig;
-#[cfg(feature = "db")]
-use crate::db::DbMetric;
 use crate::egress::Egress;
 use crate::engine::{self, EngineError, ExecOutcome, ExecParams, Profile, ReadHook};
 #[cfg(feature = "http")]
 use crate::http::HttpMetric;
-#[cfg(feature = "redis")]
-use crate::kv::RedisMetric;
-#[cfg(feature = "mail")]
-use crate::mail::MailMetric;
-#[cfg(feature = "mongo")]
-use crate::mongo::MongoMetric;
 use crate::pool::{JsPool, PoolStats};
 use crate::registry::ScriptRegistry;
 #[cfg(feature = "s3")]
@@ -300,37 +288,22 @@ pub struct Outcome {
     pub metrics: ExecMetrics,
 }
 
-/// Per-capability metrics drained from one execution (mirrors the `meta.<cap>_requests`
-/// families surfaced by the HTTP front).
+/// In-engine capability metrics drained from one execution (`http`/`s3`).
+///
+/// The driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) run in the wired
+/// [`Egress`] adapter, not the engine, so their metrics are drained by the consumer straight from
+/// that adapter (see `fabric_backends::BackendSet`) — they don't ride here.
 #[derive(Debug, Default)]
-// With no capability features the struct is empty, so it can (and per the lint must) be
-// `Copy`; with any I/O capability it holds `Vec`s and cannot.
-#[cfg_attr(not(feature = "_io"), derive(Clone, Copy))]
+// With neither in-engine capability the struct is empty, so it can (and per the lint must) be
+// `Copy`; with `http` or `s3` it holds `Vec`s and cannot.
+#[cfg_attr(not(any(feature = "http", feature = "s3")), derive(Clone, Copy))]
 pub struct ExecMetrics {
     /// HTTP (`api`) request metrics.
     #[cfg(feature = "http")]
     pub http: Vec<HttpMetric>,
-    /// `db` operation metrics.
-    #[cfg(feature = "db")]
-    pub db: Vec<DbMetric>,
-    /// `mongo` operation metrics.
-    #[cfg(feature = "mongo")]
-    pub mongo: Vec<MongoMetric>,
-    /// `mail` operation metrics.
-    #[cfg(feature = "mail")]
-    pub mail: Vec<MailMetric>,
     /// `s3` operation metrics.
     #[cfg(feature = "s3")]
     pub s3: Vec<S3Metric>,
-    /// `redis` operation metrics.
-    #[cfg(feature = "redis")]
-    pub redis: Vec<RedisMetric>,
-    /// `amq` operation metrics.
-    #[cfg(feature = "amq")]
-    pub amq: Vec<AmqMetric>,
-    /// `auth` operation metrics.
-    #[cfg(feature = "auth")]
-    pub auth: Vec<AuthMetric>,
 }
 
 /// Resolved script source — borrowed (inline) or owned (a registry `Arc<str>` kept alive
@@ -489,20 +462,8 @@ impl LogicHost {
             metrics: ExecMetrics {
                 #[cfg(feature = "http")]
                 http: result.http_metrics,
-                #[cfg(feature = "db")]
-                db: result.db_metrics,
-                #[cfg(feature = "mongo")]
-                mongo: result.mongo_metrics,
-                #[cfg(feature = "mail")]
-                mail: result.mail_metrics,
                 #[cfg(feature = "s3")]
                 s3: result.s3_metrics,
-                #[cfg(feature = "redis")]
-                redis: result.redis_metrics,
-                #[cfg(feature = "amq")]
-                amq: result.amq_metrics,
-                #[cfg(feature = "auth")]
-                auth: result.auth_metrics,
             },
         })
     }

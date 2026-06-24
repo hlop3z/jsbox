@@ -18,21 +18,21 @@ use tokio::task;
 use tracing::warn;
 use uuid::Uuid;
 
-use runlet_core::amq::{AmqConfig, AmqMetric};
-use runlet_core::auth::{AuthConfig, AuthMetric};
+use fabric_backends::amq::{AmqConfig, AmqMetric};
+use fabric_backends::auth::{AuthConfig, AuthMetric};
+use fabric_backends::db::{DbConfig, DbMetric};
+use fabric_backends::kv::{RedisConfig, RedisMetric};
+use fabric_backends::mail::{MailConfig, MailMetric};
+use fabric_backends::mongo::{MongoConfig, MongoMetric};
+use fabric_backends::{AsyncDeps, BackendSet};
 use runlet_core::breaker::CircuitBreaker;
 use runlet_core::config::EngineConfig;
-use runlet_core::db::{DbConfig, DbMetric};
 use runlet_core::egress::Egress;
 use runlet_core::engine::{EngineError, ExecOutcome, Gate};
 use runlet_core::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
 use runlet_core::host::{CapabilitySet, ExecMetrics, Invocation, LogicHost, Outcome};
 use runlet_core::http::HttpMetric;
-use runlet_core::inproc::{AsyncDeps, InProcessEgress};
-use runlet_core::kv::{RedisConfig, RedisMetric};
-use runlet_core::mail::{MailConfig, MailMetric};
 use runlet_core::metrics::{Capability, Metrics};
-use runlet_core::mongo::{MongoConfig, MongoMetric};
 use runlet_core::partition::PartitionLimiter;
 use runlet_core::registry::ScriptRegistry;
 use runlet_core::s3::{S3Config, S3Metric};
@@ -399,16 +399,17 @@ impl Meta {
         self
     }
 
-    /// Attaches HTTP, DB, mail, S3, Redis, and `RabbitMQ` metrics to this metadata.
-    fn with_metrics(mut self, metrics: ExecMetrics) -> Self {
+    /// Attaches the per-capability metrics: `http`/`s3` from the engine outcome, the
+    /// driver-backed capabilities from the egress adapter.
+    fn with_metrics(mut self, metrics: ExecMetrics, backend: BackendMetrics) -> Self {
         self.http_requests = metrics.http;
-        self.db_requests = metrics.db;
-        self.mongo_requests = metrics.mongo;
-        self.mail_requests = metrics.mail;
         self.s3_requests = metrics.s3;
-        self.redis_requests = metrics.redis;
-        self.amq_requests = metrics.amq;
-        self.auth_requests = metrics.auth;
+        self.db_requests = backend.db;
+        self.mongo_requests = backend.mongo;
+        self.mail_requests = backend.mail;
+        self.redis_requests = backend.redis;
+        self.amq_requests = backend.amq;
+        self.auth_requests = backend.auth;
         self
     }
 }
@@ -459,13 +460,13 @@ fn build_egress(
     state: &AppState,
     resolved: &ResolvedEgress,
     timeout: Duration,
-) -> Arc<InProcessEgress> {
+) -> Arc<BackendSet> {
     let deps = AsyncDeps {
         handle: Handle::current(),
         breaker: state.db_breaker.clone(),
         timeout,
     };
-    let mut adapter = InProcessEgress::new();
+    let mut adapter = BackendSet::new();
     if let Some(cfg) = resolved.db.clone() {
         adapter = adapter.with_db(cfg, &deps);
     }
@@ -487,20 +488,35 @@ fn build_egress(
     Arc::new(adapter)
 }
 
-/// Merges the driver-backed capability metrics from the egress adapter into the outcome's
-/// `meta.<cap>_requests` (they ran in the adapter, not the engine). `http`/`s3` metrics still
-/// come from the engine outcome. A no-op unless the run produced an outcome.
-fn merge_egress_metrics(
-    result: &mut Result<Result<Outcome, EngineError>, task::JoinError>,
-    adapter: &InProcessEgress,
-) {
-    if let Ok(Ok(exec)) = result {
-        exec.metrics.db = adapter.db_metrics();
-        exec.metrics.mongo = adapter.mongo_metrics();
-        exec.metrics.mail = adapter.mail_metrics();
-        exec.metrics.redis = adapter.redis_metrics();
-        exec.metrics.amq = adapter.amq_metrics();
-        exec.metrics.auth = adapter.auth_metrics();
+/// The driver-backed capability metrics, drained from the egress adapter after a run — they ran
+/// in the adapter (`fabric_backends::BackendSet`), not the engine. `http`/`s3` metrics still come
+/// from the engine outcome ([`ExecMetrics`]).
+#[derive(Debug, Default)]
+struct BackendMetrics {
+    /// `db` operation metrics.
+    db: Vec<DbMetric>,
+    /// `mongo` operation metrics.
+    mongo: Vec<MongoMetric>,
+    /// `mail` operation metrics.
+    mail: Vec<MailMetric>,
+    /// `redis` operation metrics.
+    redis: Vec<RedisMetric>,
+    /// `amq` operation metrics.
+    amq: Vec<AmqMetric>,
+    /// `auth` operation metrics.
+    auth: Vec<AuthMetric>,
+}
+
+/// Drains the driver-backed capability metrics from the egress adapter (empty for any capability
+/// the run never touched).
+fn drain_backend_metrics(adapter: &BackendSet) -> BackendMetrics {
+    BackendMetrics {
+        db: adapter.db_metrics(),
+        mongo: adapter.mongo_metrics(),
+        mail: adapter.mail_metrics(),
+        redis: adapter.redis_metrics(),
+        amq: adapter.amq_metrics(),
+        auth: adapter.auth_metrics(),
     }
 }
 
@@ -622,12 +638,12 @@ pub(crate) async fn execute(
     // into the outcome after the run. The concrete `Arc` is kept here for that drain; a `dyn`
     // clone moves into the blocking task.
     let adapter = build_egress(&state, &resolved, engine_cfg.timeout());
-    let adapter_run: Arc<dyn Egress> = Arc::<InProcessEgress>::clone(&adapter);
+    let adapter_run: Arc<dyn Egress> = Arc::<BackendSet>::clone(&adapter);
     // Namespace the bytecode cache by partition so identical source from different tenants
     // never shares an entry (no cross-tenant dedup / compile-timing leak). Cloned because the
     // closure is `move` and `partition` is still needed for `meta` after the await.
     let cache_ns = partition.clone();
-    let mut result = task::spawn_blocking(move || -> Result<Outcome, EngineError> {
+    let result = task::spawn_blocking(move || -> Result<Outcome, EngineError> {
         // `Invocation` is `#[non_exhaustive]`; build via the constructor + builder setters. The
         // HTTP front always runs the full-capability profile (the default) with no read-hook, so
         // only `caps`, the egress port, and the cache namespace differ from the defaults.
@@ -656,13 +672,15 @@ pub(crate) async fn execute(
     drop(permit);
     drop(partition_permit);
 
-    merge_egress_metrics(&mut result, &adapter);
+    // The driver-backed capabilities recorded into the adapter (not the engine outcome); drain
+    // them here so the response `meta.<cap>_requests` is unchanged.
+    let backend_metrics = drain_backend_metrics(&adapter);
 
     let exec_time_us = start.elapsed().as_micros();
     let base_meta = Meta::new(trace_id, script_bytes, context_bytes, exec_time_us)
         .with_key(key)
         .with_partition(partition);
-    build_response(result, base_meta, error_debug, &state.metrics)
+    build_response(result, base_meta, backend_metrics, error_debug, &state.metrics)
 }
 
 /// `GET /metrics` — Prometheus text exposition of the process-wide counters and live
@@ -689,6 +707,7 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> impl IntoResponse 
 fn build_response(
     result: Result<Result<Outcome, EngineError>, task::JoinError>,
     base_meta: Meta,
+    backend: BackendMetrics,
     error_debug: bool,
     metrics: &Metrics,
 ) -> AxumResponse {
@@ -696,10 +715,10 @@ fn build_response(
     metrics.observe_execution(base_meta.exec_time_us);
     match result {
         Ok(Ok(exec)) => {
-            record_capability_latencies(metrics, &exec.metrics);
+            record_capability_latencies(metrics, &exec.metrics, &backend);
             // `exec.effects` (the declarative `emit` buffer) is intentionally ignored by the
             // HTTP front — it is for non-HTTP consumers of `runlet-core`.
-            let meta = base_meta.with_metrics(exec.metrics);
+            let meta = base_meta.with_metrics(exec.metrics, backend);
             match exec.result {
                 ExecOutcome::Success(js_json) => {
                     metrics.record_success();
@@ -725,29 +744,30 @@ fn build_response(
 
 /// Feeds every per-op duration from a finished execution into its capability's latency
 /// histogram, so `/metrics` can show which downstream is slow, not just total exec time.
-fn record_capability_latencies(metrics: &Metrics, exec: &ExecMetrics) {
-    for metric in &exec.db {
+/// `http`/`s3` come from the engine outcome; the driver-backed capabilities from the adapter.
+fn record_capability_latencies(metrics: &Metrics, exec: &ExecMetrics, backend: &BackendMetrics) {
+    for metric in &backend.db {
         metrics.observe_op(Capability::Db, metric.duration_us());
     }
-    for metric in &exec.mongo {
+    for metric in &backend.mongo {
         metrics.observe_op(Capability::Mongo, metric.duration_us());
     }
     for metric in &exec.http {
         metrics.observe_op(Capability::Http, metric.duration_us());
     }
-    for metric in &exec.mail {
+    for metric in &backend.mail {
         metrics.observe_op(Capability::Mail, metric.duration_us());
     }
     for metric in &exec.s3 {
         metrics.observe_op(Capability::S3, metric.duration_us());
     }
-    for metric in &exec.redis {
+    for metric in &backend.redis {
         metrics.observe_op(Capability::Redis, metric.duration_us());
     }
-    for metric in &exec.amq {
+    for metric in &backend.amq {
         metrics.observe_op(Capability::Amq, metric.duration_us());
     }
-    for metric in &exec.auth {
+    for metric in &backend.auth {
         metrics.observe_op(Capability::Auth, metric.duration_us());
     }
 }

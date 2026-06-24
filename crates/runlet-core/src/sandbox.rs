@@ -1,44 +1,14 @@
-//! Shared utilities for sandboxed JS modules (HTTP, DB).
+//! Shared sandbox utilities: input-size validation, the script-error JSON helper, and the
+//! metric-collection apparatus.
 //!
-//! Provides generic metric collection, error JSON building,
-//! and input validation used by both `http.rs` and `db.rs`.
+//! The generic [`Collector`] + its helpers moved to `fabric-wire` (shared with the driver
+//! backends); they are re-exported here under `crate::sandbox` for the in-engine capabilities
+//! (`http`/`s3`) and the engine's metric drain, so those call sites stay unchanged.
 
-// The metric-collection apparatus is used only by the I/O capabilities; a deterministic-only
-// build (no capability features) compiles without it.
-#[cfg(feature = "_io")]
-use std::sync::{Arc, Mutex};
-
-// `Serialize` is only needed by `check_op_limit`, which the per-op-limited native capabilities
-// use — everything with a native FFI fn except `db` (now op-limited by the engine's `__io`
-// seam). That set is `http` plus the throwing capabilities (`_throws`).
-#[cfg(any(feature = "http", feature = "_throws"))]
-use serde::Serialize;
-
-/// Generic metrics collector — shared between HTTP and DB modules.
-#[cfg(feature = "_io")]
-pub type Collector<T> = Arc<Mutex<Vec<T>>>;
-
-/// Creates a new empty metrics collector.
-#[cfg(feature = "_io")]
-pub(crate) fn new_collector<T>() -> Collector<T> {
-    Arc::new(Mutex::new(Vec::new()))
-}
-
-/// Pushes a metric into the collector.
-#[cfg(feature = "_io")]
-pub(crate) fn record<T>(collector: &Collector<T>, metric: T) {
-    if let Ok(mut vec) = collector.lock() {
-        vec.push(metric);
-    }
-}
-
-/// Extracts all collected metrics, returning an empty vec if unavailable.
-#[cfg(feature = "_io")]
-pub(crate) fn drain<T: Clone>(collector: Option<&Collector<T>>) -> Vec<T> {
-    collector
-        .and_then(|coll| coll.lock().ok().map(|guard| guard.clone()))
-        .unwrap_or_default()
-}
+// The metric apparatus is used only by the in-engine capabilities (`http`/`s3`); a build without
+// them (incl. a deterministic-only core) links none of it.
+#[cfg(any(feature = "http", feature = "s3"))]
+pub(crate) use fabric_wire::metrics::{Collector, check_op_limit, drain, new_collector, record};
 
 /// Builds a JSON error string: `{"error": "message"}`.
 ///
@@ -71,30 +41,6 @@ pub fn validate_input_sizes(
         return Err((
             "CONTEXT_TOO_LARGE",
             format!("context too large: {context_bytes} bytes (max {max_context})"),
-        ));
-    }
-    Ok(())
-}
-
-/// The number of operations recorded so far (used by a backend with a sub-cap, e.g. `mail`'s
-/// `max_sends`, to enforce it against its own metrics — the generic `__io` seam already
-/// enforces the global `max_ops`).
-#[cfg(feature = "mail")]
-pub(crate) fn op_count<T>(collector: &Collector<T>) -> usize {
-    collector.lock().map_or(0, |vec| vec.len())
-}
-
-/// Checks if the operation count exceeds the per-execution limit.
-#[cfg(any(feature = "http", feature = "_throws"))]
-pub(crate) fn check_op_limit<T: Serialize>(
-    collector: &Collector<T>,
-    max_ops: usize,
-) -> Result<(), String> {
-    if let Ok(vec) = collector.lock()
-        && vec.len() >= max_ops
-    {
-        return Err(format!(
-            "too many operations: limit is {max_ops} per execution"
         ));
     }
     Ok(())

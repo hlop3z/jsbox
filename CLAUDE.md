@@ -8,18 +8,33 @@ A sandboxed JavaScript execution service in Rust. Clients `POST /execute` a JS
 `handler(ctx)` function plus a JSON context; the server runs it in an isolated QuickJS
 context and returns `{data, error, meta}`. The single endpoint is the whole product.
 
-**Cargo workspace (two crates):**
+**Cargo workspace (four crates + a bench crate):**
 
+- **`fabric-wire`** (`crates/fabric-wire/`) — the shared egress-port contract: the `Egress`
+  trait + `EgressError`, the error taxonomy (`ErrorOwner`/`Fault`/`DynamicFault` + the `__jsbox`
+  wire envelope), the per-target `CircuitBreaker`, and the metric `Collector`. A driver-free,
+  QuickJS-free leaf depended on by **both** `runlet-core` and `fabric-backends`.
+- **`fabric-backends`** (`crates/fabric-backends/`) — the driver-backed egress backends
+  (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`), each a JS-free `*Backend` (string-in/string-out
+  dispatch + metrics + `into_resource_error`), plus the in-process `BackendSet` that wires them
+  behind the `fabric_wire::Egress` port. Holds **all** the vendor drivers. Depends on
+  `fabric-wire` only (never `runlet-core` — no QuickJS), so it is the shape a sidecar (`fabricd`)
+  will host. Featureless (the driver bag always carries every backend). See
+  `docs/design/resource-egress.md`.
 - **`runlet-core`** (`crates/runlet-core/`) — the reusable logic host: the QuickJS engine,
   runtime pool, sandbox, resilience, error taxonomy, capabilities, and the callable
   [`LogicHost`] port (`Invocation` → `Outcome`). Knows nothing about HTTP. The public entry
-  is `runlet_core::host::LogicHost`; each I/O capability is a cargo **feature** (`db`, `http`,
+  is `runlet_core::host::LogicHost`; each capability is a cargo **feature** (`db`, `http`,
   `mongo`, `mail`, `s3`, `redis`, `amq`, `auth`), so a deterministic-only consumer builds with
-  `default-features = false` and links no network drivers. See `docs/design/` for the design.
+  `default-features = false` and links nothing. **Links no network driver even with `full`** —
+  the driver-backed capabilities now keep only their JS wrapper (`<cap>.rs`'s `inject_wrapper` +
+  `js/*.js`) here and route through the egress port to `fabric-backends`; only `http` (SSRF-guarded)
+  and `s3` (pure SigV4 signing) stay in-engine. See `docs/design/` for the design.
 - **`runlet`** (`crates/runlet/`) — the binary: the axum HTTP `/execute` front + server config,
-  a thin adapter over `LogicHost::run`. Enables all `runlet-core` features. Behavior is
-  unchanged from the pre-workspace `jsbox` (the binary/image are renamed to `runlet`; the
-  `jsbox_*` Prometheus metric names and internal `__jsbox` error tag are kept for compatibility).
+  a thin adapter over `LogicHost::run`. Enables `runlet-core`'s `full` and wires an in-process
+  `fabric_backends::BackendSet` as the egress port. Behavior is unchanged from the pre-workspace
+  `jsbox` (the binary/image are renamed to `runlet`; the `jsbox_*` Prometheus metric names and
+  internal `__jsbox` error tag are kept for compatibility).
 
 ## Commands
 

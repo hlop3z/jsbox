@@ -6,10 +6,9 @@
 //! `docs/design/resource-egress.md` / `docs/design/network-fabric.md`. For now this adapter lets
 //! the existing capabilities flow through the new seam unchanged.
 //!
-//! Build a fresh adapter per invocation (each backend connects lazily on first use and carries
-//! the per-request deadline) and pass it via
-//! [`Invocation::egress`](crate::host::Invocation::egress). After the run, drain each
-//! capability's metrics (e.g. [`db_metrics`](InProcessEgress::db_metrics)) into the response.
+//! Build a fresh [`BackendSet`] per invocation (each backend connects lazily on first use and
+//! carries the per-request deadline) and wire it as the invocation's egress port. After the run,
+//! drain each capability's metrics (e.g. [`db_metrics`](BackendSet::db_metrics)) into the response.
 //!
 //! Covers the driver-backed capabilities `db`/`mongo`/`mail`/`redis`/`amq`/`auth`; `http` and
 //! `s3` remain in-engine (no driver / pure signing).
@@ -21,12 +20,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::runtime::Handle;
 
+use fabric_wire::{CircuitBreaker, Egress, EgressError, ErrorOwner};
+
 use crate::amq::{AmqConfig, AmqError, AmqMetric, AmqProducer};
 use crate::auth::{AuthBackend, AuthConfig, AuthMetric};
-use crate::breaker::CircuitBreaker;
 use crate::db::{DbBackend, DbConfig, DbDeps, DbError, DbMetric};
-use crate::egress::{Egress, EgressError};
-use crate::errors::ErrorOwner;
 use crate::kv::{RedisBackend, RedisConfig, RedisError, RedisMetric};
 use crate::mail::{MailBackend, MailConfig, MailError, MailMetric};
 use crate::mongo::{MongoBackend, MongoConfig, MongoDeps, MongoError, MongoMetric};
@@ -44,10 +42,10 @@ pub struct AsyncDeps {
 
 /// An in-process egress holding per-request capability backends.
 ///
-/// Construct with [`InProcessEgress::new`] and attach capabilities with the `with_*` setters.
+/// Construct with [`BackendSet::new`] and attach capabilities with the `with_*` setters.
 /// Each backend connects lazily on first use.
 #[derive(Default, Debug)]
-pub struct InProcessEgress {
+pub struct BackendSet {
     /// Lazily-connected `db` egress.
     db: Option<DbSlot>,
     /// Lazily-connected `mongo` egress.
@@ -62,7 +60,7 @@ pub struct InProcessEgress {
     amq: Option<AmqProducer>,
 }
 
-impl InProcessEgress {
+impl BackendSet {
     /// An empty adapter (no capabilities wired).
     #[must_use]
     pub fn new() -> Self {
@@ -251,7 +249,7 @@ impl InProcessEgress {
     }
 }
 
-impl Egress for InProcessEgress {
+impl Egress for BackendSet {
     fn call(&self, name: &str, action: &str, payload_json: &str) -> Result<String, EgressError> {
         match name {
             "db" => self.call_db(action, payload_json),
@@ -499,8 +497,8 @@ mod tests {
     //! unknown-/unconfigured-egress errors. Real dispatch is covered by the per-capability
     //! integration suites against live backends.
 
-    use super::{InProcessEgress, parse_auth_token, parse_db_payload, parse_mongo_payload};
-    use crate::egress::Egress;
+    use super::{BackendSet, parse_auth_token, parse_db_payload, parse_mongo_payload};
+    use fabric_wire::Egress;
 
     /// A well-formed `db` payload yields the SQL and a re-serialized params array.
     #[test]
@@ -548,7 +546,7 @@ mod tests {
     /// An unknown egress name is rejected without touching any backend.
     #[test]
     fn unknown_resource_is_rejected() {
-        let err = InProcessEgress::new()
+        let err = BackendSet::new()
             .call("nope", "ping", "{}")
             .unwrap_err();
         assert_eq!(err.code, "IO_UNKNOWN");
@@ -557,7 +555,7 @@ mod tests {
     /// Calling a capability with no backend wired is a clear `*_NOT_CONFIGURED`, not a panic.
     #[test]
     fn unconfigured_capability_is_reported() {
-        let adapter = InProcessEgress::new();
+        let adapter = BackendSet::new();
         assert_eq!(
             adapter
                 .call("redis", "get", r#"{"key":"k"}"#)

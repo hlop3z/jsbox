@@ -15,109 +15,102 @@ pure compute (`$`/Decimal/determinism), `http` (SSRF-guarded), and `s3` (SigV4 s
 
 ## Naming (DECIDED — do not relitigate)
 
-- The egress port is **`Egress`** in Rust (`Egress`/`EgressError`/`InProcessEgress`,
-  `crates/runlet-core/src/egress.rs`). The **script-facing** global + FFI + JS file + request
-  field are **`io`** (`io.call(name, action, payload)`, `__io`, `js/io.js`, `config.io`). The
-  sandbox makes "syscalls" to its host. (Was `resource`/`Resource`/`__resource` — fully renamed.)
-- `Gate` (engine.rs) = a 2-variant `Off`/`On` enum used for the per-capability inject gates
-  (avoids `clippy::struct_excessive_bools`).
+- Egress port: Rust **`Egress`** (`fabric_wire::Egress`/`EgressError`); script-facing global +
+  FFI + JS file + request field are **`io`** (`io.call(name, action, payload)`, `__io`, `js/io.js`,
+  `config.io`). The in-process adapter is **`BackendSet`** (was `InProcessEgress`).
+- `Gate` (engine.rs) = a 2-variant `Off`/`On` enum for the per-capability inject gates.
+
+## Crate layout (AS OF Step 4a — the current shape)
+
+Five workspace members (`Cargo.toml`):
+- **`fabric-wire`** — shared leaf, no drivers/QuickJS: `Egress` trait + `EgressError`, the error
+  taxonomy (`ErrorOwner`/`Fault`/`DynamicFault` + `dynamic_fault_json`), `CircuitBreaker`/
+  `BreakerConfig`, and the metric `Collector`. Depended on by both core and backends.
+- **`fabric-backends`** — the driver bag (featureless, always all 6): `db`/`mongo`/`mail`/`kv`/
+  `amq`/`auth` `*Backend`s + `*Config`/`*Metric`/`*Error`/`*Deps`, and `BackendSet`/`AsyncDeps`
+  (`backendset.rs`). Depends on `fabric-wire` ONLY (never `runlet-core`). This is the shape
+  `fabricd` will host.
+- **`runlet-core`** — the sandbox. Links NO driver even with `full` (proven via `cargo tree`).
+  Keeps the JS wrappers: `db.rs`/`mongo.rs`/`mail.rs`/`kv.rs`/`amq.rs`/`auth.rs` are now private
+  `mod`s with just `inject_wrapper` (+ `js/*.js`). `egress.rs`/`breaker.rs` re-export from
+  `fabric-wire`; `errors.rs` re-exports `ErrorOwner`/`Fault`/`DynamicFault`/`dynamic_fault_json`;
+  `sandbox.rs` re-exports the `Collector` apparatus (gated `any(http, s3)`). `http`/`s3` stay
+  in-engine.
+- **`runlet`** — the binary. Wires `fabric_backends::BackendSet` as the egress; imports `*Config`/
+  `*Metric` from `fabric_backends`, the wire types via `runlet_core` re-exports (so no direct
+  `fabric-wire` dep).
+- **`runlet-bench`** — unchanged (no runlet-core dep).
 
 ## Branch / commits
 
-On branch **`resource-egress`** (off `main`). Commits so far:
-1. `7f26dc8` — Route driver-backed caps through the egress port (steps 1–3; was `resource`).
-2. `d1361d6` — Flip to logical-resource egress + rename to Egress/io (this session).
+On branch **`resource-egress`** (off `main`). Prior commits did steps 1–3 + the in-box trust-flip
++ Egress/io rename + docs/live-smoke. **Step 4a is implemented in the working tree but NOT yet
+committed** — review `git status`/`git diff` and commit it (suggested message:
+"Step 4a: extract fabric-wire + fabric-backends; drivers leave runlet-core").
 
-## Decisions already made (don't relitigate)
+## Status: Step 4a DONE & verified (this session)
 
-- Fabric transport: hybrid — NATS JetStream for pub/sub+queues, custom `quinn` QUIC for
-  RPC+streaming. For the **local** sidecar, start with **UDS** (zero new deps, sidesteps the
-  quinn+aws-lc-rs landmine); QUIC is for the cross-node fabric (Project B).
-- Scale tens–hundreds of nodes → skip SWIM/HyParView/Plumtree.
-- Request shape = **capability-keyed map** (`config.io = {"db":["orders-db"]}`). Trust = **hard
-  cut**: no creds in the request, ever; they live operator-side.
-
-## Status: in-box trust-flip + rename DONE & verified (this session)
-
-- **Request surface flipped:** `RequestConfig` dropped `db/mongo/mail/redis/amq/auth` configs;
-  added `io: RequestIo` (capability-keyed `Vec<String>` of logical names). Kept `allowed_hosts`,
-  `s3`, `sys`. (`crates/runlet/src/handler.rs`)
-- **Operator resource table:** server `Config` gained `resources: HashMap<String, ResourceBinding>`
-  (`crates/runlet/src/config.rs`). `ResourceBinding` is an **internally-tagged** enum
-  (`#[serde(tag="kind")]`, variants boxed) → `{"kind":"db", <DbConfig fields>}`. Wired into
-  `AppState.resources` in `main.rs`.
-- **Resolution = trust boundary:** `handler::resolve_egress(table, &io)` maps the first named
-  resource per kind → operator config; unknown name → `400 RESOURCE_NOT_FOUND`, wrong kind →
-  `400 RESOURCE_KIND_MISMATCH`. `build_egress` now wires `InProcessEgress` from the resolved
-  configs; the Tier-0 statement-timeout clamp runs on the resolved db config. **Interim limit:
-  one binding per kind** (the JS wrapper still dispatches by kind via `io.call('db',…)`, so JS
-  wrappers were NOT changed; multi-binding `db('orders-db')` is a future enhancement needing the
-  parameterized wrapper).
-- **Engine gates:** the six driver `Option<&*Config>` fields on `CapabilitySet`/`ExecParams`
-  became `Gate` (engine never saw creds, only presence). `inject_apis` gates on `.is_on()`.
-- **Verified:** `cargo clippy` full workspace clean; **per-cap cfg sweep clean** (`--no-default-
-  features --features <db|mongo|mail|redis|amq|auth|http|s3|inproc>` + none); `cargo test` green
-  (57 core + 12 runlet, incl. new `egress_resolution_tests` covering the ResourceBinding serde +
-  resolve NOT_FOUND/KIND_MISMATCH). Breaker timing test still a known flake.
-  - NOTE: the project gate is plain `cargo clippy` (NOT `--all-targets`). `--all-targets` flags
-    pre-existing `unwrap_err()` in `inproc.rs` test code — that's committed style, out of scope.
+- Two crates extracted (above). Drivers fully gone from `runlet-core` (`cargo tree -p runlet-core`
+  with `full` shows none; `fabric-backends` carries them all). `runlet` wires an in-process
+  `BackendSet` — provable no-op (behavior unchanged).
+- The driver-backed `ExecMetrics`/`ExecResult` fields left the engine; `host::ExecMetrics` now
+  carries only `http`/`s3`. The binary drains the driver metrics straight from the `BackendSet`
+  (`drain_backend_metrics` → `Meta`), so the response `meta.<cap>_requests` is unchanged.
+- `inject_apis` reworked: cfg-params for the `http`/`s3` collectors; driver caps just inject their
+  wrapper (no engine collector). The `Collectors` struct is gone.
+- **Verified (Docker `rust:1.92-alpine`, the only way to build on this Windows host):**
+  - `cargo clippy` whole workspace — clean.
+  - Per-cap cfg sweep `runlet-core --no-default-features [--features <db|mongo|mail|redis|amq|auth|
+    http|s3>]` + NONE — all clean (`sweep.sh` in repo root; `fabric-backends` is featureless, not
+    swept). NOTE: the gate is plain `cargo clippy`, NOT `--all-targets`.
+  - `cargo test` — green (fabric-wire 5, fabric-backends 13, runlet-core 40, runlet 12).
+  - NOT live-smoked this session (no backends up). The dispatch code moved verbatim, so behavior
+    should be identical — a live smoke of `db` via `config.io` is worth doing before 4b.
 
 ## What's next (in order)
 
-0. **DONE this session (commits cf7c54b/7269bd7):** docs swept to `config.io` + operator
-   `resources` (README + capability beginner docs + deployment trust framing); **live-smoke of
-   the new db path passed end-to-end** (query/params/metrics + `RESOURCE_NOT_FOUND` reject +
-   gate-withheld `typeof db === undefined`). The new request surface is now proven in reality.
-1. **DEFERRED (Task #5) — rewrite `test_simple.py`:** the hard cut broke it (sends `config.db`).
-   Needs: a generated server `config.json` `resources` map covering the named variants the tests
-   use (pg, pg-maxrows5, pg-badhost, pg-fast, pgbouncer, redis, mongo, nats, nats-fast, mail);
-   rewrite ~40 `config={"db":creds}` → `config={"io":{"db":["name"]}}`; and **reorder `main()`**
-   so auth/zitadel discovery runs BEFORE `_start_server` (their creds must be in the startup
-   resources map). Needs all backends to verify. Not blocking the architecture.
-2. **Step 4a (Task #2) — extract crates (THE ACTIVE NEXT STEP):** `fabric-wire` (`EgressError`/`ErrorOwner`/`DynamicFault`
-   + wire envelope) + `fabric-backends` (the six `*Backend`s + `BackendSet`/`InProcessEgress`);
-   drivers leave `runlet-core`, shrinking its feature matrix. runlet still uses in-process
-   `BackendSet` (provable no-op). Keep `inject_wrapper` + `js/*.js` in runlet-core. Re-sweep cfg.
-3. **Step 4b (Task #3) — fabricd:** new sidecar bin hosting `BackendSet` behind UDS (length-prefixed
-   JSON envelope; the existing `__jsbox` error JSON IS the wire error; metrics ride back in the
-   response so `merge_egress_metrics` is unchanged). Add a UDS-client `Egress` impl in runlet
-   doing `block_on(timeout(deadline, roundtrip))`; swap `InProcessEgress` for it (with in-process
-   fallback). Live-smoke box→UDS→fabricd→Postgres.
+1. **Commit Step 4a** (see above) if not already done.
+2. **Step 4b (Task #3) — `fabricd`:** new sidecar bin hosting `BackendSet` behind UDS
+   (length-prefixed JSON envelope; the existing `__jsbox` error JSON IS the wire error; metrics
+   ride back in the response so the binary's `drain_backend_metrics` stays unchanged). Add a
+   UDS-client `Egress` impl in `runlet` doing `block_on(timeout(deadline, roundtrip))`; swap
+   `BackendSet` for it (with in-process fallback). Live-smoke box→UDS→fabricd→Postgres. Because
+   `fabric-backends` is already `runlet-core`-free, `fabricd` can depend on it without pulling
+   QuickJS.
+3. **DEFERRED — rewrite `test_simple.py`:** the in-box hard cut (steps 1–3) broke it (it still
+   sends `config.db`). Needs a generated server `config.json` `resources` map for the named
+   variants (pg, pg-maxrows5, pg-badhost, pg-fast, pgbouncer, redis, mongo, nats, nats-fast, mail)
+   and ~40 `config={"db":creds}` → `config={"io":{"db":["name"]}}` rewrites, plus reordering
+   `main()` so auth/zitadel discovery runs BEFORE `_start_server`. Needs all backends up.
 4. **Step 5 finalize (Task #4):** remove the vestigial `#[expect(dead_code)]` `handle`/`db_breaker`
    from `LogicHost::new` + struct (coordinate the one-time signature break with external consumer
-   `reactive-database-pg`; update `CONSUMER_NOTES.md`). Consider `#[non_exhaustive]` + builder on
-   `CapabilitySet`.
+   `reactive-database-pg`; update `CONSUMER_NOTES.md` — see new item #7 for the 4a API moves).
 
 ## How to build/test/smoke (Windows host — native cargo CAN'T build; use Docker via PowerShell)
 
 Git Bash mangles docker `-v`/`-w` paths → **run docker from the PowerShell tool**. `target/` is
-host-mounted (incremental). clippy/rustfmt aren't preinstalled in alpine.
+host-mounted (incremental). clippy/rustfmt aren't preinstalled in alpine; `musl-dev` is needed for
+`aws-lc-sys`.
 
 ```
 # full gate (clippy + test). The real gate is plain `cargo clippy` (NOT --all-targets).
-docker run --rm -v "C:\Users\Toy\Documents\GitHub\jsbox:/work" -w /work rust:1.92-alpine sh -c "rustup component add clippy >/dev/null 2>&1; cargo clippy --quiet 2>&1 | tail -n 60; cargo test --quiet 2>&1 | tail -n 12"
+docker run --rm -v "C:\Users\Toy\Documents\GitHub\jsbox:/work" -w /work rust:1.92-alpine sh -c "apk add --no-cache musl-dev >/dev/null 2>&1; rustup component add clippy >/dev/null 2>&1; cargo clippy --quiet 2>&1 | tail -n 80; cargo test --quiet 2>&1 | tail -n 20"
+# per-cap cfg sweep (runlet-core only):
+docker run --rm -v "C:\Users\Toy\Documents\GitHub\jsbox:/work" -w /work rust:1.92-alpine sh -c "apk add --no-cache musl-dev >/dev/null 2>&1; rustup component add clippy >/dev/null 2>&1; sh sweep.sh"
 ```
-For the per-cap cfg sweep, write a small `sweep.sh` into the repo (mounted at /work) and
-`sh sweep.sh` it — **inline multi-line scripts get mangled** through PowerShell→docker→sh.
-Loop `for f in NONE db mongo mail redis amq auth http s3 inproc` calling
-`cargo clippy -p runlet-core --no-default-features [--features $f]`.
 
-Live-smoke pattern: start backend on the `jsbox_default` docker network (no host port map),
-run a sh script in `rust:1.92-alpine` on the same network that `cargo build -p runlet`, writes a
-`config.json` with a `resources` map + `debug:true`, runs the binary from /tmp (bind
-127.0.0.1:3000), polls `/health`, and curls `/execute` with `config.io` pointing at a named
-resource.
+## Gotchas learned (4a)
 
-## Gotchas learned
-
-- The egress port name maps differently by layer: Rust `Egress`, script/FFI/field `io`. Keep
-  them straight (trait `Egress` registers FFI `__io`, exposes global `io`).
-- `Gate` import in `host.rs` must be referenced as `engine::Gate` (path), NOT a `use` import —
-  otherwise driver-less cfg builds (`NONE`/`http`/`s3`) fail with unused-import.
-- `ResourceBinding` is internally-tagged + boxed variants (avoids `clippy::large_enum_variant`);
-  works because no `*Config` uses `deny_unknown_fields`.
-- The cfg matrix is the #1 risk — always sweep per-cap combos after touching capability wiring.
-- `#[expect(...)]` is fragile against the cfg matrix when the lint only fires in some combos
-  (e.g. `struct_excessive_bools` depends on how many bool fields survive cfg) — prefer a
-  structural fix (the `Gate` enum) over a cfg-conditional `#[expect]`.
+- The egress port name maps differently by layer: Rust `Egress`, script/FFI/field `io`.
+- `fabric-backends` must NOT depend on `runlet-core` (would pull QuickJS into `fabricd`). Anything
+  the backends share with the sandbox (wire types, breaker, collector) lives in `fabric-wire`.
+- The driver `*Metric` fields had to leave the engine: keeping them would force `runlet-core` to
+  reference `fabric-backends` types, re-pulling the drivers. So the engine carries only `http`/`s3`
+  metrics; the binary drains the rest from the `BackendSet`.
+- `unused_crate_dependencies` is denied → the binary reaches wire types via `runlet_core`
+  re-exports (no direct `fabric-wire` dep); `fabric-backends` gates every driver dep is moot since
+  it's featureless (all used).
+- nursery `too_long_first_doc_paragraph` bites new module/item docs — keep the first sentence short.
+- `doc_markdown` wants backticks on `MongoDB`/`PostgreSQL`/`CockroachDB`/`RabbitMQ`/`Redis` (NATS/
+  SMTP/OIDC all-caps are fine).
 - Don't reformat pre-existing committed code; only `cargo fmt` your own edits.

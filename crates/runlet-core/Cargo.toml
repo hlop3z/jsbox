@@ -12,12 +12,19 @@ categories.workspace = true
 
 # ── Always-compiled core (engine, sandbox, $sys, decimal, host) ──
 # These pull no network driver, so a deterministic-only consumer can depend on the crate
-# with `default-features = false` and link none of the heavy I/O stacks below.
+# with `default-features = false` and link none of the heavy I/O stacks below. The driver
+# capabilities now live in `fabric-backends`; this crate keeps only their JS wrappers
+# (`inject_wrapper` + `js/*.js`) and the engine seam. See docs/design/resource-egress.md.
 [dependencies]
+# The shared egress-port contract: the `Egress` trait, the error taxonomy (`ErrorOwner`/`Fault`/
+# the `__jsbox` tag), the circuit breaker, and the metric collector — re-exported from `egress`/
+# `errors`/`breaker`/`sandbox` so the engine seam and the in-engine capabilities use them.
+fabric-wire = { path = "../fabric-wire" }
 crossbeam-queue.workspace = true
 rquickjs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Retained for the host's tokio `Handle` (vestigial; see host.rs) and the engine seam.
 tokio.workspace = true
 uuid.workspace = true
 base64.workspace = true
@@ -31,61 +38,38 @@ rust_decimal.workspace = true
 # the deterministic-only `--no-default-features` core without pulling any network driver.
 moka.workspace = true
 
-# ── Optional, per-capability driver deps (enabled by the features below) ──
-tracing = { workspace = true, optional = true }
-bytes = { workspace = true, optional = true }
-tokio-postgres = { workspace = true, optional = true }
-postgres_rustls = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true }
-tokio-rustls = { workspace = true, optional = true }
-webpki-roots = { workspace = true, optional = true }
-mongodb = { workspace = true, optional = true }
+# ── Optional, per-capability deps ──
+# Only `http`/`s3` stay in-engine (one is SSRF-guarded, the other is pure SigV4 signing), and
+# both use `reqwest`; the driver-backed capabilities moved to `fabric-backends`, so their driver
+# crates are gone from here.
 reqwest = { workspace = true, optional = true }
-amqprs = { workspace = true, optional = true }
-async-nats = { workspace = true, optional = true }
-redis = { workspace = true, optional = true }
-lettre = { workspace = true, optional = true }
 
 # ── Capability features ──
-# Each I/O capability is a cargo feature gating its module + driver crates. A consumer that
-# only needs a deterministic host builds with `default-features = false` (no network drivers
-# compiled). `runlet` (the HTTP front) enables `full`.
+# Each capability is a cargo feature. `http`/`s3` gate the in-engine client; the driver-backed
+# capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) now gate only their JS wrapper +
+# engine inject gate — the connection/driver lives in `fabric-backends` behind the egress port,
+# so these pull no crates. A deterministic-only host builds with `default-features = false` and
+# links nothing here. `runlet` (the HTTP front) enables `full`.
 [features]
 default = ["full"]
-full = ["http", "db", "mongo", "mail", "s3", "redis", "amq", "auth", "inproc"]
-# In-process `Egress` egress adapter (inproc.rs): wires the crate's own driver capabilities
-# behind the egress seam so a consumer can run `io.call(...)` without a sidecar. Covers all
-# the driver-backed capabilities (docs/design/resource-egress.md).
-inproc = ["db", "mongo", "mail", "redis", "amq", "auth"]
-# Internal markers (not for direct use): `_io` is enabled by every capability (gates the
-# metric collector apparatus); `_throws` is enabled by every *throwing* capability — all
-# except `http`/`api`, which reports transport errors in-band rather than by throwing — and
-# gates the `capability_fault_json` tag machinery.
+full = ["http", "db", "mongo", "mail", "s3", "redis", "amq", "auth"]
+# Internal markers (not for direct use): `_io` is enabled by every capability and gates the
+# engine's `inject_apis` (which injects the JS wrappers + the in-engine `http`/`s3` collectors);
+# `_throws` is enabled only by `s3` (the lone in-engine *throwing* capability) and gates the
+# `capability_fault_json` tag machinery. The driver-backed capabilities map their errors to the
+# `__jsbox` tag via the egress port's always-on `dynamic_fault_json`, not that machinery.
 _io = []
 _throws = []
-# The driver-backed capabilities no longer enable `_throws`: they map their errors to the
-# `Egress` tag via `into_resource_error` / the always-on `dynamic_fault_json`, not the
-# `capability_fault_json` machinery. Only `s3` (pure signing, stays in-engine) still throws via it.
 http = ["dep:reqwest", "_io"]
-# `db` enables `_io` (it owns a metric `Collector`) but NOT `_throws`: it no longer builds the
-# `capability_fault_json` tag itself — it runs through the `Egress` egress, which maps a
-# `DbError` to the tag via `into_resource_error` / the always-on `dynamic_fault_json`.
-db = [
-    "dep:tokio-postgres",
-    "dep:postgres_rustls",
-    "dep:rustls",
-    "dep:tokio-rustls",
-    "dep:webpki-roots",
-    "dep:bytes",
-    "dep:tracing",
-    "_io",
-]
-mongo = ["dep:mongodb", "_io"]
-mail = ["dep:lettre", "_io"]
+# The driver-backed capabilities gate only their JS wrapper (`<cap>.rs`'s `inject_wrapper`) and
+# the engine inject gate — no driver crate, no `_throws`.
+db = ["_io"]
+mongo = ["_io"]
+mail = ["_io"]
 s3 = ["dep:reqwest", "_io", "_throws"]
-redis = ["dep:redis", "_io"]
-amq = ["dep:amqprs", "dep:async-nats", "dep:bytes", "_io"]
-auth = ["dep:reqwest", "_io"]
+redis = ["_io"]
+amq = ["_io"]
+auth = ["_io"]
 # The always-on compiled-bytecode cache (bytecode.rs) is unconditional — `moka` is a normal
 # dependency above, not a feature. It covers the ES-module source path only (classic scripts
 # still recompile). The declare-vs-load microbenchmark lives in the sibling `runlet-bench` crate

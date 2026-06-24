@@ -178,11 +178,28 @@ calls them directly (see step 2).
    `{collection,data}` envelope) against real backends — query/dispatch, metrics, and error
    classification all preserved. `mail`/`amq`/`auth` are structurally identical (dispatch
    unchanged) + unit-tested glue, not yet live-smoked (need SMTP/broker/IdP infra).
-4. **Adapter impl #2 — local `fabricd`** over UDS / localhost-QUIC (`quinn`). Driver crates
-   leave `runlet-core` and move into `fabricd`; the core feature matrix shrinks. `DbBackend` is
-   the shape `fabricd` hosts.
+4. **Driver crates leave `runlet-core`.**
+   - ✅ **4a — done.** Extracted two crates: **`fabric-wire`** (the shared leaf: the `Egress`
+     trait + `EgressError`, the `ErrorOwner`/`Fault`/`DynamicFault` taxonomy + `__jsbox` wire
+     envelope, the `CircuitBreaker`, and the metric `Collector`) and **`fabric-backends`** (the six
+     `*Backend`s + their `*Config`/`*Metric`/`*Error`/`*Deps` + the in-process `BackendSet`, the
+     renamed `InProcessEgress`). All vendor drivers (`tokio-postgres`/`mongodb`/`lettre`/`redis`/
+     `amqprs`/`async-nats`) now live in `fabric-backends`; `runlet-core` links **none** even with
+     `full` (proven via `cargo tree`) — the core feature matrix shrank to just the JS wrappers
+     (`<cap>.rs`'s `inject_wrapper` + `js/*.js`) and the engine seam. `fabric-backends` depends on
+     `fabric-wire` only — never on `runlet-core` (no QuickJS), so it is the shape `fabricd` will
+     host. `runlet` wires an in-process `BackendSet` (provable no-op: clippy clean across the full
+     cfg matrix, all tests green, behavior unchanged). The driver-backed `ExecMetrics` fields left
+     the engine — the binary drains them straight from the `BackendSet`.
+   - **4b — next.** Adapter impl #2: a local `fabricd` sidecar hosting `BackendSet` over UDS
+     (length-prefixed JSON; the `__jsbox` error JSON *is* the wire error; metrics ride back in the
+     response). Add a UDS-client `Egress` impl in `runlet` doing `block_on(timeout(deadline,
+     roundtrip))` and swap `BackendSet` for it (with in-process fallback). localhost-QUIC (`quinn`)
+     is the cross-node step (Project B).
 5. **Trust-model flip.** `CapabilitySet` driver configs → logical resource allowlist; all
-   creds move into `fabricd`. Remove operator-secret fields from the request surface.
+   creds move into `fabricd`. Remove operator-secret fields from the request surface. *(The
+   in-box half already landed — the request carries `config.io` logical names, not creds; step 5
+   is the `fabricd`-side move + removing the vestigial `handle`/`db_breaker` from `LogicHost::new`.)*
 
 Steps 1–3 are the bulk of the value, touch only `runlet-core`, and require no distributed
 systems. Steps 4–5 are the on-ramp to [network-fabric.md](network-fabric.md).

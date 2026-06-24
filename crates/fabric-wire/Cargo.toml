@@ -1,0 +1,21 @@
+[package]
+name = "fabric-wire"
+description = "Shared egress-port wire contract for runlet: the Egress trait, the tagged-error envelope, the error taxonomy primitives, the per-target circuit breaker, and the metric collector — depended on by both runlet-core and fabric-backends, with no driver or QuickJS code"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# A leaf crate: pure Rust + serde, no network drivers and no QuickJS. This is the shared
+# substrate the sandbox (runlet-core) and the driver host (fabric-backends, eventually
+# fabricd) both depend on — see docs/design/resource-egress.md.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

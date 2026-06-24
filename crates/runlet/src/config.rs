@@ -13,13 +13,13 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use runlet_core::amq::AmqConfig;
-use runlet_core::auth::AuthConfig;
+use fabric_backends::amq::AmqConfig;
+use fabric_backends::auth::AuthConfig;
+use fabric_backends::db::DbConfig;
+use fabric_backends::kv::RedisConfig;
+use fabric_backends::mail::MailConfig;
+use fabric_backends::mongo::MongoConfig;
 use runlet_core::config::EngineConfig;
-use runlet_core::db::DbConfig;
-use runlet_core::kv::RedisConfig;
-use runlet_core::mail::MailConfig;
-use runlet_core::mongo::MongoConfig;
 use serde::Deserialize;
 
 /// Top-level configuration. `Default` is derived — every field's default is its type

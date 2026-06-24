@@ -23,27 +23,29 @@ use serde_json::Value;
 use serde_json::value::RawValue;
 
 #[cfg(feature = "amq")]
-use crate::amq::{self, AmqMetric};
+use crate::amq;
 #[cfg(feature = "auth")]
-use crate::auth::{self, AuthMetric};
+use crate::auth;
 use crate::bytecode::{self, BytecodeCache};
 #[cfg(feature = "db")]
-use crate::db::{self, DbMetric};
+use crate::db;
 use crate::decimal;
 use crate::egress::Egress;
 use crate::errors::{self, ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
 #[cfg(feature = "http")]
 use crate::http::{self, HttpMetric};
 #[cfg(feature = "redis")]
-use crate::kv::{self, RedisMetric};
+use crate::kv;
 #[cfg(feature = "mail")]
-use crate::mail::{self, MailMetric};
+use crate::mail;
 use crate::modules;
 #[cfg(feature = "mongo")]
-use crate::mongo::{self, MongoMetric};
+use crate::mongo;
 #[cfg(feature = "s3")]
 use crate::s3::{self, S3Config, S3Metric};
-#[cfg(feature = "_io")]
+// The metric collector apparatus is needed only by the in-engine capabilities (`http`/`s3`); the
+// driver-backed capabilities surface their metrics from the egress adapter, not the engine.
+#[cfg(any(feature = "http", feature = "s3"))]
 use crate::sandbox::{self, Collector};
 use crate::sys::{self, SysConfig};
 
@@ -197,30 +199,16 @@ pub(crate) struct ExecResult {
     /// Declarative effects appended via `emit(value)`, in call order (opaque JSON to the
     /// core — the consumer interprets them).
     pub(crate) effects: Vec<Box<RawValue>>,
-    /// HTTP requests made during execution.
+    /// HTTP requests made during execution (in-engine capability).
     #[cfg(feature = "http")]
     pub(crate) http_metrics: Vec<HttpMetric>,
-    /// DB operations made during execution.
-    #[cfg(feature = "db")]
-    pub(crate) db_metrics: Vec<DbMetric>,
-    /// Mongo operations made during execution.
-    #[cfg(feature = "mongo")]
-    pub(crate) mongo_metrics: Vec<MongoMetric>,
-    /// Mail operations made during execution.
-    #[cfg(feature = "mail")]
-    pub(crate) mail_metrics: Vec<MailMetric>,
-    /// S3 operations made during execution.
+    /// S3 presign operations made during execution (in-engine capability).
     #[cfg(feature = "s3")]
     pub(crate) s3_metrics: Vec<S3Metric>,
-    /// Redis operations made during execution.
-    #[cfg(feature = "redis")]
-    pub(crate) redis_metrics: Vec<RedisMetric>,
-    /// `RabbitMQ` operations made during execution.
-    #[cfg(feature = "amq")]
-    pub(crate) amq_metrics: Vec<AmqMetric>,
-    /// Auth operations made during execution.
-    #[cfg(feature = "auth")]
-    pub(crate) auth_metrics: Vec<AuthMetric>,
+    // The driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) no longer report
+    // metrics through the engine: they run in the wired egress adapter, which the consumer drains
+    // directly (see `fabric_backends::BackendSet`). So the engine carries only the in-engine
+    // capabilities' metrics here.
 }
 
 /// What the handler produced: a success envelope or a system error.
@@ -336,42 +324,12 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
     // `ExecResult.effects` after execution. Opaque to the core (the consumer interprets it).
     let effects: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // In-engine capability metric collectors (`http`/`s3` only); the driver-backed capabilities
+    // record into the egress adapter, drained by the consumer.
     #[cfg(feature = "http")]
     let mut http_collector: Option<Collector<HttpMetric>> = None;
-    #[cfg(feature = "db")]
-    let mut db_collector: Option<Collector<DbMetric>> = None;
-    #[cfg(feature = "mongo")]
-    let mut mongo_collector: Option<Collector<MongoMetric>> = None;
-    #[cfg(feature = "mail")]
-    let mut mail_collector: Option<Collector<MailMetric>> = None;
     #[cfg(feature = "s3")]
     let mut s3_collector: Option<Collector<S3Metric>> = None;
-    #[cfg(feature = "redis")]
-    let mut redis_collector: Option<Collector<RedisMetric>> = None;
-    #[cfg(feature = "amq")]
-    let mut amq_collector: Option<Collector<AmqMetric>> = None;
-    #[cfg(feature = "auth")]
-    let mut auth_collector: Option<Collector<AuthMetric>> = None;
-
-    #[cfg(feature = "_io")]
-    let mut collectors = Collectors {
-        #[cfg(feature = "http")]
-        http: &mut http_collector,
-        #[cfg(feature = "db")]
-        db: &mut db_collector,
-        #[cfg(feature = "mongo")]
-        mongo: &mut mongo_collector,
-        #[cfg(feature = "mail")]
-        mail: &mut mail_collector,
-        #[cfg(feature = "s3")]
-        s3: &mut s3_collector,
-        #[cfg(feature = "redis")]
-        redis: &mut redis_collector,
-        #[cfg(feature = "amq")]
-        amq: &mut amq_collector,
-        #[cfg(feature = "auth")]
-        auth: &mut auth_collector,
-    };
 
     let js_result = ctx.with(|qctx| -> Result<ExecOutcome, EngineError> {
         inject_bridge(&qctx).map_err(EngineError::internal)?;
@@ -390,7 +348,14 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
                 .map_err(EngineError::internal)?;
         }
         #[cfg(feature = "_io")]
-        inject_apis(&qctx, params, &mut collectors)?;
+        inject_apis(
+            &qctx,
+            params,
+            #[cfg(feature = "http")]
+            &mut http_collector,
+            #[cfg(feature = "s3")]
+            &mut s3_collector,
+        )?;
         let handler = match resolve_handler(&qctx, params) {
             Ok(func) => func,
             Err(outcome) => return Ok(outcome),
@@ -417,20 +382,8 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         effects: drain_effects(&effects),
         #[cfg(feature = "http")]
         http_metrics: sandbox::drain(http_collector.as_ref()),
-        #[cfg(feature = "db")]
-        db_metrics: sandbox::drain(db_collector.as_ref()),
-        #[cfg(feature = "mongo")]
-        mongo_metrics: sandbox::drain(mongo_collector.as_ref()),
-        #[cfg(feature = "mail")]
-        mail_metrics: sandbox::drain(mail_collector.as_ref()),
         #[cfg(feature = "s3")]
         s3_metrics: sandbox::drain(s3_collector.as_ref()),
-        #[cfg(feature = "redis")]
-        redis_metrics: sandbox::drain(redis_collector.as_ref()),
-        #[cfg(feature = "amq")]
-        amq_metrics: sandbox::drain(amq_collector.as_ref()),
-        #[cfg(feature = "auth")]
-        auth_metrics: sandbox::drain(auth_collector.as_ref()),
     })
 }
 
@@ -452,39 +405,6 @@ fn enforce_output_cap(outcome: ExecOutcome, max_output_size: usize) -> ExecOutco
         }
     }
     outcome
-}
-
-/// Mutable references to the per-capability metric collectors.
-///
-/// Grouped into one struct so [`inject_apis`] stays within the argument-count
-/// limit as capabilities are added. Exists only when at least one I/O capability is
-/// compiled in (`feature = "_io"`).
-#[cfg(feature = "_io")]
-struct Collectors<'a> {
-    /// HTTP metrics collector slot.
-    #[cfg(feature = "http")]
-    http: &'a mut Option<Collector<HttpMetric>>,
-    /// DB metrics collector slot.
-    #[cfg(feature = "db")]
-    db: &'a mut Option<Collector<DbMetric>>,
-    /// Mongo metrics collector slot.
-    #[cfg(feature = "mongo")]
-    mongo: &'a mut Option<Collector<MongoMetric>>,
-    /// Mail metrics collector slot.
-    #[cfg(feature = "mail")]
-    mail: &'a mut Option<Collector<MailMetric>>,
-    /// S3 metrics collector slot.
-    #[cfg(feature = "s3")]
-    s3: &'a mut Option<Collector<S3Metric>>,
-    /// Redis metrics collector slot.
-    #[cfg(feature = "redis")]
-    redis: &'a mut Option<Collector<RedisMetric>>,
-    /// `RabbitMQ` metrics collector slot.
-    #[cfg(feature = "amq")]
-    amq: &'a mut Option<Collector<AmqMetric>>,
-    /// Auth metrics collector slot.
-    #[cfg(feature = "auth")]
-    auth: &'a mut Option<Collector<AuthMetric>>,
 }
 
 // -- Setup helpers ----------------------------------------------------------
@@ -511,16 +431,19 @@ fn inject_bridge(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     Ok(())
 }
 
-/// Injects the HTTP, DB, mail, and S3 APIs if configured.
+/// Injects the per-request capabilities (subject to the profile).
 ///
-/// A `db` connection failure here (inject time) is mapped to a retryable
-/// `capability/db/DB_CONNECTION` instead of `runtime/INTERNAL`, so a dead database
-/// reads as a downstream-dependency outage (200) rather than a server fault (500).
+/// The in-engine capabilities (`http`/`s3`) build their client and return a metric collector
+/// (captured into the `*_collector` slots). The driver-backed capabilities (`db`/`mongo`/`mail`/
+/// `redis`/`amq`/`auth`) inject only their JS wrapper — every call routes through the wired
+/// [`Egress`] port (injected before this), whose adapter owns the connection, resilience, and
+/// metrics; the engine never sees their credentials or records their ops.
 #[cfg(feature = "_io")]
 fn inject_apis(
     qctx: &Ctx<'_>,
     params: &ExecParams<'_>,
-    collectors: &mut Collectors<'_>,
+    #[cfg(feature = "http")] http_collector: &mut Option<Collector<HttpMetric>>,
+    #[cfg(feature = "s3")] s3_collector: &mut Option<Collector<S3Metric>>,
 ) -> Result<(), EngineError> {
     // Profile enforcement: the deterministic tier gets **no** I/O capability, regardless of
     // what configs an `Invocation` carries — the boundary is enforced here, not trusted to
@@ -530,7 +453,7 @@ fn inject_apis(
     }
     #[cfg(feature = "http")]
     if !params.allowed_hosts.is_empty() {
-        *collectors.http = Some(
+        *http_collector = Some(
             http::inject_api(
                 qctx,
                 params.allowed_hosts,
@@ -541,33 +464,25 @@ fn inject_apis(
             .map_err(EngineError::internal)?,
         );
     }
+    // Each driver-backed capability below routes through the wired [`Egress`] port: inject only
+    // its JS wrapper (which calls `io.call("<cap>", …)`); the connection, deps, and metrics live
+    // in the adapter, not the engine. The presence gate is the logical-resource flag — no config
+    // crosses the engine boundary.
     #[cfg(feature = "db")]
     if params.db_enabled.is_on() {
-        // `db` runs through the `Egress` egress: inject only the `db.js` wrapper (which calls
-        // `io.call("db", …)`). The connection, breaker, and metrics live in the wired
-        // adapter, not the engine — so this needs `egress` to be present (it is: injected
-        // before `inject_apis`). The collector stays empty here; the adapter surfaces the real
-        // `db` metrics (the consumer merges them into the outcome).
         db::inject_wrapper(qctx).map_err(EngineError::internal)?;
-        *collectors.db = Some(sandbox::new_collector());
     }
-    // Every driver-backed capability below runs through the `Egress` egress: inject only its
-    // JS wrapper (which calls `io.call("<cap>", …)`); the connection, deps, and metrics
-    // live in the wired adapter, not the engine. The collector stays empty here — the adapter
-    // surfaces the real metrics (the consumer merges them into the outcome).
     #[cfg(feature = "mongo")]
     if params.mongo_enabled.is_on() {
         mongo::inject_wrapper(qctx).map_err(EngineError::internal)?;
-        *collectors.mongo = Some(sandbox::new_collector());
     }
     #[cfg(feature = "mail")]
     if params.mail_enabled.is_on() {
         mail::inject_wrapper(qctx).map_err(EngineError::internal)?;
-        *collectors.mail = Some(sandbox::new_collector());
     }
     #[cfg(feature = "s3")]
     if let Some(s3_cfg) = params.s3_config {
-        *collectors.s3 = Some(
+        *s3_collector = Some(
             s3::inject_s3(qctx, s3_cfg, params.max_ops, params.allow_private_targets)
                 .map_err(EngineError::internal)?,
         );
@@ -575,17 +490,14 @@ fn inject_apis(
     #[cfg(feature = "redis")]
     if params.redis_enabled.is_on() {
         kv::inject_wrapper(qctx).map_err(EngineError::internal)?;
-        *collectors.redis = Some(sandbox::new_collector());
     }
     #[cfg(feature = "amq")]
     if params.amq_enabled.is_on() {
         amq::inject_wrapper(qctx).map_err(EngineError::internal)?;
-        *collectors.amq = Some(sandbox::new_collector());
     }
     #[cfg(feature = "auth")]
     if params.auth_enabled.is_on() {
         auth::inject_wrapper(qctx).map_err(EngineError::internal)?;
-        *collectors.auth = Some(sandbox::new_collector());
     }
     Ok(())
 }
