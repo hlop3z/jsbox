@@ -6,16 +6,19 @@
 database. If `db` is a spreadsheet of rows, `mongo` is a **folder of little JSON files** you
 can search, add to, change, and delete.
 
-> Like `db` and `mail`, the connection is **operator-supplied** in `config.mongo`, so it's
-> trusted — it connects to exactly the host you name (no SSRF guard). All calls are
-> **synchronous** (no `await`).
+> Like `db` and `mail`, the connection is **operator-supplied** — it lives in the server's
+> `config.json`, not your request, so it's trusted (it connects to exactly the host the
+> operator named, no SSRF guard). All calls are **synchronous** (no `await`).
 
 ## Turn it on first 🔑
 
+The operator gives the connection a nickname like `shop-docs` in the server's `config.json`:
+
 ```json
 {
-  "config": {
-    "mongo": {
+  "resources": {
+    "shop-docs": {
+      "kind": "mongo",
       "host": "localhost",
       "port": 27017,
       "username": "app",
@@ -29,7 +32,17 @@ can search, add to, change, and delete.
 }
 ```
 
-No `config.mongo` → `mongo` is turned off (`typeof mongo === "undefined"`).
+Then your request asks for it by nickname with `config.io.mongo`:
+
+```json
+{
+  "config": {
+    "io": { "mongo": ["shop-docs"] }
+  }
+}
+```
+
+No nickname in `config.io.mongo` → `mongo` is turned off (`typeof mongo === "undefined"`).
 
 - `username`/`password` are optional — omit them for a database with no auth.
 - `auth_source` is the database your user is defined in (default `admin`).

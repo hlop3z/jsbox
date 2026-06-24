@@ -27,9 +27,12 @@ this page is the "what to actually set, and why" synthesis.
 
 These are the difference between "internal demo" and "safe to point traffic at."
 
-- **Authenticate `/execute` (fail-closed).** The `/execute` caller is fully trusted — it
-  supplies the credentials (`config.db`/`mail`/…) and arbitrary JS — so an unauthenticated
-  reachable port is a full compromise (SSRF pivot, mail relay, credential use). jsbox
+- **Authenticate `/execute` (fail-closed).** The `/execute` caller is trusted — it runs
+  arbitrary JS and picks which operator-declared resources to use (`config.io`) — so an
+  unauthenticated reachable port is a full compromise (SSRF pivot, mail relay, use of any
+  provisioned resource). (Credentials themselves no longer ride in the request — they live
+  operator-side in the server `config.json` `resources` map — but a reachable executor is
+  still a pivot into everything the operator provisioned.) jsbox
   **refuses to start** on a non-loopback bind unless you either set `access_token` (a shared
   secret; requests must send `Authorization: Bearer <token>`, constant-time compared) or
   explicitly set `allow_unauthenticated: true` to assert auth is terminated upstream
@@ -129,12 +132,13 @@ caller-set, never script-set) and it's echoed back in `meta.partition`.
 
 `$sys.secrets` values are **opaque handles** inside JS — the plaintext never enters the sandbox;
 a script can only ever return the `"[secret:NAME]"` placeholder, never the value (see
-[docs/09-sys.md](09-sys.md)). Supply them in `config.sys`. Treat the request `config` itself as
-sensitive (it carries DB passwords, SMTP creds): terminate TLS in front of jsbox, and don't log
-request bodies.
+[docs/09-sys.md](09-sys.md)). Supply them in `config.sys`. The request `config` no longer carries
+driver credentials (they live operator-side in the server `config.json` `resources` map — keep
+*that* file secret), but `config.sys.secrets` still does, so terminate TLS in front of jsbox and
+don't log request bodies.
 
 **Mail relay abuse (untrusted scripts).** A handler chooses its own `to`/subject/body against the
-operator's SMTP relay, so for untrusted scripts constrain it in `config.mail`: set
+operator's SMTP relay, so for untrusted scripts constrain it in the operator's `mail` resource: set
 `allowed_recipient_domains` (a recipient whose domain is off-list is rejected before send) and
 `max_sends` (per-execution cap on `mail.send`, on top of `max_recipients` per message). Together
 they keep a handler from turning the relay into an open spam cannon.

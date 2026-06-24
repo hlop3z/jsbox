@@ -47,23 +47,29 @@ Read these in order. Each one is short.
 Your robot starts with **no** super-powers. You turn each one on by adding a
 little `config` to your message. That keeps things safe.
 
-| Super-power             | What it does                | Turn it on with        |
-| ----------------------- | --------------------------- | ---------------------- |
-| `api`                   | Talk to other websites      | `config.allowed_hosts` |
-| `db`                    | Talk to a database          | `config.db`            |
-| `mongo`                 | Talk to a document database | `config.mongo`         |
-| `mail`                  | Send email                  | `config.mail`          |
-| `s3`                    | Signed upload links         | `config.s3`            |
-| `redis`                 | A super-fast notebook       | `config.redis`         |
-| `amq`                   | Send messages (RabbitMQ/NATS) | `config.amq`         |
-| `auth`                  | Check a login token         | `config.auth`          |
-| `$sys.env` / `.secrets` | Settings + use-only secrets | `config.sys`           |
+| Super-power             | What it does                | Turn it on with               |
+| ----------------------- | --------------------------- | ----------------------------- |
+| `api`                   | Talk to other websites      | `config.allowed_hosts`        |
+| `db`                    | Talk to a database          | `config.io.db: ["nickname"]`  |
+| `mongo`                 | Talk to a document database | `config.io.mongo: ["nickname"]` |
+| `mail`                  | Send email                  | `config.io.mail: ["nickname"]` |
+| `s3`                    | Signed upload links         | `config.s3`                   |
+| `redis`                 | A super-fast notebook       | `config.io.redis: ["nickname"]` |
+| `amq`                   | Send messages (RabbitMQ/NATS) | `config.io.amq: ["nickname"]` |
+| `auth`                  | Check a login token         | `config.io.auth: ["nickname"]` |
+| `$sys.env` / `.secrets` | Settings + use-only secrets | `config.sys`                  |
+
+The database/mail/redis/etc. **nicknames** point at resources the grown-up (operator)
+set up in the server's `config.json` `resources` — the keys and passwords live there,
+never in your request. You just ask by nickname (e.g. `config.io.db: ["orders-db"]`).
+`api` (`allowed_hosts`) and `s3` keep their settings in the request.
 
 (`$` — exact decimal math — and **`$sys.crypto` / `$sys.date`** are the exceptions:
 they're **always on**, no config. Only `$sys.env` / `$sys.secrets` need `config.sys`.)
 
 If you don't turn a super-power on, the robot simply doesn't have it. (For example,
-if there's no `config.mail`, then `mail` is `undefined` — it isn't there at all.)
+if there's no nickname in `config.io.mail`, then `mail` is `undefined` — it isn't there
+at all.)
 
 ## Going further 🛠️
 

@@ -6,12 +6,14 @@
 
 ## Turn it on first 🔑
 
-Give the robot your mail server details with `config.mail`:
+Your mail server details (host, password, …) live with the **operator** in the server's
+`config.json`, under a nickname like `team-mail`:
 
 ```json
 {
-  "config": {
-    "mail": {
+  "resources": {
+    "team-mail": {
+      "kind": "mail",
       "host": "smtp.example.com",
       "port": 587,
       "user": "apikey",
@@ -19,6 +21,16 @@ Give the robot your mail server details with `config.mail`:
       "tls": "starttls",
       "from": "no-reply@example.com"
     }
+  }
+}
+```
+
+Then your request asks for it by nickname with `config.io.mail` — no passwords:
+
+```json
+{
+  "config": {
+    "io": { "mail": ["team-mail"] }
   }
 }
 ```
@@ -34,7 +46,8 @@ Give the robot your mail server details with `config.mail`:
 | `max_recipients` | Most people one email may go to                            | `50`         |
 | `timeout_ms`     | How long to wait before giving up                          | `10000`      |
 
-No `config.mail` → `mail` is turned off.
+No nickname in `config.io.mail` → `mail` is turned off. (`config.mail.from` below means
+the `from` set in the operator's `team-mail` resource.)
 
 > **Which `tls`?** Most servers use `"starttls"` (port 587). Some older ones use
 > `"wrapper"` (port 465). Use `"none"` only for local testing with no security.
@@ -60,7 +73,7 @@ That's it! `accepted: true` means the mail server took your email. 🎉
 
 ```js
 mail.send({
-  from: "Team <hello@example.com>", // optional (else uses config.mail.from)
+  from: "Team <hello@example.com>", // optional (else uses the resource's from)
   to: ["alice@example.com", "bob@example.com"], // one or many
   cc: ["boss@example.com"], // optional
   bcc: ["secret@example.com"], // optional (hidden copy)

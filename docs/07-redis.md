@@ -12,12 +12,14 @@ counters, caches, sessions, and "remember this for a minute" jobs.
 
 ## Turn it on first 🔑
 
-Give the robot the address of your Redis with `config.redis`:
+The address of your Redis lives with the **operator** in the server's `config.json`,
+under a nickname like `cache`:
 
 ```json
 {
-  "config": {
-    "redis": {
+  "resources": {
+    "cache": {
+      "kind": "redis",
       "url": "redis://localhost:6379/0",
       "timeout_ms": 5000
     }
@@ -25,7 +27,17 @@ Give the robot the address of your Redis with `config.redis`:
 }
 ```
 
-No `config.redis` → `redis` is turned off.
+Then your request asks for it by nickname with `config.io.redis`:
+
+```json
+{
+  "config": {
+    "io": { "redis": ["cache"] }
+  }
+}
+```
+
+No nickname in `config.io.redis` → `redis` is turned off.
 
 > **Managed Redis?** Use a `rediss://` URL (two s's) for TLS — it just works, validated
 > against the usual public certificate authorities.

@@ -9,19 +9,21 @@ a worker on the other side collects it when it's ready.
 This is great for slow or background jobs — "send a welcome email", "resize this image",
 "charge this card" — that you don't want to wait around for inside your handler.
 
-> jsbox talks to **RabbitMQ** (the default) or **NATS** — pick with `config.amq.backend`.
+> jsbox talks to **RabbitMQ** (the default) or **NATS** — pick with the resource's `backend`.
 > Either way jsbox is **producer-side** only: it _sends_ messages (and, on NATS, can _ask and
 > wait for one reply_). It does **not** subscribe/consume a stream — that's the worker's job,
 > somewhere else.
 
 ## Turn it on first 🔑
 
-Give the robot the address of your broker with `config.amq`:
+The address of your broker lives with the **operator** in the server's `config.json`,
+under a nickname like `events`:
 
 ```json
 {
-  "config": {
-    "amq": {
+  "resources": {
+    "events": {
+      "kind": "amq",
       "host": "localhost",
       "port": 5672,
       "username": "guest",
@@ -34,17 +36,29 @@ Give the robot the address of your broker with `config.amq`:
 }
 ```
 
-No `config.amq` → `amq` is turned off.
-
-### Using NATS instead 🟢
-
-Set `"backend": "nats"`. Now the routing key is a **subject**, the port defaults to `4222`,
-and `vhost`/`exchange` don't apply. Auth is optional (`username`+`password`, or a `token`):
+Then your request asks for it by nickname with `config.io.amq`:
 
 ```json
 {
   "config": {
-    "amq": {
+    "io": { "amq": ["events"] }
+  }
+}
+```
+
+No nickname in `config.io.amq` → `amq` is turned off.
+
+### Using NATS instead 🟢
+
+In the operator's resource, set `"backend": "nats"`. Now the routing key is a **subject**,
+the port defaults to `4222`, and `vhost`/`exchange` don't apply. Auth is optional
+(`username`+`password`, or a `token`):
+
+```json
+{
+  "resources": {
+    "events": {
+      "kind": "amq",
       "backend": "nats",
       "host": "localhost",
       "port": 4222,

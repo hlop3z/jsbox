@@ -10,12 +10,15 @@ A database is a giant, super-organized **spreadsheet** that remembers things for
 
 ## Turn it on first 🔑
 
-Give the robot the keys to your database with `config.db`:
+The **keys** to your database (host, password, …) live with the grown-up who runs the
+server — the **operator** — never in your request. They give the database a nickname
+like `orders-db` in the server's `config.json`:
 
 ```json
 {
-  "config": {
-    "db": {
+  "resources": {
+    "orders-db": {
+      "kind": "db",
       "host": "localhost",
       "port": 5432,
       "user": "app",
@@ -26,7 +29,20 @@ Give the robot the keys to your database with `config.db`:
 }
 ```
 
-No `config.db` → `db` is turned off.
+Then in your request you just ask for it **by nickname** with `config.io.db` — no
+passwords, ever:
+
+```json
+{
+  "config": {
+    "io": { "db": ["orders-db"] }
+  }
+}
+```
+
+No nickname in `config.io.db` → `db` is turned off. Ask for a nickname the operator
+never set up → the request is rejected (`RESOURCE_NOT_FOUND`). This way a script can
+only reach the databases the operator allowed, and never sees a password.
 
 ## Reading rows: `db.query`
 

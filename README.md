@@ -44,16 +44,17 @@ POST /execute
   "context": { "name": "Alice" },
   "config": {
     "allowed_hosts": ["api.example.com"],
-    "db": {
-      "host": "localhost",
-      "port": 5432,
-      "user": "app",
-      "password": "secret",
-      "database": "mydb"
-    }
+    "io": { "db": ["orders-db"] }
   }
 }
 ```
+
+Driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) are addressed by
+**logical name** in `config.io`, not by inline connection config. The endpoints and
+credentials are declared once, operator-side, in the server `config.json` `resources`
+map (see [Logical resources](#logical-resources-configio)) — the request never carries
+a host or a password. `http` (`allowed_hosts`) and `s3` stay script-controlled/in-engine
+and keep their inline config.
 
 | Field                  | Required | Description                                                              |
 | ---------------------- | -------- | ------------------------------------------------------------------------ |
@@ -61,11 +62,9 @@ POST /execute
 | `key`                  | one of   | Registered-script key (see [Registered scripts](#registered-scripts))    |
 | `context`              | no       | JSON object passed as `ctx` to the handler                               |
 | `config.allowed_hosts` | no       | Hosts the script can reach via `api.*` (`["*"]` = any, `[]` = disabled)  |
-| `config.db`            | no       | PostgreSQL/CockroachDB connection (omit to disable `db.*`)               |
-| `config.mongo`         | no       | MongoDB connection (omit to disable `mongo.*`)                           |
-| `config.mail`          | no       | SMTP relay connection (omit to disable `mail.*`)                         |
-| `config.s3`            | no       | S3/R2/MinIO connection for presigned URLs (omit to disable `s3.*`)       |
-| `config.auth`          | no       | OIDC/IAM issuer for `auth.*` token validation (omit to disable `auth.*`) |
+| `config.io`            | no       | Logical resource names per capability, e.g. `{"db":["orders-db"]}` — names resolved operator-side, no creds (omit a kind to disable it) |
+| `config.s3`            | no       | S3/R2/MinIO connection for presigned URLs (in-engine; omit to disable `s3.*`) |
+| `config.sys`           | no       | `$sys.env` / `$sys.secrets` context                                      |
 
 ### Response
 
@@ -92,6 +91,36 @@ bridge. On a **system-generated** failure, `error` is a structured envelope —
 `{ type, source, code, message, retryable, owner, details?, debug? }` — that a client can
 branch on without parsing strings; `meta.trace_id` correlates it with server logs. See
 [`docs/99-errors.md`](docs/99-errors.md) for the full contract.
+
+### Logical resources (`config.io`)
+
+Driver-backed capabilities are addressed by **logical name**, not inline connection
+config. The operator declares each named resource once in the server `config.json`
+`resources` map (an internally-tagged object: `kind` selects the capability, the rest is
+that driver's config):
+
+```json
+{
+  "resources": {
+    "orders-db": { "kind": "db", "host": "pg", "user": "app", "password": "secret", "database": "shop" },
+    "cache":     { "kind": "redis", "url": "redis://cache:6379/0" }
+  }
+}
+```
+
+A request then names the resources it may use, keyed by capability kind:
+
+```json
+{ "config": { "io": { "db": ["orders-db"], "redis": ["cache"] } } }
+```
+
+The name gates the capability (no name → the global is `undefined`) **and** selects which
+operator binding is wired. A name the operator never declared is rejected with a `400`
+`RESOURCE_NOT_FOUND`; a name of the wrong kind is a `400` `RESOURCE_KIND_MISMATCH`. This is
+the trust boundary: a (possibly compromised) caller can only reach operator-provisioned
+resources and never sees an endpoint or a credential. Interim: one binding per kind is
+wired (the JS wrapper still dispatches by kind, e.g. `db.query(…)`). Design:
+[`docs/design/resource-egress.md`](docs/design/resource-egress.md).
 
 ### Registered scripts
 
@@ -222,7 +251,7 @@ function handler(ctx) {
 
 ### db.query / db.execute / db.begin / db.commit / db.rollback
 
-PostgreSQL/CockroachDB client (requires `config.db`):
+PostgreSQL/CockroachDB client (requires a `config.io.db` resource):
 
 ```js
 function handler(ctx) {
@@ -255,7 +284,7 @@ BIGINT and NUMERIC values are always returned as strings (JS number precision sa
 
 ### mail.send
 
-SMTP client (requires `config.mail`):
+SMTP client (requires a `config.io.mail` resource):
 
 ```js
 function handler(ctx) {
@@ -504,7 +533,7 @@ parsed JSON body, bounded by `config.amq.request_timeout_ms` (default 5000) → 
 
 ### mongo.find / find_one / count / aggregate / insert* / update* / delete* — document database
 
-MongoDB client (requires `config.mongo`, **operator-supplied** — trusted, no SSRF guard, like
+MongoDB client (requires a `config.io.mongo` resource, **operator-supplied** — trusted, no SSRF guard, like
 `db`/`mail`). Async under the hood (per-op client-side deadline anchored to the execution
 budget, like `db`). Filters/updates/pipelines are passed as data, never string-interpolated.
 Synchronous from JS.
@@ -684,8 +713,8 @@ HTTP request
         -> fresh Context per request
           -> inject json() bridge
           -> inject api.* (if allowed_hosts)
-          -> inject db.* (if config.db)
-          -> inject mail.* (if config.mail)
+          -> inject db.*/mongo.*/mail.*/redis.*/amq.*/auth.* (per config.io names,
+             resolved operator-side -> wired Egress port; script-facing global: io.call)
           -> inject s3.* (if config.s3)
           -> eval user script
           -> remove eval/Proxy

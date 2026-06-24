@@ -11,17 +11,31 @@ is the one true judge of whether a token is good.
 
 ## Turn it on first 🔑
 
-Give the robot your identity server's address with `config.auth`:
+Your identity server's address (and any app secret) lives with the **operator** in the
+server's `config.json`, under a nickname like `idp`:
 
 ```json
 {
-  "config": {
-    "auth": {
+  "resources": {
+    "idp": {
+      "kind": "auth",
       "issuer": "https://login.example.com"
     }
   }
 }
 ```
+
+Then your request asks for it by nickname with `config.io.auth`:
+
+```json
+{
+  "config": {
+    "io": { "auth": ["idp"] }
+  }
+}
+```
+
+The operator's `idp` resource takes these settings:
 
 | Setting          | What it means                                            | Default      |
 | ---------------- | -------------------------------------------------------- | ------------ |
@@ -32,7 +46,7 @@ Give the robot your identity server's address with `config.auth`:
 | `client_secret`  | App secret — only needed for `introspect`                | `""`         |
 | `timeout_ms`     | How long to wait before giving up                        | `10000`      |
 
-No `config.auth` → `auth` is turned off (`typeof auth === "undefined"`).
+No nickname in `config.io.auth` → `auth` is turned off (`typeof auth === "undefined"`).
 
 > **Auto-discovery.** You usually only set `issuer`. The robot finds the right
 > endpoints by reading `{issuer}/.well-known/openid-configuration` — the standard
@@ -68,12 +82,13 @@ normal, everyday business, so you just check `u.ok` and branch. (This mirrors ho
 `introspect` is the official "is this token still alive?" question (the OAuth standard
 calls it RFC 7662). It can see things `user_info` can't, like whether a token was
 **revoked** or when it **expires** — but it needs your app's own `client_id` and
-`client_secret`:
+`client_secret`, which the operator adds to the resource:
 
 ```json
 {
-  "config": {
-    "auth": {
+  "resources": {
+    "idp": {
+      "kind": "auth",
       "issuer": "https://login.example.com",
       "client_id": "my-api",
       "client_secret": "shhh"
