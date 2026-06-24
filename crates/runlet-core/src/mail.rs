@@ -17,8 +17,8 @@ use lettre::{SmtpTransport, Transport};
 use rquickjs::{Ctx, Value as JsValue};
 use serde::{Deserialize, Serialize};
 
+use crate::egress::EgressError;
 use crate::errors::{ErrorOwner, Fault};
-use crate::resource::ResourceError;
 use crate::sandbox::{self, Collector};
 
 /// JS wrapper — loaded from `src/js/mail.js` at compile time.
@@ -56,11 +56,11 @@ impl MailError {
         }
     }
 
-    /// Converts into the capability-agnostic [`ResourceError`] for the egress seam (source
+    /// Converts into the capability-agnostic [`EgressError`] for the egress seam (source
     /// `mail`), preserving the classified code / retryable / owner.
     #[must_use]
-    pub fn into_resource_error(self) -> ResourceError {
-        ResourceError {
+    pub fn into_resource_error(self) -> EgressError {
+        EgressError {
             code: self.fault.code.to_owned(),
             message: self.message,
             source: "mail".to_owned(),
@@ -228,7 +228,7 @@ struct SendCtx<'a> {
 /// A `mail` backend: the pre-built SMTP transport plus send policy and its own metrics,
 /// exposing a single [`call`](MailBackend::call).
 ///
-/// The reusable dispatch core behind the in-process [`Resource`](crate::resource::Resource)
+/// The reusable dispatch core behind the in-process [`Egress`](crate::egress::Egress)
 /// adapter. Sync. See `docs/design/resource-egress.md`.
 pub struct MailBackend {
     /// Pre-built SMTP transport (connects per send, internally).
@@ -261,13 +261,13 @@ impl fmt::Debug for MailBackend {
 
 impl MailBackend {
     /// Builds the SMTP transport from config; a setup failure maps to a retryable
-    /// `MAIL_ERROR` [`ResourceError`].
+    /// `MAIL_ERROR` [`EgressError`].
     ///
     /// # Errors
     ///
-    /// Returns a [`ResourceError`] if transport construction fails.
-    pub fn connect_resource(config: &MailConfig) -> Result<Self, ResourceError> {
-        let transport = build_transport(config).map_err(|err| ResourceError {
+    /// Returns a [`EgressError`] if transport construction fails.
+    pub fn connect_resource(config: &MailConfig) -> Result<Self, EgressError> {
+        let transport = build_transport(config).map_err(|err| EgressError {
             code: MAIL_FALLBACK.code.to_owned(),
             message: err.to_string(),
             source: "mail".to_owned(),
@@ -320,8 +320,8 @@ impl MailBackend {
     }
 }
 
-/// Injects the `mail` global (the `mail.js` wrapper, routing through `resource.call`). No
-/// transport is built here — the wired [`Resource`](crate::resource::Resource) adapter serves it.
+/// Injects the `mail` global (the `mail.js` wrapper, routing through `io.call`). No
+/// transport is built here — the wired [`Egress`](crate::egress::Egress) adapter serves it.
 ///
 /// # Errors
 ///

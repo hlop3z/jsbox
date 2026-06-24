@@ -1,7 +1,7 @@
 (function() {
-  // Routes through the generic resource egress (throws a tagged capability error on failure).
+  // Routes through the generic io egress (throws a tagged capability error on failure).
   function call(action, payload) {
-    return resource.call('amq', action, payload || {});
+    return io.call('amq', action, payload || {});
   }
   globalThis.amq = {
     // Publish a batch: amq.send([[routingKey, payload], ...]). Rust owns batching.

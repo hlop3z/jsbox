@@ -24,8 +24,8 @@ use rquickjs::{Ctx, Value as JsValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::egress::EgressError;
 use crate::errors::{ErrorOwner, Fault};
-use crate::resource::ResourceError;
 use crate::sandbox::{self, Collector};
 
 /// JS wrapper — loaded from `src/js/auth.js` at compile time.
@@ -128,11 +128,11 @@ impl AuthError {
         Self::new(AUTH_UNAVAILABLE, format!("auth request failed: {err}"))
     }
 
-    /// Converts into the capability-agnostic [`ResourceError`] for the egress seam (source
+    /// Converts into the capability-agnostic [`EgressError`] for the egress seam (source
     /// `auth`), preserving the classified code / retryable / owner and the structured details.
     #[must_use]
-    pub fn into_resource_error(self) -> ResourceError {
-        ResourceError {
+    pub fn into_resource_error(self) -> EgressError {
+        EgressError {
             code: self.fault.code.to_owned(),
             message: self.message,
             source: "auth".to_owned(),
@@ -171,7 +171,7 @@ struct AuthState {
 /// An `auth` backend: the blocking client + resolved config (with request-scoped discovery
 /// memo) plus its own metrics, exposing a single [`call`](AuthBackend::call).
 ///
-/// The reusable dispatch core behind the in-process [`Resource`](crate::resource::Resource)
+/// The reusable dispatch core behind the in-process [`Egress`](crate::egress::Egress)
 /// adapter. Sync. See `docs/design/resource-egress.md`.
 pub struct AuthBackend {
     /// Shared auth runtime (client + config + request-scoped discovery memo).
@@ -197,16 +197,16 @@ impl fmt::Debug for AuthBackend {
 
 impl AuthBackend {
     /// Builds the blocking HTTP client; a build failure maps to a retryable `AUTH_UNAVAILABLE`
-    /// [`ResourceError`].
+    /// [`EgressError`].
     ///
     /// # Errors
     ///
-    /// Returns a [`ResourceError`] if client construction fails.
-    pub fn connect_resource(config: &AuthConfig) -> Result<Self, ResourceError> {
+    /// Returns a [`EgressError`] if client construction fails.
+    pub fn connect_resource(config: &AuthConfig) -> Result<Self, EgressError> {
         let client = Client::builder()
             .timeout(Duration::from_millis(config.timeout_ms))
             .build()
-            .map_err(|err| ResourceError {
+            .map_err(|err| EgressError {
                 code: AUTH_UNAVAILABLE.code.to_owned(),
                 message: format!("auth client build failed: {err}"),
                 source: "auth".to_owned(),
@@ -231,8 +231,8 @@ impl AuthBackend {
     ///
     /// # Errors
     ///
-    /// Returns a [`ResourceError`] for an infra failure (issuer down / misconfig / bad status).
-    pub fn call(&self, action: &str, token: &str) -> Result<String, ResourceError> {
+    /// Returns a [`EgressError`] for an infra failure (issuer down / misconfig / bad status).
+    pub fn call(&self, action: &str, token: &str) -> Result<String, EgressError> {
         let start = Instant::now();
         let result = dispatch(&self.state, action, token);
         let status = result.as_ref().map_or(0, |outcome| outcome.status);
@@ -252,8 +252,8 @@ impl AuthBackend {
     }
 }
 
-/// Injects the `auth` global (the `auth.js` wrapper, routing through `resource.call`). No client
-/// is built here — the wired [`Resource`](crate::resource::Resource) adapter serves it.
+/// Injects the `auth` global (the `auth.js` wrapper, routing through `io.call`). No client
+/// is built here — the wired [`Egress`](crate::egress::Egress) adapter serves it.
 ///
 /// # Errors
 ///

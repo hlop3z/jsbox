@@ -133,7 +133,7 @@ pub struct EngineConfig {
 /// - `pool_size`: controls number of concurrent execution workers
 ///
 /// Higher values increase parallelism and request throughput, but may increase
-/// resource contention under load.
+/// egress contention under load.
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {

@@ -30,8 +30,8 @@ use serde_json::Value;
 use tokio::runtime::Handle;
 use tokio::time::timeout;
 
+use crate::egress::EgressError;
 use crate::errors::{ErrorOwner, Fault};
-use crate::resource::ResourceError;
 use crate::sandbox::{self, Collector};
 
 /// JS wrapper — loaded from `src/js/mongo.js` at compile time.
@@ -160,11 +160,11 @@ impl MongoError {
         }
     }
 
-    /// Converts into the capability-agnostic [`ResourceError`] for the egress seam (source
+    /// Converts into the capability-agnostic [`EgressError`] for the egress seam (source
     /// `mongo`), preserving the classified code / retryable / owner and the structured details.
     #[must_use]
-    pub fn into_resource_error(self) -> ResourceError {
-        ResourceError {
+    pub fn into_resource_error(self) -> EgressError {
+        EgressError {
             code: self.fault.code.to_owned(),
             message: self.message,
             source: "mongo".to_owned(),
@@ -222,7 +222,7 @@ pub struct MongoDeps<'a> {
 /// [`call`](MongoBackend::call).
 ///
 /// The reusable async dispatch core behind the in-process
-/// [`Resource`](crate::resource::Resource) adapter (and the shape a sidecar hosts). See
+/// [`Egress`](crate::egress::Egress) adapter (and the shape a sidecar hosts). See
 /// `docs/design/resource-egress.md`.
 pub struct MongoBackend {
     /// Runtime handle for `block_on` (the driver is async; the engine thread is blocking).
@@ -256,16 +256,16 @@ impl fmt::Debug for MongoBackend {
 impl MongoBackend {
     /// Builds the client (inside the runtime context so monitors spawn) and anchors the
     /// per-execution deadline. The driver connects lazily, so a build failure here is only a
-    /// bad URI / option error, classified to a [`ResourceError`] (source `mongo`); an
+    /// bad URI / option error, classified to a [`EgressError`] (source `mongo`); an
     /// unreachable database surfaces as a `MONGO_CONNECTION` error on the first op.
     ///
     /// # Errors
     ///
-    /// Returns a [`ResourceError`] if client construction fails.
+    /// Returns a [`EgressError`] if client construction fails.
     pub fn connect_resource(
         config: &MongoConfig,
         deps: &MongoDeps<'_>,
-    ) -> Result<Self, ResourceError> {
+    ) -> Result<Self, EgressError> {
         let uri = build_uri(config);
         let client = deps
             .handle
@@ -320,8 +320,8 @@ impl MongoBackend {
     }
 }
 
-/// Injects the `mongo` global (the `mongo.js` wrapper, routing through `resource.call`). No
-/// client is built here — the wired [`Resource`](crate::resource::Resource) adapter serves it.
+/// Injects the `mongo` global (the `mongo.js` wrapper, routing through `io.call`). No
+/// client is built here — the wired [`Egress`](crate::egress::Egress) adapter serves it.
 ///
 /// # Errors
 ///

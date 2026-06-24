@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::runtime::{Builder, Runtime};
 
+use crate::egress::EgressError;
 use crate::errors::{ErrorOwner, Fault};
-use crate::resource::ResourceError;
 use crate::sandbox::{self, Collector};
 
 /// JS wrapper — loaded from `src/js/amq.js` at compile time.
@@ -171,11 +171,11 @@ impl AmqError {
         }
     }
 
-    /// Converts into the capability-agnostic [`ResourceError`] for the egress seam (source
+    /// Converts into the capability-agnostic [`EgressError`] for the egress seam (source
     /// `amq`), preserving the classified code / retryable / owner.
     #[must_use]
-    pub fn into_resource_error(self) -> ResourceError {
-        ResourceError {
+    pub fn into_resource_error(self) -> EgressError {
+        EgressError {
             code: self.fault.code.to_owned(),
             message: self.message,
             source: "amq".to_owned(),
@@ -205,7 +205,7 @@ struct SendOutcome {
 /// Stateless beyond config — each `send`/`request` opens its own
 /// connection lazily (see module docs), so there is no setup I/O and construction is infallible.
 /// The reusable dispatch core behind the in-process
-/// [`Resource`](crate::resource::Resource) adapter. (Named `AmqProducer`, not `*Backend`, since
+/// [`Egress`](crate::egress::Egress) adapter. (Named `AmqProducer`, not `*Backend`, since
 /// [`AmqBackend`] is already the rabbitmq/nats selector enum.) See
 /// `docs/design/resource-egress.md`.
 #[derive(Debug)]
@@ -248,7 +248,7 @@ impl AmqProducer {
     }
 }
 
-/// Injects the `amq` global (the `amq.js` wrapper, routing through `resource.call`).
+/// Injects the `amq` global (the `amq.js` wrapper, routing through `io.call`).
 ///
 /// # Errors
 ///

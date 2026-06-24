@@ -53,8 +53,8 @@ lettre = { workspace = true, optional = true }
 [features]
 default = ["full"]
 full = ["http", "db", "mongo", "mail", "s3", "redis", "amq", "auth", "inproc"]
-# In-process `Resource` egress adapter (inproc.rs): wires the crate's own driver capabilities
-# behind the egress seam so a consumer can run `resource.call(...)` without a sidecar. Covers all
+# In-process `Egress` egress adapter (inproc.rs): wires the crate's own driver capabilities
+# behind the egress seam so a consumer can run `io.call(...)` without a sidecar. Covers all
 # the driver-backed capabilities (docs/design/resource-egress.md).
 inproc = ["db", "mongo", "mail", "redis", "amq", "auth"]
 # Internal markers (not for direct use): `_io` is enabled by every capability (gates the
@@ -64,11 +64,11 @@ inproc = ["db", "mongo", "mail", "redis", "amq", "auth"]
 _io = []
 _throws = []
 # The driver-backed capabilities no longer enable `_throws`: they map their errors to the
-# `Resource` tag via `into_resource_error` / the always-on `dynamic_fault_json`, not the
+# `Egress` tag via `into_resource_error` / the always-on `dynamic_fault_json`, not the
 # `capability_fault_json` machinery. Only `s3` (pure signing, stays in-engine) still throws via it.
 http = ["dep:reqwest", "_io"]
 # `db` enables `_io` (it owns a metric `Collector`) but NOT `_throws`: it no longer builds the
-# `capability_fault_json` tag itself — it runs through the `Resource` egress, which maps a
+# `capability_fault_json` tag itself — it runs through the `Egress` egress, which maps a
 # `DbError` to the tag via `into_resource_error` / the always-on `dynamic_fault_json`.
 db = [
     "dep:tokio-postgres",

@@ -23,8 +23,8 @@ use tokio_postgres::types::{FromSql, IsNull, ToSql, Type};
 use tokio_postgres::{Client, Connection, NoTls};
 
 use crate::breaker::CircuitBreaker;
+use crate::egress::EgressError;
 use crate::errors::{ErrorOwner, Fault};
-use crate::resource::ResourceError;
 use crate::sandbox::{self, Collector};
 
 /// JS wrapper — loaded from `src/js/db.js` at compile time.
@@ -113,11 +113,11 @@ impl DbError {
         }
     }
 
-    /// Converts into the capability-agnostic [`ResourceError`] for the egress seam (source
+    /// Converts into the capability-agnostic [`EgressError`] for the egress seam (source
     /// `db`), preserving the classified code / retryable / owner and the structured details.
     #[must_use]
-    pub fn into_resource_error(self) -> ResourceError {
-        ResourceError {
+    pub fn into_resource_error(self) -> EgressError {
+        EgressError {
             code: self.fault.code.to_owned(),
             message: self.message,
             source: "db".to_owned(),
@@ -237,7 +237,7 @@ pub struct DbDeps<'a> {
 ///
 /// This is the reusable dispatch core, holding no `QuickJS` state — shared by the in-process
 /// `__db` capability (via [`inject_db`]) and the in-process
-/// [`Resource`](crate::resource::Resource) adapter (`crate::inproc`), and the same shape a
+/// [`Egress`](crate::egress::Egress) adapter (`crate::inproc`), and the same shape a
 /// sidecar will host when the driver moves out of the sandbox process. See
 /// `docs/design/resource-egress.md`.
 pub struct DbBackend {
@@ -299,15 +299,15 @@ impl DbBackend {
         })
     }
 
-    /// Connects, mapping a failure straight to a [`ResourceError`] (source `db`) for the egress
+    /// Connects, mapping a failure straight to a [`EgressError`] (source `db`) for the egress
     /// seam: a breaker-open refusal → retryable `DB_CIRCUIT_OPEN`, any other connect failure →
     /// retryable `DB_CONNECTION`. The adapter surfaces this as a thrown capability error,
     /// identical to a query-time connection drop.
     ///
     /// # Errors
     ///
-    /// Returns a [`ResourceError`] if the breaker is open or the connection fails.
-    pub fn connect_resource(config: &DbConfig, deps: &DbDeps<'_>) -> Result<Self, ResourceError> {
+    /// Returns a [`EgressError`] if the breaker is open or the connection fails.
+    pub fn connect_resource(config: &DbConfig, deps: &DbDeps<'_>) -> Result<Self, EgressError> {
         Self::connect(config, deps).map_err(|err| connect_error_to_resource(err.as_ref()))
     }
 
@@ -338,15 +338,15 @@ impl DbBackend {
     }
 }
 
-/// Maps a `db` connect failure to a [`ResourceError`]: breaker-open → `DB_CIRCUIT_OPEN`,
+/// Maps a `db` connect failure to a [`EgressError`]: breaker-open → `DB_CIRCUIT_OPEN`,
 /// otherwise `DB_CONNECTION` (connect failures are the only outcome of `connect_through_breaker`).
-fn connect_error_to_resource(err: &(dyn Error + Send + Sync + 'static)) -> ResourceError {
+fn connect_error_to_resource(err: &(dyn Error + Send + Sync + 'static)) -> EgressError {
     let fault = if is_circuit_open(err) {
         DB_CIRCUIT_OPEN_FAULT
     } else {
         DB_CONNECTION_FAULT
     };
-    ResourceError {
+    EgressError {
         code: fault.code.to_owned(),
         message: err.to_string(),
         source: "db".to_owned(),
@@ -357,9 +357,9 @@ fn connect_error_to_resource(err: &(dyn Error + Send + Sync + 'static)) -> Resou
 }
 
 /// Injects the `db` global — the `db.js` wrapper, which routes every call through the
-/// `resource.call("db", …)` egress. **No connection happens here**: dispatch is served by the
-/// wired [`Resource`](crate::resource::Resource) (e.g. the in-process [`DbBackend`] adapter, or
-/// a sidecar), so the `resource` global must already be injected. The presence of a `db` config
+/// `io.call("db", …)` egress. **No connection happens here**: dispatch is served by the
+/// wired [`Egress`](crate::egress::Egress) (e.g. the in-process [`DbBackend`] adapter, or
+/// a sidecar), so the `io` global must already be injected. The presence of a `db` config
 /// on the invocation is what gates this wrapper (the engine no longer reads its credentials).
 ///
 /// # Errors
@@ -770,7 +770,7 @@ fn extract_metric_info(action: &str, json: &str) -> (usize, u64, bool) {
 
 #[cfg(test)]
 mod tests {
-    //! Verifies the `DbError` → `ResourceError` mapping used by the in-process egress adapter
+    //! Verifies the `DbError` → `EgressError` mapping used by the in-process egress adapter
     //! preserves the classified fault (code / retryable / owner) and the `db` source tag.
 
     use super::{DB_CONNECTION_FAULT, DbError};

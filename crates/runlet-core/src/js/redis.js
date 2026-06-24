@@ -1,7 +1,7 @@
 (function() {
-  // Routes through the generic resource egress (throws a tagged capability error on failure).
+  // Routes through the generic io egress (throws a tagged capability error on failure).
   function call(action, payload) {
-    return resource.call('redis', action, payload || {});
+    return io.call('redis', action, payload || {});
   }
   globalThis.redis = {
     // strings in/out; get of a missing key returns null. Synchronous (no await).

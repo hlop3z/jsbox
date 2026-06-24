@@ -4,10 +4,10 @@
   // (and so correctly consumes no max_ops slot). No cross-request/global state.
   var cache = {};
 
-  // Routes through the generic resource egress. An infra failure carries `error` and is thrown
-  // by resource.call (tagged); an in-band result ({ ok: ... }) has no `error` → returned as data.
+  // Routes through the generic io egress. An infra failure carries `error` and is thrown
+  // by io.call (tagged); an in-band result ({ ok: ... }) has no `error` → returned as data.
   function call(action, token) {
-    return resource.call('auth', action, { token: token || '' });
+    return io.call('auth', action, { token: token || '' });
   }
 
   function memo(action, token) {

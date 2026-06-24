@@ -23,24 +23,24 @@ use serde_json::Value;
 use serde_json::value::RawValue;
 
 #[cfg(feature = "amq")]
-use crate::amq::{self, AmqConfig, AmqMetric};
+use crate::amq::{self, AmqMetric};
 #[cfg(feature = "auth")]
-use crate::auth::{self, AuthConfig, AuthMetric};
+use crate::auth::{self, AuthMetric};
 use crate::bytecode::{self, BytecodeCache};
 #[cfg(feature = "db")]
-use crate::db::{self, DbConfig, DbMetric};
+use crate::db::{self, DbMetric};
 use crate::decimal;
+use crate::egress::Egress;
 use crate::errors::{self, ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
 #[cfg(feature = "http")]
 use crate::http::{self, HttpMetric};
 #[cfg(feature = "redis")]
-use crate::kv::{self, RedisConfig, RedisMetric};
+use crate::kv::{self, RedisMetric};
 #[cfg(feature = "mail")]
-use crate::mail::{self, MailConfig, MailMetric};
+use crate::mail::{self, MailMetric};
 use crate::modules;
 #[cfg(feature = "mongo")]
-use crate::mongo::{self, MongoConfig, MongoMetric};
-use crate::resource::Resource;
+use crate::mongo::{self, MongoMetric};
 #[cfg(feature = "s3")]
 use crate::s3::{self, S3Config, S3Metric};
 #[cfg(feature = "_io")]
@@ -61,10 +61,10 @@ const MEMORY_MSG: &str = "memory limit exceeded";
 /// `$sys.crypto.uuid`).
 const DETERMINISM_SANITIZER: &str = include_str!("js/determinism.js");
 
-/// The generic `resource.call` egress wrapper — loaded from `src/js/resource.js` at compile
-/// time. `eval`'d after `__resource` is registered, only when a [`Resource`] is wired and the
+/// The generic `io.call` egress wrapper — loaded from `src/js/io.js` at compile
+/// time. `eval`'d after `__io` is registered, only when a [`Egress`] is wired and the
 /// profile is `Full` (the seam is I/O).
-const RESOURCE_WRAPPER: &str = include_str!("js/resource.js");
+const IO_WRAPPER: &str = include_str!("js/io.js");
 
 /// Capability-injection + determinism profile for an execution.
 ///
@@ -81,6 +81,35 @@ pub enum Profile {
     /// consumer-supplied read-of-declared-dependencies hook are available. The
     /// in-transaction logic tier.
     Deterministic,
+}
+
+/// Whether a driver-backed capability's wrapper is injected for an invocation.
+///
+/// A two-variant enum rather than a `bool` so the capability structs don't accumulate a wall of
+/// bools (`clippy::struct_excessive_bools`). Encodes presence only — the connection and
+/// credentials live in the wired [`Egress`] port, resolved operator-side from a logical resource
+/// name, never crossing the engine boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Gate {
+    /// Capability withheld (the default).
+    #[default]
+    Off,
+    /// Capability exposed — its JS wrapper is injected.
+    On,
+}
+
+impl Gate {
+    /// `On` when `enabled`, else `Off`.
+    #[must_use]
+    pub const fn from_enabled(enabled: bool) -> Self {
+        if enabled { Self::On } else { Self::Off }
+    }
+
+    /// Whether the capability is exposed.
+    #[must_use]
+    pub const fn is_on(self) -> bool {
+        matches!(self, Self::On)
+    }
 }
 
 /// Consumer-supplied "read a declared dependency" hook — the deterministic-profile seam.
@@ -113,35 +142,38 @@ pub(crate) struct ExecParams<'a> {
     /// Allowed HTTP hosts (empty = disabled).
     #[cfg(feature = "http")]
     pub(crate) allowed_hosts: &'a [String],
-    /// Database config (None = disabled).
+    /// Whether the `db` capability wrapper is injected (the logical-resource gate). The
+    /// connection + credentials live in the wired [`Egress`] port, not here — so this is
+    /// just an on/off flag, no config crosses the engine boundary.
     #[cfg(feature = "db")]
-    pub(crate) db_config: Option<&'a DbConfig>,
-    /// Mongo (document DB) config (None = disabled).
+    pub(crate) db_enabled: Gate,
+    /// Whether the `mongo` capability wrapper is injected (see `db_enabled`).
     #[cfg(feature = "mongo")]
-    pub(crate) mongo_config: Option<&'a MongoConfig>,
-    /// Mail config (None = disabled).
+    pub(crate) mongo_enabled: Gate,
+    /// Whether the `mail` capability wrapper is injected (see `db_enabled`).
     #[cfg(feature = "mail")]
-    pub(crate) mail_config: Option<&'a MailConfig>,
-    /// S3 config (None = disabled).
+    pub(crate) mail_enabled: Gate,
+    /// S3 config (None = disabled). Stays in-engine (pure `SigV4` presign, no driver), so unlike
+    /// the driver-backed capabilities it still carries its config across the boundary.
     #[cfg(feature = "s3")]
     pub(crate) s3_config: Option<&'a S3Config>,
-    /// Redis config (None = disabled).
+    /// Whether the `redis` capability wrapper is injected (see `db_enabled`).
     #[cfg(feature = "redis")]
-    pub(crate) redis_config: Option<&'a RedisConfig>,
-    /// `RabbitMQ` config (None = disabled).
+    pub(crate) redis_enabled: Gate,
+    /// Whether the `amq` capability wrapper is injected (see `db_enabled`).
     #[cfg(feature = "amq")]
-    pub(crate) amq_config: Option<&'a AmqConfig>,
-    /// Auth (OIDC/IAM) config (None = disabled).
+    pub(crate) amq_enabled: Gate,
+    /// Whether the `auth` capability wrapper is injected (see `db_enabled`).
     #[cfg(feature = "auth")]
-    pub(crate) auth_config: Option<&'a AuthConfig>,
+    pub(crate) auth_enabled: Gate,
     /// `$sys` env/secrets context (None = no env/secrets injected).
     pub(crate) sys_config: Option<&'a SysConfig>,
     /// Read-of-declared-dependencies hook (the deterministic-profile seam). `None` = no
     /// `read` global is injected.
     pub(crate) read_hook: Option<Arc<ReadHook>>,
-    /// I/O egress seam (the `resource.call` global). `None` = no `resource` global is injected.
+    /// I/O egress seam (the `io.call` global). `None` = no `io` global is injected.
     /// Withheld under [`Profile::Deterministic`] (it performs I/O). Not feature-gated.
-    pub(crate) resource: Option<Arc<dyn Resource>>,
+    pub(crate) egress: Option<Arc<dyn Egress>>,
     /// Max operations per execution (also caps the number of `emit` effects).
     pub(crate) max_ops: usize,
     /// Max bytes the handler may return (`0` = off, bounded only by `memory_limit`).
@@ -352,9 +384,9 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         // The egress is I/O, so it is gated to `Profile::Full` exactly like the capabilities —
         // the boundary is enforced here, never trusted to the caller's `Invocation`.
         if params.profile == Profile::Full
-            && let Some(resource) = &params.resource
+            && let Some(egress) = &params.egress
         {
-            inject_resource(&qctx, Arc::clone(resource), params.max_ops)
+            inject_egress(&qctx, Arc::clone(egress), params.max_ops)
                 .map_err(EngineError::internal)?;
         }
         #[cfg(feature = "_io")]
@@ -510,26 +542,26 @@ fn inject_apis(
         );
     }
     #[cfg(feature = "db")]
-    if params.db_config.is_some() {
-        // `db` runs through the `Resource` egress: inject only the `db.js` wrapper (which calls
-        // `resource.call("db", …)`). The connection, breaker, and metrics live in the wired
-        // adapter, not the engine — so this needs `resource` to be present (it is: injected
+    if params.db_enabled.is_on() {
+        // `db` runs through the `Egress` egress: inject only the `db.js` wrapper (which calls
+        // `io.call("db", …)`). The connection, breaker, and metrics live in the wired
+        // adapter, not the engine — so this needs `egress` to be present (it is: injected
         // before `inject_apis`). The collector stays empty here; the adapter surfaces the real
         // `db` metrics (the consumer merges them into the outcome).
         db::inject_wrapper(qctx).map_err(EngineError::internal)?;
         *collectors.db = Some(sandbox::new_collector());
     }
-    // Every driver-backed capability below runs through the `Resource` egress: inject only its
-    // JS wrapper (which calls `resource.call("<cap>", …)`); the connection, deps, and metrics
+    // Every driver-backed capability below runs through the `Egress` egress: inject only its
+    // JS wrapper (which calls `io.call("<cap>", …)`); the connection, deps, and metrics
     // live in the wired adapter, not the engine. The collector stays empty here — the adapter
     // surfaces the real metrics (the consumer merges them into the outcome).
     #[cfg(feature = "mongo")]
-    if params.mongo_config.is_some() {
+    if params.mongo_enabled.is_on() {
         mongo::inject_wrapper(qctx).map_err(EngineError::internal)?;
         *collectors.mongo = Some(sandbox::new_collector());
     }
     #[cfg(feature = "mail")]
-    if params.mail_config.is_some() {
+    if params.mail_enabled.is_on() {
         mail::inject_wrapper(qctx).map_err(EngineError::internal)?;
         *collectors.mail = Some(sandbox::new_collector());
     }
@@ -541,17 +573,17 @@ fn inject_apis(
         );
     }
     #[cfg(feature = "redis")]
-    if params.redis_config.is_some() {
+    if params.redis_enabled.is_on() {
         kv::inject_wrapper(qctx).map_err(EngineError::internal)?;
         *collectors.redis = Some(sandbox::new_collector());
     }
     #[cfg(feature = "amq")]
-    if params.amq_config.is_some() {
+    if params.amq_enabled.is_on() {
         amq::inject_wrapper(qctx).map_err(EngineError::internal)?;
         *collectors.amq = Some(sandbox::new_collector());
     }
     #[cfg(feature = "auth")]
-    if params.auth_config.is_some() {
+    if params.auth_enabled.is_on() {
         auth::inject_wrapper(qctx).map_err(EngineError::internal)?;
         *collectors.auth = Some(sandbox::new_collector());
     }
@@ -691,27 +723,27 @@ fn inject_read(qctx: &Ctx<'_>, hook: Arc<ReadHook>) -> Result<(), rquickjs::Erro
     Ok(())
 }
 
-/// Injects the consumer-supplied `resource.call(name, action, payload)` egress global.
+/// Injects the consumer-supplied `io.call(name, action, payload)` egress global.
 ///
-/// The native `__resource` forwards `(name, action, payload_json)` to the [`Resource`] hook and
+/// The native `__io` forwards `(name, action, payload_json)` to the [`Egress`] hook and
 /// returns either the JSON result verbatim or a `__jsbox` tagged error; the JS wrapper
-/// (`js/resource.js`) throws on the latter so the engine classifies it as a capability error
+/// (`js/io.js`) throws on the latter so the engine classifies it as a capability error
 /// exactly like a built-in capability. Calls are capped at `max_ops` per execution (a shared
 /// counter, mirroring `emit`), so the egress can't be used to bypass the op budget.
-fn inject_resource(
+fn inject_egress(
     qctx: &Ctx<'_>,
-    resource: Arc<dyn Resource>,
+    egress: Arc<dyn Egress>,
     max_ops: usize,
 ) -> Result<(), rquickjs::Error> {
     let used = Arc::new(AtomicUsize::new(0));
-    let resource_fn = Function::new(
+    let egress_fn = Function::new(
         qctx.clone(),
         move |name: String, action: String, payload: String| -> String {
             if used.load(Ordering::Relaxed) >= max_ops {
                 let message = format!("too many operations: limit is {max_ops} per execution");
                 return errors::dynamic_fault_json(&errors::DynamicFault {
                     error: &message,
-                    code: "RESOURCE_OP_LIMIT",
+                    code: "IO_OP_LIMIT",
                     retryable: false,
                     owner: ErrorOwner::Developer,
                     source: "engine",
@@ -719,15 +751,15 @@ fn inject_resource(
                 });
             }
             let _prev = used.fetch_add(1, Ordering::Relaxed);
-            match resource.call(&name, &action, &payload) {
+            match egress.call(&name, &action, &payload) {
                 Ok(json) => json,
                 Err(err) => err.to_tag_json(),
             }
         },
     )?
-    .with_name("__resource")?;
-    qctx.globals().set("__resource", resource_fn)?;
-    let wrapper: JsValue<'_> = qctx.eval(RESOURCE_WRAPPER)?;
+    .with_name("__io")?;
+    qctx.globals().set("__io", egress_fn)?;
+    let wrapper: JsValue<'_> = qctx.eval(IO_WRAPPER)?;
     drop(wrapper);
     Ok(())
 }
@@ -1226,7 +1258,7 @@ mod bytecode_cache_tests {
             profile: Profile::Full,
             sys_config: None,
             read_hook: None,
-            resource: None,
+            egress: None,
             max_ops: 64,
             max_output_size: 0,
         }
@@ -1292,45 +1324,43 @@ mod bytecode_cache_tests {
     }
 }
 
-/// The `Resource` egress seam: a wired resource exposes `resource.call`, success JSON flows
-/// back to the script, a `ResourceError` round-trips as a classified capability error, and the
+/// The `Egress` egress seam: a wired egress exposes `io.call`, success JSON flows
+/// back to the script, a `EgressError` round-trips as a classified capability error, and the
 /// seam is withheld under `Profile::Deterministic`. Gated to the capability-free build so
 /// `ExecParams` has no I/O fields to populate.
 #[cfg(test)]
 #[cfg(not(feature = "_io"))]
-mod resource_tests {
+mod egress_tests {
     use super::{EngineError, ExecOutcome, ExecParams, Profile, run};
-    use crate::resource::{Resource, ResourceError};
+    use crate::egress::{Egress, EgressError};
     use rquickjs::Runtime;
     use std::sync::Arc;
     use std::time::Duration;
 
     /// A stub egress: action `"fail"` returns a retryable `db` error; anything else echoes the
     /// payload back wrapped in `{"echoed": …}` (valid JSON, since the wrapper stringified it).
-    struct EchoResource;
+    struct EchoEgress;
 
-    impl Resource for EchoResource {
+    impl Egress for EchoEgress {
         fn call(
             &self,
             _name: &str,
             action: &str,
             payload_json: &str,
-        ) -> Result<String, ResourceError> {
+        ) -> Result<String, EgressError> {
             if action == "fail" {
-                return Err(
-                    ResourceError::new("db", "DB_TIMEOUT", "backend unreachable").retryable(),
-                );
+                return Err(EgressError::new("db", "DB_TIMEOUT", "backend unreachable").retryable());
             }
             Ok(format!("{{\"echoed\":{payload_json}}}"))
         }
     }
 
-    /// Builds `ExecParams` for the no-capability build with an optional resource egress wired.
+    /// Builds `ExecParams` for the no-capability build with an optional egress port wired.
     fn params<'a>(
         runtime: &'a Runtime,
         script: &'a str,
         profile: Profile,
-        resource: Option<Arc<dyn Resource>>,
+        egress: Option<Arc<dyn Egress>>,
     ) -> ExecParams<'a> {
         ExecParams {
             runtime,
@@ -1342,20 +1372,20 @@ mod resource_tests {
             profile,
             sys_config: None,
             read_hook: None,
-            resource,
+            egress,
             max_ops: 8,
             max_output_size: 0,
         }
     }
 
-    /// A successful `resource.call` returns the backend JSON to the script.
+    /// A successful `io.call` returns the backend JSON to the script.
     #[test]
     fn resource_call_returns_backend_json() {
         let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
         let script =
-            "function handler(ctx) { return json(resource.call('orders', 'ping', { x: ctx.n })); }";
-        let resource: Arc<dyn Resource> = Arc::new(EchoResource);
-        let exec = run(&params(&runtime, script, Profile::Full, Some(resource)))
+            "function handler(ctx) { return json(io.call('orders', 'ping', { x: ctx.n })); }";
+        let egress: Arc<dyn Egress> = Arc::new(EchoEgress);
+        let exec = run(&params(&runtime, script, Profile::Full, Some(egress)))
             .unwrap_or_else(|_err| unreachable!());
         let ExecOutcome::Success(json) = exec.outcome else {
             unreachable!("expected a success outcome");
@@ -1370,33 +1400,33 @@ mod resource_tests {
         );
     }
 
-    /// A `ResourceError` round-trips through the `__jsbox` tag and classifies as a capability
+    /// A `EgressError` round-trips through the `__jsbox` tag and classifies as a capability
     /// error (not a generic script error), preserving the `db` source.
     #[test]
     fn resource_error_classifies_as_capability() {
         let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
-        let script = "function handler(ctx) { return json(resource.call('orders', 'fail', {})); }";
-        let resource: Arc<dyn Resource> = Arc::new(EchoResource);
-        let exec = run(&params(&runtime, script, Profile::Full, Some(resource)))
+        let script = "function handler(ctx) { return json(io.call('orders', 'fail', {})); }";
+        let egress: Arc<dyn Egress> = Arc::new(EchoEgress);
+        let exec = run(&params(&runtime, script, Profile::Full, Some(egress)))
             .unwrap_or_else(|_err| unreachable!());
         assert!(
             matches!(exec.outcome, ExecOutcome::Error(EngineError::Capability(_))),
-            "a ResourceError must surface as a classified capability error"
+            "a EgressError must surface as a classified capability error"
         );
     }
 
-    /// Under `Profile::Deterministic` the egress is withheld: `resource` is undefined even when
+    /// Under `Profile::Deterministic` the egress is withheld: `egress` is undefined even when
     /// one is wired (the boundary is enforced by the engine, not the caller).
     #[test]
     fn resource_withheld_under_deterministic_profile() {
         let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
-        let script = "function handler() { return json(typeof resource); }";
-        let resource: Arc<dyn Resource> = Arc::new(EchoResource);
+        let script = "function handler() { return json(typeof egress); }";
+        let egress: Arc<dyn Egress> = Arc::new(EchoEgress);
         let exec = run(&params(
             &runtime,
             script,
             Profile::Deterministic,
-            Some(resource),
+            Some(egress),
         ))
         .unwrap_or_else(|_err| unreachable!());
         let ExecOutcome::Success(json) = exec.outcome else {

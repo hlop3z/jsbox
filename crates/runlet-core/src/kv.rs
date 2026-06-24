@@ -18,8 +18,8 @@ use rquickjs::{Ctx, Value as JsValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::egress::EgressError;
 use crate::errors::{ErrorOwner, Fault};
-use crate::resource::ResourceError;
 use crate::sandbox::{self, Collector};
 
 /// JS wrapper — loaded from `src/js/redis.js` at compile time.
@@ -96,11 +96,11 @@ impl RedisError {
         }
     }
 
-    /// Converts into the capability-agnostic [`ResourceError`] for the egress seam (source
+    /// Converts into the capability-agnostic [`EgressError`] for the egress seam (source
     /// `redis`), preserving the classified code / retryable / owner.
     #[must_use]
-    pub fn into_resource_error(self) -> ResourceError {
-        ResourceError {
+    pub fn into_resource_error(self) -> EgressError {
+        EgressError {
             code: self.fault.code.to_owned(),
             message: self.message,
             source: "redis".to_owned(),
@@ -134,7 +134,7 @@ fn classify(err: &redis::RedisError) -> Fault {
 /// A connected, JS-free `redis` backend: a shared connection plus its own metrics, exposing a
 /// single string-in/string-out [`call`](RedisBackend::call).
 ///
-/// The reusable dispatch core behind the in-process [`Resource`](crate::resource::Resource)
+/// The reusable dispatch core behind the in-process [`Egress`](crate::egress::Egress)
 /// adapter (and the shape a sidecar hosts). Sync — no runtime handle needed. See
 /// `docs/design/resource-egress.md`.
 pub struct RedisBackend {
@@ -157,13 +157,13 @@ impl fmt::Debug for RedisBackend {
 }
 
 impl RedisBackend {
-    /// Connects, mapping a failure to a [`ResourceError`] (source `redis`): an IO failure →
+    /// Connects, mapping a failure to a [`EgressError`] (source `redis`): an IO failure →
     /// retryable `REDIS_CONNECTION`, else the retryable `REDIS_ERROR` fallback.
     ///
     /// # Errors
     ///
-    /// Returns a [`ResourceError`] if the connection cannot be established.
-    pub fn connect_resource(config: &RedisConfig) -> Result<Self, ResourceError> {
+    /// Returns a [`EgressError`] if the connection cannot be established.
+    pub fn connect_resource(config: &RedisConfig) -> Result<Self, EgressError> {
         match connect(config) {
             Ok(conn) => Ok(Self {
                 conn: Arc::new(Mutex::new(conn)),
@@ -175,7 +175,7 @@ impl RedisBackend {
                 } else {
                     REDIS_FALLBACK
                 };
-                Err(ResourceError {
+                Err(EgressError {
                     code: fault.code.to_owned(),
                     message: err.to_string(),
                     source: "redis".to_owned(),
@@ -206,8 +206,8 @@ impl RedisBackend {
     }
 }
 
-/// Injects the `redis` global (the `redis.js` wrapper, routing through `resource.call`). No
-/// connection happens here — the wired [`Resource`](crate::resource::Resource) adapter serves it.
+/// Injects the `redis` global (the `redis.js` wrapper, routing through `io.call`). No
+/// connection happens here — the wired [`Egress`](crate::egress::Egress) adapter serves it.
 ///
 /// # Errors
 ///

@@ -1,9 +1,9 @@
-//! The [`Resource`] egress port — the consumer-supplied seam for out-of-process I/O.
+//! The [`Egress`] port port — the consumer-supplied seam for out-of-process I/O.
 //!
 //! Symmetric to the deterministic-side read seam ([`crate::engine::ReadHook`]): a consumer
-//! wires one `Resource` implementation and the engine exposes a single
-//! `resource.call(name, action, payload)` global. The core stays domain-agnostic — it forwards
-//! `(name, action, payload_json)` and surfaces the string result, or maps a [`ResourceError`]
+//! wires one `Egress` implementation and the engine exposes a single
+//! `io.call(name, action, payload)` global. The core stays domain-agnostic — it forwards
+//! `(name, action, payload_json)` and surfaces the string result, or maps a [`EgressError`]
 //! into the same `__jsbox` tagged-error JSON a built-in capability throws, so the existing
 //! error-classification path ([`crate::engine`]'s `read_capability_tag`) consumes it unchanged.
 //!
@@ -20,30 +20,30 @@ use crate::errors::{self, DynamicFault, ErrorOwner};
 ///
 /// The implementation maps a logical `name` (e.g. `"orders-db"`) to a concrete backend from
 /// operator config the sandbox never sees, performs the I/O, and returns the result as a JSON
-/// string (`Ok`) or a [`ResourceError`] (`Err`). `Send + Sync` because the pooled runtime is
+/// string (`Ok`) or a [`EgressError`] (`Err`). `Send + Sync` because the pooled runtime is
 /// shared across threads (the `parallel` feature).
-pub trait Resource: Send + Sync {
-    /// Performs one resource call.
+pub trait Egress: Send + Sync {
+    /// Performs one egress call.
     ///
-    /// `name` is the logical resource, `action` the operation (e.g. `"query"`), and
+    /// `name` is the logical egress, `action` the operation (e.g. `"query"`), and
     /// `payload_json` the script's JSON-encoded arguments (untrusted). Returns the JSON result
     /// string on success.
     ///
     /// # Errors
     ///
-    /// Returns a [`ResourceError`] when the backend call fails; the engine renders it into the
+    /// Returns a [`EgressError`] when the backend call fails; the engine renders it into the
     /// `__jsbox` tagged error the JS wrapper throws (surfaced to the script as a thrown
     /// capability error).
-    fn call(&self, name: &str, action: &str, payload_json: &str) -> Result<String, ResourceError>;
+    fn call(&self, name: &str, action: &str, payload_json: &str) -> Result<String, EgressError>;
 }
 
-/// A failed [`Resource::call`], carrying the fields of the `__jsbox` error tag.
+/// A failed [`Egress::call`], carrying the fields of the `__jsbox` error tag.
 ///
 /// `source` should be a known capability tag (`"db"`, `"mongo"`, …) so the engine classifies
 /// the throw as a capability error; an unrecognized source degrades to a script error (the
 /// existing `read_capability_tag` contract).
 #[derive(Debug, Clone)]
-pub struct ResourceError {
+pub struct EgressError {
     /// Stable machine code (e.g. `"DB_TIMEOUT"`).
     pub code: String,
     /// Human-safe cause (surfaced gated, in `debug.raw`).
@@ -59,7 +59,7 @@ pub struct ResourceError {
     pub owner: ErrorOwner,
 }
 
-impl ResourceError {
+impl EgressError {
     /// Builds an error from a source/code/message, defaulting `retryable` to `false`, `owner`
     /// to [`ErrorOwner::Operator`], and `details` to none.
     #[must_use]

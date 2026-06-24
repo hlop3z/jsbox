@@ -158,8 +158,8 @@ struct CapabilityFault {
 }
 
 /// Serializable `__jsbox` tag built from dynamic (caller-owned) string fields, for the
-/// always-on [`crate::resource::Resource`] egress. Mirrors [`CapabilityFault`] but borrows
-/// `&str`/`&Value` and is not feature-gated (the resource seam is core).
+/// always-on [`crate::egress::Egress`] port. Mirrors [`CapabilityFault`] but borrows
+/// `&str`/`&Value` and is not feature-gated (the egress seam is core).
 #[derive(Debug, Serialize)]
 pub(crate) struct DynamicFault<'a> {
     /// Raw cause (the human-readable message — surfaced gated, in `debug.raw`).
@@ -180,10 +180,10 @@ pub(crate) struct DynamicFault<'a> {
 /// Last-resort JSON if a [`DynamicFault`] ever fails to serialize (always compiled).
 const FALLBACK_DYNAMIC_FAULT_JSON: &str = r#"{"error":"internal error","code":"INTERNAL","retryable":true,"owner":"operator","source":"engine"}"#;
 
-/// Builds the `__jsbox` tag JSON for a [`crate::resource::Resource`] egress failure.
+/// Builds the `__jsbox` tag JSON for a [`crate::egress::Egress`] port failure.
 ///
-/// The always-compiled sibling of [`capability_fault_json`]: the resource seam is core (not
-/// feature-gated), and a resource's `source`/`code`/`owner` are supplied dynamically by the
+/// The always-compiled sibling of [`capability_fault_json`]: the egress seam is core (not
+/// feature-gated), and a egress's `source`/`code`/`owner` are supplied dynamically by the
 /// sidecar rather than from a static per-capability [`Fault`]. Produces the identical
 /// `{ error, code, retryable, owner, source, details? }` shape the engine classifies.
 pub(crate) fn dynamic_fault_json(fault: &DynamicFault<'_>) -> String {

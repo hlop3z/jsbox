@@ -1,5 +1,5 @@
-//! In-process [`Resource`] adapter — wires this crate's own driver capabilities behind the
-//! egress seam, so a consumer can run `resource.call(...)` without a sidecar.
+//! In-process [`Egress`] adapter — wires this crate's own driver capabilities behind the
+//! egress seam, so a consumer can run `io.call(...)` without a sidecar.
 //!
 //! Transitional: the JS-free backends it holds (`DbBackend`, `MongoBackend`, …) are exactly what
 //! a sidecar (`fabricd`) will host once the drivers move out of the sandbox process — see
@@ -8,8 +8,8 @@
 //!
 //! Build a fresh adapter per invocation (each backend connects lazily on first use and carries
 //! the per-request deadline) and pass it via
-//! [`Invocation::resource`](crate::host::Invocation::resource). After the run, drain each
-//! capability's metrics (e.g. [`db_metrics`](InProcessResource::db_metrics)) into the response.
+//! [`Invocation::egress`](crate::host::Invocation::egress). After the run, drain each
+//! capability's metrics (e.g. [`db_metrics`](InProcessEgress::db_metrics)) into the response.
 //!
 //! Covers the driver-backed capabilities `db`/`mongo`/`mail`/`redis`/`amq`/`auth`; `http` and
 //! `s3` remain in-engine (no driver / pure signing).
@@ -25,11 +25,11 @@ use crate::amq::{AmqConfig, AmqError, AmqMetric, AmqProducer};
 use crate::auth::{AuthBackend, AuthConfig, AuthMetric};
 use crate::breaker::CircuitBreaker;
 use crate::db::{DbBackend, DbConfig, DbDeps, DbError, DbMetric};
+use crate::egress::{Egress, EgressError};
 use crate::errors::ErrorOwner;
 use crate::kv::{RedisBackend, RedisConfig, RedisError, RedisMetric};
 use crate::mail::{MailBackend, MailConfig, MailError, MailMetric};
 use crate::mongo::{MongoBackend, MongoConfig, MongoDeps, MongoError, MongoMetric};
-use crate::resource::{Resource, ResourceError};
 
 /// Shared runtime/resilience deps for the async backends (`db`, `mongo`). Cloned per backend.
 #[derive(Debug, Clone)]
@@ -44,25 +44,25 @@ pub struct AsyncDeps {
 
 /// An in-process egress holding per-request capability backends.
 ///
-/// Construct with [`InProcessResource::new`] and attach capabilities with the `with_*` setters.
+/// Construct with [`InProcessEgress::new`] and attach capabilities with the `with_*` setters.
 /// Each backend connects lazily on first use.
 #[derive(Default, Debug)]
-pub struct InProcessResource {
-    /// Lazily-connected `db` resource.
+pub struct InProcessEgress {
+    /// Lazily-connected `db` egress.
     db: Option<DbSlot>,
-    /// Lazily-connected `mongo` resource.
+    /// Lazily-connected `mongo` egress.
     mongo: Option<MongoSlot>,
-    /// Lazily-connected `mail` resource.
+    /// Lazily-connected `mail` egress.
     mail: Option<MailSlot>,
-    /// Lazily-connected `redis` resource.
+    /// Lazily-connected `redis` egress.
     redis: Option<RedisSlot>,
-    /// Lazily-connected `auth` resource.
+    /// Lazily-connected `auth` egress.
     auth: Option<AuthSlot>,
-    /// `amq` resource (stateless — connects per call, so built eagerly).
+    /// `amq` egress (stateless — connects per call, so built eagerly).
     amq: Option<AmqProducer>,
 }
 
-impl InProcessResource {
+impl InProcessEgress {
     /// An empty adapter (no capabilities wired).
     #[must_use]
     pub fn new() -> Self {
@@ -182,7 +182,7 @@ impl InProcessResource {
     }
 
     /// `db`: unpack `{sql, params}` and dispatch.
-    fn call_db(&self, action: &str, payload_json: &str) -> Result<String, ResourceError> {
+    fn call_db(&self, action: &str, payload_json: &str) -> Result<String, EgressError> {
         let backend = self
             .db
             .as_ref()
@@ -195,7 +195,7 @@ impl InProcessResource {
     }
 
     /// `mongo`: unpack `{collection, data}` and dispatch.
-    fn call_mongo(&self, action: &str, payload_json: &str) -> Result<String, ResourceError> {
+    fn call_mongo(&self, action: &str, payload_json: &str) -> Result<String, EgressError> {
         let backend = self
             .mongo
             .as_ref()
@@ -208,7 +208,7 @@ impl InProcessResource {
     }
 
     /// `mail`: the payload is the send envelope, passed straight through.
-    fn call_mail(&self, action: &str, payload_json: &str) -> Result<String, ResourceError> {
+    fn call_mail(&self, action: &str, payload_json: &str) -> Result<String, EgressError> {
         let backend = self
             .mail
             .as_ref()
@@ -220,7 +220,7 @@ impl InProcessResource {
     }
 
     /// `redis`: the payload is the op args, passed straight through.
-    fn call_redis(&self, action: &str, payload_json: &str) -> Result<String, ResourceError> {
+    fn call_redis(&self, action: &str, payload_json: &str) -> Result<String, EgressError> {
         let backend = self
             .redis
             .as_ref()
@@ -232,7 +232,7 @@ impl InProcessResource {
     }
 
     /// `amq`: the payload is the batch / request, passed straight through.
-    fn call_amq(&self, action: &str, payload_json: &str) -> Result<String, ResourceError> {
+    fn call_amq(&self, action: &str, payload_json: &str) -> Result<String, EgressError> {
         let backend = self.amq.as_ref().ok_or_else(|| not_configured("amq"))?;
         backend
             .call(action, payload_json)
@@ -240,7 +240,7 @@ impl InProcessResource {
     }
 
     /// `auth`: unpack `{token}` and dispatch (the backend's `call` already maps its errors).
-    fn call_auth(&self, action: &str, payload_json: &str) -> Result<String, ResourceError> {
+    fn call_auth(&self, action: &str, payload_json: &str) -> Result<String, EgressError> {
         let backend = self
             .auth
             .as_ref()
@@ -251,8 +251,8 @@ impl InProcessResource {
     }
 }
 
-impl Resource for InProcessResource {
-    fn call(&self, name: &str, action: &str, payload_json: &str) -> Result<String, ResourceError> {
+impl Egress for InProcessEgress {
+    fn call(&self, name: &str, action: &str, payload_json: &str) -> Result<String, EgressError> {
         match name {
             "db" => self.call_db(action, payload_json),
             "mongo" => self.call_mongo(action, payload_json),
@@ -260,29 +260,29 @@ impl Resource for InProcessResource {
             "redis" => self.call_redis(action, payload_json),
             "amq" => self.call_amq(action, payload_json),
             "auth" => self.call_auth(action, payload_json),
-            other => Err(ResourceError::new(
-                "engine",
-                "RESOURCE_UNKNOWN",
-                format!("unknown resource '{other}'"),
-            )
-            .owner(ErrorOwner::Developer)),
+            other => {
+                Err(
+                    EgressError::new("engine", "IO_UNKNOWN", format!("unknown egress '{other}'"))
+                        .owner(ErrorOwner::Developer),
+                )
+            }
         }
     }
 }
 
-/// Builds the `<CAP>_NOT_CONFIGURED` error for a resource called without its backend wired.
-fn not_configured(name: &str) -> ResourceError {
-    ResourceError::new(
+/// Builds the `<CAP>_NOT_CONFIGURED` error for a egress called without its backend wired.
+fn not_configured(name: &str) -> EgressError {
+    EgressError::new(
         name,
         format!("{}_NOT_CONFIGURED", name.to_uppercase()),
-        format!("{name} resource is not configured"),
+        format!("{name} egress is not configured"),
     )
     .owner(ErrorOwner::Developer)
 }
 
 // -- Lazy slots -------------------------------------------------------------
 
-/// Lazily-connected `db` resource: connect params + a connect-once cell.
+/// Lazily-connected `db` egress: connect params + a connect-once cell.
 #[derive(Debug)]
 struct DbSlot {
     /// Operator connection config.
@@ -290,12 +290,12 @@ struct DbSlot {
     /// Async runtime + breaker + deadline.
     deps: AsyncDeps,
     /// Connect-once cell (`Ok` backend or the classified `Err`, cached for the invocation).
-    backend: OnceLock<Result<DbBackend, ResourceError>>,
+    backend: OnceLock<Result<DbBackend, EgressError>>,
 }
 
 impl DbSlot {
     /// Returns the connected backend, connecting on first use.
-    fn backend(&self) -> Result<&DbBackend, ResourceError> {
+    fn backend(&self) -> Result<&DbBackend, EgressError> {
         let deps = DbDeps {
             handle: &self.deps.handle,
             timeout: self.deps.timeout,
@@ -311,7 +311,7 @@ impl DbSlot {
     }
 }
 
-/// Lazily-connected `mongo` resource.
+/// Lazily-connected `mongo` egress.
 #[derive(Debug)]
 struct MongoSlot {
     /// Operator connection config.
@@ -319,12 +319,12 @@ struct MongoSlot {
     /// Async runtime + deadline (breaker unused).
     deps: AsyncDeps,
     /// Connect-once cell.
-    backend: OnceLock<Result<MongoBackend, ResourceError>>,
+    backend: OnceLock<Result<MongoBackend, EgressError>>,
 }
 
 impl MongoSlot {
     /// Returns the connected backend, connecting on first use.
-    fn backend(&self) -> Result<&MongoBackend, ResourceError> {
+    fn backend(&self) -> Result<&MongoBackend, EgressError> {
         let deps = MongoDeps {
             handle: &self.deps.handle,
             timeout: self.deps.timeout,
@@ -339,18 +339,18 @@ impl MongoSlot {
     }
 }
 
-/// Lazily-built `mail` resource.
+/// Lazily-built `mail` egress.
 #[derive(Debug)]
 struct MailSlot {
     /// Operator config.
     config: MailConfig,
     /// Build-once cell.
-    backend: OnceLock<Result<MailBackend, ResourceError>>,
+    backend: OnceLock<Result<MailBackend, EgressError>>,
 }
 
 impl MailSlot {
     /// Returns the backend, building the transport on first use.
-    fn backend(&self) -> Result<&MailBackend, ResourceError> {
+    fn backend(&self) -> Result<&MailBackend, EgressError> {
         match self
             .backend
             .get_or_init(|| MailBackend::connect_resource(&self.config))
@@ -361,18 +361,18 @@ impl MailSlot {
     }
 }
 
-/// Lazily-connected `redis` resource.
+/// Lazily-connected `redis` egress.
 #[derive(Debug)]
 struct RedisSlot {
     /// Operator config.
     config: RedisConfig,
     /// Connect-once cell.
-    backend: OnceLock<Result<RedisBackend, ResourceError>>,
+    backend: OnceLock<Result<RedisBackend, EgressError>>,
 }
 
 impl RedisSlot {
     /// Returns the connected backend, connecting on first use.
-    fn backend(&self) -> Result<&RedisBackend, ResourceError> {
+    fn backend(&self) -> Result<&RedisBackend, EgressError> {
         match self
             .backend
             .get_or_init(|| RedisBackend::connect_resource(&self.config))
@@ -383,18 +383,18 @@ impl RedisSlot {
     }
 }
 
-/// Lazily-built `auth` resource.
+/// Lazily-built `auth` egress.
 #[derive(Debug)]
 struct AuthSlot {
     /// Operator config.
     config: AuthConfig,
     /// Build-once cell.
-    backend: OnceLock<Result<AuthBackend, ResourceError>>,
+    backend: OnceLock<Result<AuthBackend, EgressError>>,
 }
 
 impl AuthSlot {
     /// Returns the backend, building the client on first use.
-    fn backend(&self) -> Result<&AuthBackend, ResourceError> {
+    fn backend(&self) -> Result<&AuthBackend, EgressError> {
         match self
             .backend
             .get_or_init(|| AuthBackend::connect_resource(&self.config))
@@ -427,9 +427,9 @@ struct DbArgs {
 }
 
 /// Parses the `db` egress payload, defaulting missing/null params to `[]`.
-fn parse_db_payload(payload_json: &str) -> Result<DbArgs, ResourceError> {
+fn parse_db_payload(payload_json: &str) -> Result<DbArgs, EgressError> {
     let payload: DbPayload = serde_json::from_str(payload_json).map_err(|err| {
-        ResourceError::new("db", "DB_BAD_PAYLOAD", format!("invalid db payload: {err}"))
+        EgressError::new("db", "DB_BAD_PAYLOAD", format!("invalid db payload: {err}"))
             .owner(ErrorOwner::Developer)
     })?;
     let params_json = if payload.params.is_null() {
@@ -455,9 +455,9 @@ struct MongoEnvelope {
 }
 
 /// Parses the `mongo` envelope into `(collection, data_json)`, defaulting null data to `{}`.
-fn parse_mongo_payload(payload_json: &str) -> Result<(String, String), ResourceError> {
+fn parse_mongo_payload(payload_json: &str) -> Result<(String, String), EgressError> {
     let envelope: MongoEnvelope = serde_json::from_str(payload_json).map_err(|err| {
-        ResourceError::new(
+        EgressError::new(
             "mongo",
             "MONGO_QUERY",
             format!("invalid mongo payload: {err}"),
@@ -481,9 +481,9 @@ struct AuthPayload {
 }
 
 /// Parses the `auth` payload into the bearer token string.
-fn parse_auth_token(payload_json: &str) -> Result<String, ResourceError> {
+fn parse_auth_token(payload_json: &str) -> Result<String, EgressError> {
     let payload: AuthPayload = serde_json::from_str(payload_json).map_err(|err| {
-        ResourceError::new(
+        EgressError::new(
             "auth",
             "AUTH_REQUEST",
             format!("invalid auth payload: {err}"),
@@ -496,11 +496,11 @@ fn parse_auth_token(payload_json: &str) -> Result<String, ResourceError> {
 #[cfg(test)]
 mod tests {
     //! Covers the adapter glue that needs no live backend: payload unpacking and the
-    //! unknown-/unconfigured-resource errors. Real dispatch is covered by the per-capability
+    //! unknown-/unconfigured-egress errors. Real dispatch is covered by the per-capability
     //! integration suites against live backends.
 
-    use super::{InProcessResource, parse_auth_token, parse_db_payload, parse_mongo_payload};
-    use crate::resource::Resource;
+    use super::{InProcessEgress, parse_auth_token, parse_db_payload, parse_mongo_payload};
+    use crate::egress::Egress;
 
     /// A well-formed `db` payload yields the SQL and a re-serialized params array.
     #[test]
@@ -545,19 +545,19 @@ mod tests {
         assert_eq!(err.source, "db");
     }
 
-    /// An unknown resource name is rejected without touching any backend.
+    /// An unknown egress name is rejected without touching any backend.
     #[test]
     fn unknown_resource_is_rejected() {
-        let err = InProcessResource::new()
+        let err = InProcessEgress::new()
             .call("nope", "ping", "{}")
             .unwrap_err();
-        assert_eq!(err.code, "RESOURCE_UNKNOWN");
+        assert_eq!(err.code, "IO_UNKNOWN");
     }
 
     /// Calling a capability with no backend wired is a clear `*_NOT_CONFIGURED`, not a panic.
     #[test]
     fn unconfigured_capability_is_reported() {
-        let adapter = InProcessResource::new();
+        let adapter = InProcessEgress::new();
         assert_eq!(
             adapter
                 .call("redis", "get", r#"{"key":"k"}"#)

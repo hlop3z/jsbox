@@ -18,26 +18,26 @@ use serde_json::value::RawValue;
 use tokio::runtime::Handle;
 
 #[cfg(feature = "amq")]
-use crate::amq::{AmqConfig, AmqMetric};
+use crate::amq::AmqMetric;
 #[cfg(feature = "auth")]
-use crate::auth::{AuthConfig, AuthMetric};
+use crate::auth::AuthMetric;
 use crate::breaker::CircuitBreaker;
 use crate::bytecode::BytecodeCacheStats;
 use crate::config::EngineConfig;
 #[cfg(feature = "db")]
-use crate::db::{DbConfig, DbMetric};
+use crate::db::DbMetric;
+use crate::egress::Egress;
 use crate::engine::{self, EngineError, ExecOutcome, ExecParams, Profile, ReadHook};
 #[cfg(feature = "http")]
 use crate::http::HttpMetric;
 #[cfg(feature = "redis")]
-use crate::kv::{RedisConfig, RedisMetric};
+use crate::kv::RedisMetric;
 #[cfg(feature = "mail")]
-use crate::mail::{MailConfig, MailMetric};
+use crate::mail::MailMetric;
 #[cfg(feature = "mongo")]
-use crate::mongo::{MongoConfig, MongoMetric};
+use crate::mongo::MongoMetric;
 use crate::pool::{JsPool, PoolStats};
 use crate::registry::ScriptRegistry;
-use crate::resource::Resource;
 #[cfg(feature = "s3")]
 use crate::s3::{S3Config, S3Metric};
 use crate::sys::SysConfig;
@@ -53,24 +53,24 @@ pub struct LogicHost {
     pool: JsPool,
     /// Tokio handle, retained for `LogicHost::new` API stability.
     ///
-    /// Vestigial: every async driver (`db`, `mongo`) now runs in the consumer's `Resource`
+    /// Vestigial: every async driver (`db`, `mongo`) now runs in the consumer's `Egress`
     /// adapter, which carries its own handle (`Handle::current()` on the request thread), so the
     /// engine no longer drives `block_on` and never reads this. Kept on the constructor pending
     /// the step-4/5 cleanup — see `docs/design/resource-egress.md`.
     #[expect(
         dead_code,
-        reason = "async drivers moved to the Resource adapter; kept on new() for API stability"
+        reason = "async drivers moved to the Egress adapter; kept on new() for API stability"
     )]
     handle: Handle,
     /// `db` circuit breaker (Tier 3), shared across invocations. `None` = disabled.
     ///
-    /// Vestigial on the host: `db` connections now happen in the consumer's `Resource` adapter
+    /// Vestigial on the host: `db` connections now happen in the consumer's `Egress` adapter
     /// (the binary's handler holds the breaker via `AppState` and passes it there), so the
     /// engine no longer reads this. Retained on [`LogicHost::new`] for API stability pending the
     /// step-4/5 cleanup — see `docs/design/resource-egress.md`.
     #[expect(
         dead_code,
-        reason = "db connect/breaker moved to the Resource adapter; kept on new() for API stability"
+        reason = "db connect/breaker moved to the Egress adapter; kept on new() for API stability"
     )]
     db_breaker: Option<Arc<CircuitBreaker>>,
     /// Engine sandbox limits (timeout, `max_ops`, output cap, wildcard policy, …).
@@ -109,35 +109,40 @@ pub enum CodeRef<'a> {
 
 /// Which capabilities to inject for an invocation (per-request, opt-in).
 ///
-/// Each `Some` config requests that capability; under [`Profile::Deterministic`] every I/O
-/// capability is withheld regardless (the boundary is enforced by the engine, not trusted
-/// here).
+/// Driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) are plain enable
+/// flags — their connection/credentials live in the wired [`Egress`] port, resolved
+/// operator-side from a logical resource name. `http`/`s3`/`sys` still carry their config
+/// here. Under [`Profile::Deterministic`] every I/O capability is withheld regardless (the
+/// boundary is enforced by the engine, not trusted here).
 #[derive(Debug, Clone, Copy)]
 pub struct CapabilitySet<'a> {
     /// Allowed hosts for the `api` HTTP client (empty = `api` disabled).
     #[cfg(feature = "http")]
     pub allowed_hosts: &'a [String],
-    /// `db` (Postgres-family) config.
+    /// Whether to expose `db`. The connection + credentials live in the wired [`Egress`] port
+    /// (resolved operator-side from a logical resource name), never in the request — so this is
+    /// just an enable flag, no config crosses the engine boundary.
     #[cfg(feature = "db")]
-    pub db: Option<&'a DbConfig>,
-    /// `mongo` (document DB) config.
+    pub db: engine::Gate,
+    /// Whether to expose `mongo` (see [`db`](Self::db)).
     #[cfg(feature = "mongo")]
-    pub mongo: Option<&'a MongoConfig>,
-    /// `mail` (SMTP) config.
+    pub mongo: engine::Gate,
+    /// Whether to expose `mail` (see [`db`](Self::db)).
     #[cfg(feature = "mail")]
-    pub mail: Option<&'a MailConfig>,
-    /// `s3` (object storage) config.
+    pub mail: engine::Gate,
+    /// `s3` (object storage) config. Stays in-engine (pure `SigV4` presign, no driver), so it
+    /// still carries its config here unlike the driver-backed capabilities.
     #[cfg(feature = "s3")]
     pub s3: Option<&'a S3Config>,
-    /// `redis` config.
+    /// Whether to expose `redis` (see [`db`](Self::db)).
     #[cfg(feature = "redis")]
-    pub redis: Option<&'a RedisConfig>,
-    /// `amq` (message broker) config.
+    pub redis: engine::Gate,
+    /// Whether to expose `amq` (see [`db`](Self::db)).
     #[cfg(feature = "amq")]
-    pub amq: Option<&'a AmqConfig>,
-    /// `auth` (OIDC/IAM) config.
+    pub amq: engine::Gate,
+    /// Whether to expose `auth` (see [`db`](Self::db)).
     #[cfg(feature = "auth")]
-    pub auth: Option<&'a AuthConfig>,
+    pub auth: engine::Gate,
     /// `$sys` env/secrets context.
     pub sys: Option<&'a SysConfig>,
 }
@@ -149,19 +154,19 @@ impl CapabilitySet<'_> {
         #[cfg(feature = "http")]
         allowed_hosts: &[],
         #[cfg(feature = "db")]
-        db: None,
+        db: engine::Gate::Off,
         #[cfg(feature = "mongo")]
-        mongo: None,
+        mongo: engine::Gate::Off,
         #[cfg(feature = "mail")]
-        mail: None,
+        mail: engine::Gate::Off,
         #[cfg(feature = "s3")]
         s3: None,
         #[cfg(feature = "redis")]
-        redis: None,
+        redis: engine::Gate::Off,
         #[cfg(feature = "amq")]
-        amq: None,
+        amq: engine::Gate::Off,
         #[cfg(feature = "auth")]
-        auth: None,
+        auth: engine::Gate::Off,
         sys: None,
     };
 }
@@ -170,7 +175,7 @@ impl CapabilitySet<'_> {
 ///
 /// `#[non_exhaustive]`: construct via [`Invocation::inline`] / [`Invocation::registered`] and
 /// the builder setters, never a struct literal. This makes additive fields (like the
-/// `resource` egress) backward-compatible for external consumers (see
+/// `egress` port) backward-compatible for external consumers (see
 /// `crates/runlet-core/CONSUMER_NOTES.md` item #2).
 #[non_exhaustive]
 pub struct Invocation<'a> {
@@ -185,10 +190,10 @@ pub struct Invocation<'a> {
     /// Optional read-of-declared-dependencies hook (the deterministic-profile seam). `None`
     /// = no `read` global. The core never inspects what is read — opaque to it.
     pub read_hook: Option<Arc<ReadHook>>,
-    /// Optional I/O egress seam (the `resource.call` global). `None` = no `resource` global.
+    /// Optional I/O egress seam (the `io.call` global). `None` = no `io` global.
     /// Withheld under [`Profile::Deterministic`] (it performs I/O). The HTTP front passes
     /// `None`; a sidecar-backed consumer wires its egress here.
-    pub resource: Option<Arc<dyn Resource>>,
+    pub egress: Option<Arc<dyn Egress>>,
     /// Partition/tenant namespace for the bytecode cache key. Identical source under different
     /// namespaces gets separate cache entries (no cross-tenant dedup / compile-timing leak).
     /// `None` = global. Typically the caller's partition key.
@@ -208,7 +213,7 @@ impl fmt::Debug for Invocation<'_> {
             .field("profile", &self.profile)
             .field("caps", &self.caps)
             .field("read_hook", &self.read_hook.as_ref().map(|_hook| "<hook>"))
-            .field("resource", &self.resource.as_ref().map(|_res| "<resource>"))
+            .field("egress", &self.egress.as_ref().map(|_res| "<egress>"))
             .field("cache_namespace", &self.cache_namespace)
             .finish()
     }
@@ -216,7 +221,7 @@ impl fmt::Debug for Invocation<'_> {
 
 impl<'a> Invocation<'a> {
     /// An invocation from inline source + JSON context, defaulting to [`Profile::Full`], no
-    /// capabilities ([`CapabilitySet::NONE`]), no read-hook, no resource egress, and the global
+    /// capabilities ([`CapabilitySet::NONE`]), no read-hook, no egress port, and the global
     /// (unnamespaced) bytecode cache. Refine with the builder setters.
     #[must_use]
     pub const fn inline(source: &'a str, context_json: &'a str) -> Self {
@@ -239,7 +244,7 @@ impl<'a> Invocation<'a> {
             profile: Profile::Full,
             caps: CapabilitySet::NONE,
             read_hook: None,
-            resource: None,
+            egress: None,
             cache_namespace: None,
         }
     }
@@ -265,10 +270,10 @@ impl<'a> Invocation<'a> {
         self
     }
 
-    /// Sets the I/O egress resource (the `resource.call` seam).
+    /// Sets the I/O egress port (the `io.call` seam).
     #[must_use]
-    pub fn resource(mut self, resource: Arc<dyn Resource>) -> Self {
-        self.resource = Some(resource);
+    pub fn egress(mut self, egress: Arc<dyn Egress>) -> Self {
+        self.egress = Some(egress);
         self
     }
 
@@ -448,22 +453,22 @@ impl LogicHost {
                 #[cfg(feature = "http")]
                 allowed_hosts: inv.caps.allowed_hosts,
                 #[cfg(feature = "db")]
-                db_config: inv.caps.db,
+                db_enabled: inv.caps.db,
                 #[cfg(feature = "mongo")]
-                mongo_config: inv.caps.mongo,
+                mongo_enabled: inv.caps.mongo,
                 #[cfg(feature = "mail")]
-                mail_config: inv.caps.mail,
+                mail_enabled: inv.caps.mail,
                 #[cfg(feature = "s3")]
                 s3_config: inv.caps.s3,
                 #[cfg(feature = "redis")]
-                redis_config: inv.caps.redis,
+                redis_enabled: inv.caps.redis,
                 #[cfg(feature = "amq")]
-                amq_config: inv.caps.amq,
+                amq_enabled: inv.caps.amq,
                 #[cfg(feature = "auth")]
-                auth_config: inv.caps.auth,
+                auth_enabled: inv.caps.auth,
                 sys_config: inv.caps.sys,
                 read_hook: inv.read_hook,
-                resource: inv.resource,
+                egress: inv.egress,
                 max_ops: self.limits.max_ops,
                 max_output_size: self.limits.max_output_size,
                 #[cfg(any(feature = "http", feature = "s3"))]

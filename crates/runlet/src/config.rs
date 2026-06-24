@@ -7,12 +7,19 @@
 //! Size fields accept human-readable strings: `"8mb"`, `"256kb"`, `"1gb"`,
 //! or plain numbers in bytes: `8388608`.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+use runlet_core::amq::AmqConfig;
+use runlet_core::auth::AuthConfig;
 use runlet_core::config::EngineConfig;
+use runlet_core::db::DbConfig;
+use runlet_core::kv::RedisConfig;
+use runlet_core::mail::MailConfig;
+use runlet_core::mongo::MongoConfig;
 use serde::Deserialize;
 
 /// Top-level configuration. `Default` is derived — every field's default is its type
@@ -62,6 +69,34 @@ pub(crate) struct Config {
     /// loopback bind never needs this.
     #[serde(default)]
     pub(crate) allow_unauthenticated: bool,
+    /// Operator-declared logical resources the egress port resolves by name. A request names
+    /// these in `config.io` (e.g. `{"db":["orders-db"]}`); the endpoint/credentials live here,
+    /// never in the request body — so a compromised caller can only reach the resources the
+    /// operator provisioned, and never learns a credential. Omit to disable all driver-backed
+    /// capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`).
+    #[serde(default)]
+    pub(crate) resources: HashMap<String, ResourceBinding>,
+}
+
+/// One operator-declared logical resource: a driver `kind` tag plus that driver's connection
+/// config (the remaining fields). Internally tagged, so `{"kind":"db","host":…}` selects the
+/// `db` capability and deserializes the rest into its [`DbConfig`]. Boxed variants keep the enum
+/// small (the configs differ widely in size).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ResourceBinding {
+    /// A Postgres-family `db` resource.
+    Db(Box<DbConfig>),
+    /// A `mongo` document-database resource.
+    Mongo(Box<MongoConfig>),
+    /// A `mail`/SMTP resource.
+    Mail(Box<MailConfig>),
+    /// A `redis` resource.
+    Redis(Box<RedisConfig>),
+    /// An `amq` (`RabbitMQ`/`NATS`) message-broker resource.
+    Amq(Box<AmqConfig>),
+    /// An `auth` (OIDC/IAM) resource.
+    Auth(Box<AuthConfig>),
 }
 
 /// HTTP server settings.

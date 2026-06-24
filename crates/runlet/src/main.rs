@@ -138,6 +138,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         );
     }
 
+    // The operator's logical-resource table — endpoints/credentials the request never sees. A
+    // request names these in `config.io`; the handler resolves names to configs (see
+    // `handler::resolve_egress`). Cloned out of `config` (read-only thereafter) into the shared
+    // state. Loaded before the engine config moves into the pool.
+    let resources = Arc::new(config.resources.clone());
+    if !resources.is_empty() {
+        info!("logical resources: {} declared", resources.len());
+    }
+
     let registry = Arc::new(script_registry);
     // The callable logic host owns the pool + resilience wiring; the HTTP front is one
     // consumer of it (a non-HTTP scheduler could be another).
@@ -162,6 +171,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         limiter: Arc::new(Semaphore::new(max_concurrent)),
         partition_limiter,
         db_breaker,
+        resources,
         metrics: Arc::new(Metrics::default()),
         bulkhead_capacity: max_concurrent,
         access_token,

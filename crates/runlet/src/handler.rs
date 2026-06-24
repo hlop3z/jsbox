@@ -1,5 +1,6 @@
 //! HTTP handler for the `/execute` endpoint.
 
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -22,21 +23,23 @@ use runlet_core::auth::{AuthConfig, AuthMetric};
 use runlet_core::breaker::CircuitBreaker;
 use runlet_core::config::EngineConfig;
 use runlet_core::db::{DbConfig, DbMetric};
-use runlet_core::engine::{EngineError, ExecOutcome};
+use runlet_core::egress::Egress;
+use runlet_core::engine::{EngineError, ExecOutcome, Gate};
 use runlet_core::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
 use runlet_core::host::{CapabilitySet, ExecMetrics, Invocation, LogicHost, Outcome};
 use runlet_core::http::HttpMetric;
-use runlet_core::inproc::{AsyncDeps, InProcessResource};
+use runlet_core::inproc::{AsyncDeps, InProcessEgress};
 use runlet_core::kv::{RedisConfig, RedisMetric};
 use runlet_core::mail::{MailConfig, MailMetric};
 use runlet_core::metrics::{Capability, Metrics};
 use runlet_core::mongo::{MongoConfig, MongoMetric};
 use runlet_core::partition::PartitionLimiter;
 use runlet_core::registry::ScriptRegistry;
-use runlet_core::resource::Resource;
 use runlet_core::s3::{S3Config, S3Metric};
 use runlet_core::sandbox;
 use runlet_core::sys::SysConfig;
+
+use crate::config::ResourceBinding;
 
 /// Shared application state for the router: the logic host, the script registry, and
 /// the concurrency bulkhead.
@@ -63,6 +66,10 @@ pub(crate) struct AppState {
     /// `db` circuit breaker (Tier 3): fast-fails requests to a target that keeps failing
     /// to connect. `None` = disabled. Shared across requests.
     pub(crate) db_breaker: Option<Arc<CircuitBreaker>>,
+    /// Operator-declared logical resources, resolved by name from a request's `config.io`
+    /// allowlist. The endpoint/credentials live here (operator-supplied at startup), never in
+    /// the request body — a script names `"orders-db"`, never a host or password.
+    pub(crate) resources: Arc<HashMap<String, ResourceBinding>>,
     /// Process-wide observability counters, exposed at `GET /metrics`.
     pub(crate) metrics: Arc<Metrics>,
     /// Configured global bulkhead capacity, surfaced as the `_total` permit gauge.
@@ -119,35 +126,195 @@ impl ScriptSource {
 }
 
 /// Per-request configuration sent by the caller.
+///
+/// Driver-backed capabilities no longer carry connection config here: the request names
+/// logical resources in [`io`](Self::io) and the endpoint/credentials are resolved
+/// operator-side (see [`AppState::resources`]). `http` (`allowed_hosts`) and `s3` stay
+/// script-controlled/in-engine and keep their config.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RequestConfig {
     /// Allowed hosts for the `api` HTTP client.
     #[serde(default)]
     pub(crate) allowed_hosts: Vec<String>,
-    /// Database connection config (omit to disable `db` in JS).
-    #[serde(default)]
-    pub(crate) db: Option<DbConfig>,
-    /// Mongo (document DB) config (omit to disable `mongo` in JS).
-    #[serde(default)]
-    pub(crate) mongo: Option<MongoConfig>,
-    /// Mail/SMTP config (omit to disable `mail` in JS).
-    #[serde(default)]
-    pub(crate) mail: Option<MailConfig>,
-    /// S3 presigning config (omit to disable `s3` in JS).
+    /// S3 presigning config (omit to disable `s3` in JS). Stays in-engine (pure `SigV4` presign).
     #[serde(default)]
     pub(crate) s3: Option<S3Config>,
-    /// Redis config (omit to disable `redis` in JS).
-    #[serde(default)]
-    pub(crate) redis: Option<RedisConfig>,
-    /// `RabbitMQ` config (omit to disable `amq` in JS).
-    #[serde(default)]
-    pub(crate) amq: Option<AmqConfig>,
-    /// Auth (OIDC/IAM) config (omit to disable `auth` in JS).
-    #[serde(default)]
-    pub(crate) auth: Option<AuthConfig>,
     /// `$sys` env/secrets context (omit to leave `$sys.env`/`$sys.secrets` empty).
     #[serde(default)]
     pub(crate) sys: Option<SysConfig>,
+    /// Logical resources this invocation may reach, keyed by capability kind (e.g.
+    /// `{"db":["orders-db"]}`). Names are resolved to operator config server-side; the request
+    /// never carries endpoints or credentials.
+    #[serde(default)]
+    pub(crate) io: RequestIo,
+}
+
+/// The `config.io` allowlist: which logical resources the script may address, per capability
+/// kind. The interim in-process egress wires the first named resource of each kind (single
+/// binding per kind); the names are resolved to operator config in [`resolve_egress`].
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RequestIo {
+    /// `db` logical resource names.
+    #[serde(default)]
+    pub(crate) db: Vec<String>,
+    /// `mongo` logical resource names.
+    #[serde(default)]
+    pub(crate) mongo: Vec<String>,
+    /// `mail` logical resource names.
+    #[serde(default)]
+    pub(crate) mail: Vec<String>,
+    /// `redis` logical resource names.
+    #[serde(default)]
+    pub(crate) redis: Vec<String>,
+    /// `amq` logical resource names.
+    #[serde(default)]
+    pub(crate) amq: Vec<String>,
+    /// `auth` logical resource names.
+    #[serde(default)]
+    pub(crate) auth: Vec<String>,
+}
+
+/// Operator configs resolved from a request's logical-resource names, ready to wire into the
+/// in-process [`Egress`](runlet_core::egress::Egress). Each field is `Some` only when the
+/// request named a resource of that kind that resolved to a matching operator binding.
+#[derive(Debug, Default)]
+struct ResolvedEgress {
+    /// Resolved `db` connection config.
+    db: Option<DbConfig>,
+    /// Resolved `mongo` config.
+    mongo: Option<MongoConfig>,
+    /// Resolved `mail` config.
+    mail: Option<MailConfig>,
+    /// Resolved `redis` config.
+    redis: Option<RedisConfig>,
+    /// Resolved `amq` config.
+    amq: Option<AmqConfig>,
+    /// Resolved `auth` config.
+    auth: Option<AuthConfig>,
+}
+
+/// Per-capability gates derived from a [`ResolvedEgress`] — which capability wrapper the engine
+/// injects. `Copy` so it can move into the blocking task.
+#[derive(Debug, Clone, Copy)]
+struct CapabilityGates {
+    /// Expose `db`.
+    db: Gate,
+    /// Expose `mongo`.
+    mongo: Gate,
+    /// Expose `mail`.
+    mail: Gate,
+    /// Expose `redis`.
+    redis: Gate,
+    /// Expose `amq`.
+    amq: Gate,
+    /// Expose `auth`.
+    auth: Gate,
+}
+
+impl ResolvedEgress {
+    /// The engine-side capability gates (which wrappers to inject) for this resolution.
+    const fn gates(&self) -> CapabilityGates {
+        CapabilityGates {
+            db: Gate::from_enabled(self.db.is_some()),
+            mongo: Gate::from_enabled(self.mongo.is_some()),
+            mail: Gate::from_enabled(self.mail.is_some()),
+            redis: Gate::from_enabled(self.redis.is_some()),
+            amq: Gate::from_enabled(self.amq.is_some()),
+            auth: Gate::from_enabled(self.auth.is_some()),
+        }
+    }
+}
+
+/// Resolves a request's logical-resource names against the operator resource table, returning
+/// the concrete configs to wire. The request only ever names resources — credentials live in
+/// the table — so this is the trust boundary: an unknown name or a kind mismatch is rejected
+/// (boxed status + envelope) before any I/O is wired.
+fn resolve_egress(
+    table: &HashMap<String, ResourceBinding>,
+    io: &RequestIo,
+) -> Result<ResolvedEgress, Box<(u16, ErrorEnvelope)>> {
+    Ok(ResolvedEgress {
+        db: pick(table, &io.db, "db", |binding| match binding {
+            ResourceBinding::Db(cfg) => Some((**cfg).clone()),
+            ResourceBinding::Mongo(_)
+            | ResourceBinding::Mail(_)
+            | ResourceBinding::Redis(_)
+            | ResourceBinding::Amq(_)
+            | ResourceBinding::Auth(_) => None,
+        })?,
+        mongo: pick(table, &io.mongo, "mongo", |binding| match binding {
+            ResourceBinding::Mongo(cfg) => Some((**cfg).clone()),
+            ResourceBinding::Db(_)
+            | ResourceBinding::Mail(_)
+            | ResourceBinding::Redis(_)
+            | ResourceBinding::Amq(_)
+            | ResourceBinding::Auth(_) => None,
+        })?,
+        mail: pick(table, &io.mail, "mail", |binding| match binding {
+            ResourceBinding::Mail(cfg) => Some((**cfg).clone()),
+            ResourceBinding::Db(_)
+            | ResourceBinding::Mongo(_)
+            | ResourceBinding::Redis(_)
+            | ResourceBinding::Amq(_)
+            | ResourceBinding::Auth(_) => None,
+        })?,
+        redis: pick(table, &io.redis, "redis", |binding| match binding {
+            ResourceBinding::Redis(cfg) => Some((**cfg).clone()),
+            ResourceBinding::Db(_)
+            | ResourceBinding::Mongo(_)
+            | ResourceBinding::Mail(_)
+            | ResourceBinding::Amq(_)
+            | ResourceBinding::Auth(_) => None,
+        })?,
+        amq: pick(table, &io.amq, "amq", |binding| match binding {
+            ResourceBinding::Amq(cfg) => Some((**cfg).clone()),
+            ResourceBinding::Db(_)
+            | ResourceBinding::Mongo(_)
+            | ResourceBinding::Mail(_)
+            | ResourceBinding::Redis(_)
+            | ResourceBinding::Auth(_) => None,
+        })?,
+        auth: pick(table, &io.auth, "auth", |binding| match binding {
+            ResourceBinding::Auth(cfg) => Some((**cfg).clone()),
+            ResourceBinding::Db(_)
+            | ResourceBinding::Mongo(_)
+            | ResourceBinding::Mail(_)
+            | ResourceBinding::Redis(_)
+            | ResourceBinding::Amq(_) => None,
+        })?,
+    })
+}
+
+/// Resolves the first named resource of one kind: `None` when none is named; the extracted
+/// config when the name exists and matches the kind; a `400` envelope when the name is unknown
+/// or is the wrong kind. Only the first name is wired (single binding per kind, interim).
+fn pick<T>(
+    table: &HashMap<String, ResourceBinding>,
+    names: &[String],
+    kind: &str,
+    extract: impl Fn(&ResourceBinding) -> Option<T>,
+) -> Result<Option<T>, Box<(u16, ErrorEnvelope)>> {
+    let Some(name) = names.first() else {
+        return Ok(None);
+    };
+    let Some(binding) = table.get(name) else {
+        return Err(Box::new((
+            400,
+            request_error(
+                "RESOURCE_NOT_FOUND",
+                format!("no operator resource named `{name}`"),
+            ),
+        )));
+    };
+    extract(binding).map(Some).ok_or_else(|| {
+        Box::new((
+            400,
+            request_error(
+                "RESOURCE_KIND_MISMATCH",
+                format!("resource `{name}` is not a {kind} resource"),
+            ),
+        ))
+    })
 }
 
 /// Returns a clone of the pre-allocated default context.
@@ -284,38 +451,37 @@ fn raw_null_ref() -> &'static RawValue {
     &RAW_NULL
 }
 
-/// Builds the per-request in-process [`Resource`] egress: wires every driver-backed capability
-/// present in the request config (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`), each connecting
+/// Builds the per-request in-process [`Egress`](runlet_core::egress::Egress) port from the
+/// operator configs already resolved from the request's logical-resource names — each connecting
 /// lazily on first use. Dispatch + metrics live in the adapter rather than the engine. `timeout`
 /// is the per-execution wall-clock budget (the per-query/op deadline).
 fn build_egress(
     state: &AppState,
-    config: &RequestConfig,
-    db_config: Option<DbConfig>,
+    resolved: &ResolvedEgress,
     timeout: Duration,
-) -> Arc<InProcessResource> {
+) -> Arc<InProcessEgress> {
     let deps = AsyncDeps {
         handle: Handle::current(),
         breaker: state.db_breaker.clone(),
         timeout,
     };
-    let mut adapter = InProcessResource::new();
-    if let Some(cfg) = db_config {
+    let mut adapter = InProcessEgress::new();
+    if let Some(cfg) = resolved.db.clone() {
         adapter = adapter.with_db(cfg, &deps);
     }
-    if let Some(cfg) = config.mongo.clone() {
+    if let Some(cfg) = resolved.mongo.clone() {
         adapter = adapter.with_mongo(cfg, &deps);
     }
-    if let Some(cfg) = config.mail.clone() {
+    if let Some(cfg) = resolved.mail.clone() {
         adapter = adapter.with_mail(cfg);
     }
-    if let Some(cfg) = config.redis.clone() {
+    if let Some(cfg) = resolved.redis.clone() {
         adapter = adapter.with_redis(cfg);
     }
-    if let Some(cfg) = config.amq.clone() {
+    if let Some(cfg) = resolved.amq.clone() {
         adapter = adapter.with_amq(cfg);
     }
-    if let Some(cfg) = config.auth.clone() {
+    if let Some(cfg) = resolved.auth.clone() {
         adapter = adapter.with_auth(cfg);
     }
     Arc::new(adapter)
@@ -326,7 +492,7 @@ fn build_egress(
 /// come from the engine outcome. A no-op unless the run produced an outcome.
 fn merge_egress_metrics(
     result: &mut Result<Result<Outcome, EngineError>, task::JoinError>,
-    adapter: &InProcessResource,
+    adapter: &InProcessEgress,
 ) {
     if let Ok(Ok(exec)) = result {
         exec.metrics.db = adapter.db_metrics();
@@ -343,6 +509,10 @@ fn merge_egress_metrics(
 /// Takes `Result<Json<…>, JsonRejection>` rather than `Json<…>` so a malformed or
 /// type-confused body is handled here as a structured `{data, error, meta}` envelope,
 /// instead of axum short-circuiting with its default plain-text rejection.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear request pipeline: auth → resolve egress → admit → execute → respond"
+)]
 pub(crate) async fn execute(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -404,9 +574,27 @@ pub(crate) async fn execute(
     }
 
     let context_json: String = context.get().into();
-    // Tier 0: clamp the per-request db statement_timeout to the operator ceiling. Clone so
-    // `config` stays whole for `build_egress` to read the other capability configs.
-    let db_config = clamp_db(config.db.clone(), engine_cfg.max_statement_timeout_ms);
+    // Trust boundary: resolve the request's logical-resource names (`config.io`) to operator
+    // configs. The request names resources; credentials live operator-side. An unknown name or
+    // kind mismatch is rejected here, before any I/O is wired.
+    let mut resolved = match resolve_egress(&state.resources, &config.io) {
+        Ok(resolved) => resolved,
+        Err(rejection) => {
+            state.metrics.record_rejection();
+            let (status, envelope) = *rejection;
+            let meta = Meta::new(trace_id, script_bytes, context_bytes, 0)
+                .with_key(key)
+                .with_partition(partition);
+            return system_error_response(envelope, status, meta);
+        }
+    };
+    // Tier 0: clamp the resolved db statement_timeout to the operator ceiling.
+    if let Some(db) = resolved.db.as_mut() {
+        clamp_statement_timeout(db, engine_cfg.max_statement_timeout_ms);
+    }
+    // Engine-side capability gates (which wrappers to inject) — derived before the configs move
+    // into the egress adapter, so they can travel into the blocking task as a `Copy` value.
+    let gates = resolved.gates();
 
     let start = Instant::now();
 
@@ -428,13 +616,13 @@ pub(crate) async fn execute(
     // runtime, and applies the SSRF/wildcard policy. The HTTP front always runs the
     // full-capability profile with no read-hook.
     let host = state.host.clone();
-    // The in-process `Resource` egress: `db` now dispatches through it (connecting lazily on
+    // The in-process `Egress` egress: `db` now dispatches through it (connecting lazily on
     // first use and recording its own metrics), instead of the engine connecting directly. A
     // fresh adapter per request carries the per-execution deadline; its `db` metrics are merged
     // into the outcome after the run. The concrete `Arc` is kept here for that drain; a `dyn`
     // clone moves into the blocking task.
-    let adapter = build_egress(&state, &config, db_config.clone(), engine_cfg.timeout());
-    let adapter_run: Arc<dyn Resource> = Arc::<InProcessResource>::clone(&adapter);
+    let adapter = build_egress(&state, &resolved, engine_cfg.timeout());
+    let adapter_run: Arc<dyn Egress> = Arc::<InProcessEgress>::clone(&adapter);
     // Namespace the bytecode cache by partition so identical source from different tenants
     // never shares an entry (no cross-tenant dedup / compile-timing leak). Cloned because the
     // closure is `move` and `partition` is still needed for `meta` after the await.
@@ -442,21 +630,21 @@ pub(crate) async fn execute(
     let mut result = task::spawn_blocking(move || -> Result<Outcome, EngineError> {
         // `Invocation` is `#[non_exhaustive]`; build via the constructor + builder setters. The
         // HTTP front always runs the full-capability profile (the default) with no read-hook, so
-        // only `caps`, the resource egress, and the cache namespace differ from the defaults.
+        // only `caps`, the egress port, and the cache namespace differ from the defaults.
         let caps = CapabilitySet {
             allowed_hosts: &config.allowed_hosts,
-            db: db_config.as_ref(),
-            mongo: config.mongo.as_ref(),
-            mail: config.mail.as_ref(),
+            db: gates.db,
+            mongo: gates.mongo,
+            mail: gates.mail,
             s3: config.s3.as_ref(),
-            redis: config.redis.as_ref(),
-            amq: config.amq.as_ref(),
-            auth: config.auth.as_ref(),
+            redis: gates.redis,
+            amq: gates.amq,
+            auth: gates.auth,
             sys: config.sys.as_ref(),
         };
         let mut invocation = Invocation::inline(source.as_str(), &context_json)
             .caps(caps)
-            .resource(adapter_run);
+            .egress(adapter_run);
         if let Some(namespace) = cache_ns.as_deref() {
             invocation = invocation.cache_namespace(namespace);
         }
@@ -765,15 +953,6 @@ fn enforce_auth(state: &AppState, headers: &HeaderMap) -> Option<AxumResponse> {
     Some(unauthorized_response())
 }
 
-/// Applies the Tier 0 statement-timeout clamp to a request's db config (if present), so jsbox
-/// never issues an unbounded `SET` (see `docs/design/resilience.md`).
-fn clamp_db(mut db: Option<DbConfig>, ceiling_ms: u64) -> Option<DbConfig> {
-    if let Some(cfg) = db.as_mut() {
-        clamp_statement_timeout(cfg, ceiling_ms);
-    }
-    db
-}
-
 /// Returns `true` if the request carries a valid `Authorization: Bearer <token>` matching
 /// `expected`. The token is compared in constant time so a timing side-channel can't recover
 /// it byte by byte.
@@ -935,5 +1114,82 @@ mod tests {
             !request_authorized(&with_auth("Bearer "), "s3cret"),
             "empty token rejected"
         );
+    }
+}
+
+#[cfg(test)]
+mod egress_resolution_tests {
+    //! The trust boundary: the operator resource table (internally-tagged `ResourceBinding`
+    //! serde) and `resolve_egress` mapping a request's logical names → operator configs,
+    //! rejecting unknown names and kind mismatches.
+
+    use super::{RequestIo, ResourceBinding, resolve_egress};
+    use std::collections::HashMap;
+
+    /// Builds an operator table with one `db` (`orders-db`) and one `redis` (`cache`) binding,
+    /// parsed from JSON — exercising the internally-tagged `kind` deserialization.
+    fn table() -> HashMap<String, ResourceBinding> {
+        serde_json::from_str(
+            r#"{
+                "orders-db": {"kind":"db","host":"h","user":"u","password":"p","database":"d"},
+                "cache": {"kind":"redis","url":"redis://h:6379"}
+            }"#,
+        )
+        .unwrap_or_else(|err| unreachable!("valid resource table: {err}"))
+    }
+
+    /// A `RequestIo` naming the given db resources (other kinds empty).
+    fn io_db(names: &[&str]) -> RequestIo {
+        RequestIo {
+            db: names.iter().map(|name| (*name).to_owned()).collect(),
+            ..RequestIo::default()
+        }
+    }
+
+    /// The `kind` tag selects the variant: `orders-db` deserializes as a `db` binding.
+    #[test]
+    fn binding_kind_tag_selects_variant() {
+        let table = table();
+        assert!(
+            matches!(table.get("orders-db"), Some(ResourceBinding::Db(_))),
+            "orders-db is a db binding"
+        );
+        assert!(
+            matches!(table.get("cache"), Some(ResourceBinding::Redis(_))),
+            "cache is a redis binding"
+        );
+    }
+
+    /// A named, kind-matching resource resolves and its gate turns on.
+    #[test]
+    fn resolves_named_db() {
+        let resolved = resolve_egress(&table(), &io_db(&["orders-db"]))
+            .unwrap_or_else(|_err| unreachable!("orders-db resolves"));
+        assert!(resolved.db.is_some(), "db config resolved");
+        assert!(resolved.gates().db.is_on(), "db gate on");
+        assert!(resolved.mongo.is_none(), "unnamed kinds stay off");
+    }
+
+    /// No names → nothing resolved, every gate off.
+    #[test]
+    fn empty_io_resolves_nothing() {
+        let resolved = resolve_egress(&table(), &RequestIo::default())
+            .unwrap_or_else(|_err| unreachable!("empty io is ok"));
+        assert!(resolved.db.is_none() && !resolved.gates().db.is_on());
+    }
+
+    /// An unknown resource name is rejected `400 RESOURCE_NOT_FOUND` (the request named a
+    /// resource the operator never provisioned).
+    #[test]
+    fn unknown_name_is_rejected() {
+        let err = resolve_egress(&table(), &io_db(&["nope"])).unwrap_err();
+        assert_eq!(err.0, 400, "unknown name is a 400");
+    }
+
+    /// Naming a resource of the wrong kind (a redis under `db`) is rejected.
+    #[test]
+    fn kind_mismatch_is_rejected() {
+        let err = resolve_egress(&table(), &io_db(&["cache"])).unwrap_err();
+        assert_eq!(err.0, 400, "kind mismatch is a 400");
     }
 }

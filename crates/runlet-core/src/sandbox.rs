@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 // `Serialize` is only needed by `check_op_limit`, which the per-op-limited native capabilities
-// use — everything with a native FFI fn except `db` (now op-limited by the engine's `__resource`
+// use — everything with a native FFI fn except `db` (now op-limited by the engine's `__io`
 // seam). That set is `http` plus the throwing capabilities (`_throws`).
 #[cfg(any(feature = "http", feature = "_throws"))]
 use serde::Serialize;
@@ -77,7 +77,7 @@ pub fn validate_input_sizes(
 }
 
 /// The number of operations recorded so far (used by a backend with a sub-cap, e.g. `mail`'s
-/// `max_sends`, to enforce it against its own metrics — the generic `__resource` seam already
+/// `max_sends`, to enforce it against its own metrics — the generic `__io` seam already
 /// enforces the global `max_ops`).
 #[cfg(feature = "mail")]
 pub(crate) fn op_count<T>(collector: &Collector<T>) -> usize {

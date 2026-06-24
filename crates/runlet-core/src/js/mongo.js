@@ -1,9 +1,9 @@
 (function() {
-  // Routes through the generic resource egress; the collection is packed into the payload
-  // ({collection, data}) since resource.call carries a single payload. resource.call throws a
-  // tagged capability error on failure (see js/resource.js).
+  // Routes through the generic io egress; the collection is packed into the payload
+  // ({collection, data}) since io.call carries a single payload. io.call throws a
+  // tagged capability error on failure (see js/io.js).
   function call(action, collection, payload) {
-    return resource.call('mongo', action, { collection: collection, data: payload || {} });
+    return io.call('mongo', action, { collection: collection, data: payload || {} });
   }
   globalThis.mongo = {
     // Reads. Values that don't fit a JS number exactly come back as strings
