@@ -64,13 +64,17 @@ On branch **`resource-egress`** (off `main`). Commits so far:
 
 ## What's next (in order)
 
-1. **Close the in-box step (Task #5):** the hard cut broke `test_simple.py` (it sends `config.db`
-   + generates `.test-run/config.json`). Update the harness to emit an operator `resources` map
-   and send `config.io`. Update `docs/` + `README.md` for the new surface + the io/Egress rename.
-   Then **live-smoke** db end-to-end (operator config.json `resources` → request `config.io` →
-   `db.query`) via Docker on the `jsbox_default` network. This is the only unproven runtime path
-   (static + unit-tested, not yet end-to-end).
-2. **Step 4a (Task #2) — extract crates:** `fabric-wire` (`EgressError`/`ErrorOwner`/`DynamicFault`
+0. **DONE this session (commits cf7c54b/7269bd7):** docs swept to `config.io` + operator
+   `resources` (README + capability beginner docs + deployment trust framing); **live-smoke of
+   the new db path passed end-to-end** (query/params/metrics + `RESOURCE_NOT_FOUND` reject +
+   gate-withheld `typeof db === undefined`). The new request surface is now proven in reality.
+1. **DEFERRED (Task #5) — rewrite `test_simple.py`:** the hard cut broke it (sends `config.db`).
+   Needs: a generated server `config.json` `resources` map covering the named variants the tests
+   use (pg, pg-maxrows5, pg-badhost, pg-fast, pgbouncer, redis, mongo, nats, nats-fast, mail);
+   rewrite ~40 `config={"db":creds}` → `config={"io":{"db":["name"]}}`; and **reorder `main()`**
+   so auth/zitadel discovery runs BEFORE `_start_server` (their creds must be in the startup
+   resources map). Needs all backends to verify. Not blocking the architecture.
+2. **Step 4a (Task #2) — extract crates (THE ACTIVE NEXT STEP):** `fabric-wire` (`EgressError`/`ErrorOwner`/`DynamicFault`
    + wire envelope) + `fabric-backends` (the six `*Backend`s + `BackendSet`/`InProcessEgress`);
    drivers leave `runlet-core`, shrinking its feature matrix. runlet still uses in-process
    `BackendSet` (provable no-op). Keep `inject_wrapper` + `js/*.js` in runlet-core. Re-sweep cfg.
