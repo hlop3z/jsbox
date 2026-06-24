@@ -27,6 +27,8 @@ pub mod errors;
 pub mod host;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "inproc")]
+pub mod inproc;
 #[cfg(feature = "redis")]
 pub mod kv;
 #[cfg(feature = "mail")]
@@ -38,6 +40,7 @@ pub mod mongo;
 pub mod partition;
 pub mod pool;
 pub mod registry;
+pub mod resource;
 #[cfg(feature = "s3")]
 pub mod s3;
 pub mod sandbox;
@@ -54,3 +57,7 @@ pub use crate::engine::{EngineError, ExecOutcome, Profile, ReadHook};
 pub use crate::host::{
     CapabilitySet, CodeRef, ExecMetrics, HostSettings, Invocation, LogicHost, Outcome,
 };
+#[cfg(feature = "inproc")]
+pub use crate::inproc::InProcessResource;
+pub use crate::pool::PoolStats;
+pub use crate::resource::{Resource, ResourceError};

@@ -35,8 +35,9 @@ use crate::kv::{RedisConfig, RedisMetric};
 use crate::mail::{MailConfig, MailMetric};
 #[cfg(feature = "mongo")]
 use crate::mongo::{MongoConfig, MongoMetric};
-use crate::pool::JsPool;
+use crate::pool::{JsPool, PoolStats};
 use crate::registry::ScriptRegistry;
+use crate::resource::Resource;
 #[cfg(feature = "s3")]
 use crate::s3::{S3Config, S3Metric};
 use crate::sys::SysConfig;
@@ -50,17 +51,26 @@ use crate::sys::SysConfig;
 pub struct LogicHost {
     /// Pool of pre-warmed runtimes.
     pool: JsPool,
-    /// Tokio handle driving async capability I/O from the blocking thread (`block_on`).
-    /// Only consumed by the async `db`/`mongo` drivers.
-    #[cfg_attr(
-        not(any(feature = "db", feature = "mongo")),
-        expect(dead_code, reason = "only the async db/mongo drivers use the runtime handle")
+    /// Tokio handle, retained for `LogicHost::new` API stability.
+    ///
+    /// Vestigial: every async driver (`db`, `mongo`) now runs in the consumer's `Resource`
+    /// adapter, which carries its own handle (`Handle::current()` on the request thread), so the
+    /// engine no longer drives `block_on` and never reads this. Kept on the constructor pending
+    /// the step-4/5 cleanup — see `docs/design/resource-egress.md`.
+    #[expect(
+        dead_code,
+        reason = "async drivers moved to the Resource adapter; kept on new() for API stability"
     )]
     handle: Handle,
     /// `db` circuit breaker (Tier 3), shared across invocations. `None` = disabled.
-    #[cfg_attr(
-        not(feature = "db"),
-        expect(dead_code, reason = "the circuit breaker only guards the db capability")
+    ///
+    /// Vestigial on the host: `db` connections now happen in the consumer's `Resource` adapter
+    /// (the binary's handler holds the breaker via `AppState` and passes it there), so the
+    /// engine no longer reads this. Retained on [`LogicHost::new`] for API stability pending the
+    /// step-4/5 cleanup — see `docs/design/resource-egress.md`.
+    #[expect(
+        dead_code,
+        reason = "db connect/breaker moved to the Resource adapter; kept on new() for API stability"
     )]
     db_breaker: Option<Arc<CircuitBreaker>>,
     /// Engine sandbox limits (timeout, `max_ops`, output cap, wildcard policy, …).
@@ -68,7 +78,10 @@ pub struct LogicHost {
     /// Relax the SSRF private-IP block (`api`/`s3`) — local-dev only.
     #[cfg_attr(
         not(any(feature = "http", feature = "s3")),
-        expect(dead_code, reason = "the SSRF relax flag only applies to http/s3 targets")
+        expect(
+            dead_code,
+            reason = "the SSRF relax flag only applies to http/s3 targets"
+        )
     )]
     allow_private_targets: bool,
     /// Registry resolving `CodeRef::Registered` keys to source.
@@ -154,6 +167,12 @@ impl CapabilitySet<'_> {
 }
 
 /// One execution request.
+///
+/// `#[non_exhaustive]`: construct via [`Invocation::inline`] / [`Invocation::registered`] and
+/// the builder setters, never a struct literal. This makes additive fields (like the
+/// `resource` egress) backward-compatible for external consumers (see
+/// `crates/runlet-core/CONSUMER_NOTES.md` item #2).
+#[non_exhaustive]
 pub struct Invocation<'a> {
     /// Inline source or a registry key.
     pub code: CodeRef<'a>,
@@ -166,6 +185,10 @@ pub struct Invocation<'a> {
     /// Optional read-of-declared-dependencies hook (the deterministic-profile seam). `None`
     /// = no `read` global. The core never inspects what is read — opaque to it.
     pub read_hook: Option<Arc<ReadHook>>,
+    /// Optional I/O egress seam (the `resource.call` global). `None` = no `resource` global.
+    /// Withheld under [`Profile::Deterministic`] (it performs I/O). The HTTP front passes
+    /// `None`; a sidecar-backed consumer wires its egress here.
+    pub resource: Option<Arc<dyn Resource>>,
     /// Partition/tenant namespace for the bytecode cache key. Identical source under different
     /// namespaces gets separate cache entries (no cross-tenant dedup / compile-timing leak).
     /// `None` = global. Typically the caller's partition key.
@@ -185,8 +208,75 @@ impl fmt::Debug for Invocation<'_> {
             .field("profile", &self.profile)
             .field("caps", &self.caps)
             .field("read_hook", &self.read_hook.as_ref().map(|_hook| "<hook>"))
+            .field("resource", &self.resource.as_ref().map(|_res| "<resource>"))
             .field("cache_namespace", &self.cache_namespace)
             .finish()
+    }
+}
+
+impl<'a> Invocation<'a> {
+    /// An invocation from inline source + JSON context, defaulting to [`Profile::Full`], no
+    /// capabilities ([`CapabilitySet::NONE`]), no read-hook, no resource egress, and the global
+    /// (unnamespaced) bytecode cache. Refine with the builder setters.
+    #[must_use]
+    pub const fn inline(source: &'a str, context_json: &'a str) -> Self {
+        Self::with_defaults(CodeRef::Inline(source), context_json)
+    }
+
+    /// An invocation from a registry key + JSON context, with the same defaults as
+    /// [`inline`](Self::inline).
+    #[must_use]
+    pub const fn registered(key: &'a str, context_json: &'a str) -> Self {
+        Self::with_defaults(CodeRef::Registered(key), context_json)
+    }
+
+    /// Shared constructor: all optionals at their defaults.
+    #[must_use]
+    const fn with_defaults(code: CodeRef<'a>, context_json: &'a str) -> Self {
+        Self {
+            code,
+            context_json,
+            profile: Profile::Full,
+            caps: CapabilitySet::NONE,
+            read_hook: None,
+            resource: None,
+            cache_namespace: None,
+        }
+    }
+
+    /// Sets the capability + determinism profile.
+    #[must_use]
+    pub const fn profile(mut self, profile: Profile) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// Sets the capabilities to inject (subject to the profile).
+    #[must_use]
+    pub const fn caps(mut self, caps: CapabilitySet<'a>) -> Self {
+        self.caps = caps;
+        self
+    }
+
+    /// Sets the read-of-declared-dependencies hook (the deterministic-profile seam).
+    #[must_use]
+    pub fn read_hook(mut self, hook: Arc<ReadHook>) -> Self {
+        self.read_hook = Some(hook);
+        self
+    }
+
+    /// Sets the I/O egress resource (the `resource.call` seam).
+    #[must_use]
+    pub fn resource(mut self, resource: Arc<dyn Resource>) -> Self {
+        self.resource = Some(resource);
+        self
+    }
+
+    /// Sets the bytecode-cache partition namespace (per-tenant cache isolation).
+    #[must_use]
+    pub const fn cache_namespace(mut self, namespace: &'a str) -> Self {
+        self.cache_namespace = Some(namespace);
+        self
     }
 }
 
@@ -298,6 +388,26 @@ impl LogicHost {
         self.pool.bytecode_cache().stats()
     }
 
+    /// A snapshot of runtime-pool liveness (configured size, idle, in-flight) — for
+    /// operability gauges and for a consumer to drive its own graceful-drain loop.
+    #[must_use]
+    pub fn pool_stats(&self) -> PoolStats {
+        self.pool.stats()
+    }
+
+    /// Begins graceful teardown: subsequent [`run`](Self::run) calls are rejected with
+    /// [`EngineError::ShuttingDown`], and the warm runtime pool is disposed (in-flight
+    /// executions finish and dispose their own runtime on release).
+    ///
+    /// This is a **surface-agnostic primitive**: signal handling and in-flight draining stay
+    /// with the consumer. A typical sequence is `host.shutdown()`, then poll
+    /// [`pool_stats`](Self::pool_stats) until `in_flight` reaches zero (bounded by the
+    /// wall-clock cap) before exiting. Because each capability uses a fresh per-request connection (torn down
+    /// at request end), no long-lived driver connections outlive the host. Idempotent; cheap.
+    pub fn shutdown(&self) {
+        self.pool.shutdown();
+    }
+
     /// Executes one [`Invocation`] on a pooled runtime.
     ///
     /// # Errors
@@ -307,11 +417,17 @@ impl LogicHost {
     /// acquisition failure, or context creation ([`EngineError::Internal`]). Every
     /// in-execution failure is carried in `Outcome.result` as [`ExecOutcome::Error`].
     pub fn run(&self, inv: Invocation<'_>) -> Result<Outcome, EngineError> {
+        if !self.pool.is_accepting() {
+            return Err(EngineError::ShuttingDown);
+        }
+
         let source = match inv.code {
             CodeRef::Inline(source) => ResolvedSource::Borrowed(source),
-            CodeRef::Registered(key) => ResolvedSource::Owned(self.registry.get(key).ok_or_else(
-                || EngineError::ScriptNotFound(format!("no registered script for key `{key}`")),
-            )?),
+            CodeRef::Registered(key) => {
+                ResolvedSource::Owned(self.registry.get(key).ok_or_else(|| {
+                    EngineError::ScriptNotFound(format!("no registered script for key `{key}`"))
+                })?)
+            }
         };
 
         let runtime = self
@@ -325,10 +441,6 @@ impl LogicHost {
                 runtime: &runtime,
                 bytecode_cache: Some(self.pool.bytecode_cache()),
                 cache_namespace: inv.cache_namespace,
-                #[cfg(any(feature = "db", feature = "mongo"))]
-                tokio_handle: &self.handle,
-                #[cfg(feature = "db")]
-                db_breaker: self.db_breaker.as_deref(),
                 script: source.as_str(),
                 context_json: inv.context_json,
                 timeout: self.limits.timeout(),
@@ -351,6 +463,7 @@ impl LogicHost {
                 auth_config: inv.caps.auth,
                 sys_config: inv.caps.sys,
                 read_hook: inv.read_hook,
+                resource: inv.resource,
                 max_ops: self.limits.max_ops,
                 max_output_size: self.limits.max_output_size,
                 #[cfg(any(feature = "http", feature = "s3"))]

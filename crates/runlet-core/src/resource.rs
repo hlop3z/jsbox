@@ -1,0 +1,107 @@
+//! The [`Resource`] egress port — the consumer-supplied seam for out-of-process I/O.
+//!
+//! Symmetric to the deterministic-side read seam ([`crate::engine::ReadHook`]): a consumer
+//! wires one `Resource` implementation and the engine exposes a single
+//! `resource.call(name, action, payload)` global. The core stays domain-agnostic — it forwards
+//! `(name, action, payload_json)` and surfaces the string result, or maps a [`ResourceError`]
+//! into the same `__jsbox` tagged-error JSON a built-in capability throws, so the existing
+//! error-classification path ([`crate::engine`]'s `read_capability_tag`) consumes it unchanged.
+//!
+//! This is the seam that lets driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/
+//! `auth`) move out of the sandbox process and behind a sidecar — see
+//! `docs/design/resource-egress.md`. Unlike the I/O capabilities it is **not** cargo-feature
+//! gated: a deterministic-only core (`--no-default-features`) can still wire an egress.
+
+use serde_json::Value;
+
+use crate::errors::{self, DynamicFault, ErrorOwner};
+
+/// Consumer-supplied I/O egress.
+///
+/// The implementation maps a logical `name` (e.g. `"orders-db"`) to a concrete backend from
+/// operator config the sandbox never sees, performs the I/O, and returns the result as a JSON
+/// string (`Ok`) or a [`ResourceError`] (`Err`). `Send + Sync` because the pooled runtime is
+/// shared across threads (the `parallel` feature).
+pub trait Resource: Send + Sync {
+    /// Performs one resource call.
+    ///
+    /// `name` is the logical resource, `action` the operation (e.g. `"query"`), and
+    /// `payload_json` the script's JSON-encoded arguments (untrusted). Returns the JSON result
+    /// string on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ResourceError`] when the backend call fails; the engine renders it into the
+    /// `__jsbox` tagged error the JS wrapper throws (surfaced to the script as a thrown
+    /// capability error).
+    fn call(&self, name: &str, action: &str, payload_json: &str) -> Result<String, ResourceError>;
+}
+
+/// A failed [`Resource::call`], carrying the fields of the `__jsbox` error tag.
+///
+/// `source` should be a known capability tag (`"db"`, `"mongo"`, …) so the engine classifies
+/// the throw as a capability error; an unrecognized source degrades to a script error (the
+/// existing `read_capability_tag` contract).
+#[derive(Debug, Clone)]
+pub struct ResourceError {
+    /// Stable machine code (e.g. `"DB_TIMEOUT"`).
+    pub code: String,
+    /// Human-safe cause (surfaced gated, in `debug.raw`).
+    pub message: String,
+    /// Originating capability/source tag (`"db"`, `"mail"`, …).
+    pub source: String,
+    /// Structured, ungated machine context (e.g. `{"sqlstate":"40001"}`). Boxed to keep the
+    /// error small (`clippy::result_large_err`) since it rides in a `Result` across the trait.
+    pub details: Option<Box<Value>>,
+    /// Retry hint.
+    pub retryable: bool,
+    /// Responsible owner; defaults to [`ErrorOwner::Operator`].
+    pub owner: ErrorOwner,
+}
+
+impl ResourceError {
+    /// Builds an error from a source/code/message, defaulting `retryable` to `false`, `owner`
+    /// to [`ErrorOwner::Operator`], and `details` to none.
+    #[must_use]
+    pub fn new<S, C, M>(source: S, code: C, message: M) -> Self
+    where
+        S: Into<String>,
+        C: Into<String>,
+        M: Into<String>,
+    {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            source: source.into(),
+            details: None,
+            retryable: false,
+            owner: ErrorOwner::Operator,
+        }
+    }
+
+    /// Marks the error retryable (builder-style).
+    #[must_use]
+    pub const fn retryable(mut self) -> Self {
+        self.retryable = true;
+        self
+    }
+
+    /// Sets the responsible owner (builder-style).
+    #[must_use]
+    pub const fn owner(mut self, owner: ErrorOwner) -> Self {
+        self.owner = owner;
+        self
+    }
+
+    /// Renders this error as the `__jsbox` tagged-error JSON the JS wrapper throws.
+    pub(crate) fn to_tag_json(&self) -> String {
+        errors::dynamic_fault_json(&DynamicFault {
+            error: &self.message,
+            code: &self.code,
+            retryable: self.retryable,
+            owner: self.owner,
+            source: &self.source,
+            details: self.details.as_deref(),
+        })
+    }
+}

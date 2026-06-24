@@ -14,8 +14,7 @@
 //! contract is unchanged. The driver connects lazily, so a dead database surfaces as a
 //! capability throw (`MONGO_CONNECTION`) on first use rather than at inject time.
 
-use std::error::Error;
-use std::sync::Arc;
+use std::fmt::{self, Formatter};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -25,13 +24,14 @@ use mongodb::error::{Error as DriverError, ErrorKind};
 use mongodb::options::ClientOptions;
 use mongodb::{Client, Collection, Database};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use rquickjs::{Ctx, Function, Value as JsValue};
+use rquickjs::{Ctx, Value as JsValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::runtime::Handle;
 use tokio::time::timeout;
 
-use crate::errors::{self, ErrorOwner, ErrorSource, Fault};
+use crate::errors::{ErrorOwner, Fault};
+use crate::resource::ResourceError;
 use crate::sandbox::{self, Collector};
 
 /// JS wrapper — loaded from `src/js/mongo.js` at compile time.
@@ -39,8 +39,6 @@ const MONGO_WRAPPER: &str = include_str!("js/mongo.js");
 
 /// Fallback fault for any mongo error without a more specific classification.
 const MONGO_FALLBACK: Fault = Fault::new("MONGO_ERROR", true, ErrorOwner::Operator);
-/// Fault for exhausting the per-execution op budget mid-call.
-const MONGO_OP_LIMIT: Fault = Fault::new("MONGO_OP_LIMIT", false, ErrorOwner::Developer);
 /// Fault for a failure to reach / authenticate with the database.
 const MONGO_CONNECTION: Fault = Fault::new("MONGO_CONNECTION", true, ErrorOwner::Operator);
 /// Fault for an operation that exceeded the client-side execution deadline (Tier 2).
@@ -125,7 +123,7 @@ impl MongoMetric {
 
 /// A mongo error carrying its classified [`Fault`], the raw message, and structured details.
 #[derive(Debug)]
-struct MongoError {
+pub struct MongoError {
     /// Classified code + retry hint + owner.
     fault: Fault,
     /// Raw driver/usage message.
@@ -161,6 +159,20 @@ impl MongoError {
             details: None,
         }
     }
+
+    /// Converts into the capability-agnostic [`ResourceError`] for the egress seam (source
+    /// `mongo`), preserving the classified code / retryable / owner and the structured details.
+    #[must_use]
+    pub fn into_resource_error(self) -> ResourceError {
+        ResourceError {
+            code: self.fault.code.to_owned(),
+            message: self.message,
+            source: "mongo".to_owned(),
+            details: self.details.map(Box::new),
+            retryable: self.fault.retryable,
+            owner: self.fault.owner,
+        }
+    }
 }
 
 /// Maps a `mongodb` driver error to a [`Fault`] by its kind (above the "stringify cliff").
@@ -170,9 +182,9 @@ fn classify(err: &DriverError) -> Fault {
         reason = "mongodb::error::ErrorKind is #[non_exhaustive]; a fallback arm is required"
     )]
     match &*err.kind {
-        ErrorKind::Authentication { .. }
-        | ErrorKind::Io(_)
-        | ErrorKind::ServerSelection { .. } => MONGO_CONNECTION,
+        ErrorKind::Authentication { .. } | ErrorKind::Io(_) | ErrorKind::ServerSelection { .. } => {
+            MONGO_CONNECTION
+        }
         ErrorKind::Write(_) | ErrorKind::BulkWrite(_) => MONGO_WRITE,
         ErrorKind::Command(cmd) => classify_command(cmd.code),
         ErrorKind::InvalidArgument { .. } => MONGO_QUERY,
@@ -192,86 +204,132 @@ const fn classify_command(code: i32) -> Fault {
 
 // -- Public API -------------------------------------------------------------
 
-/// Runtime and deadline dependencies threaded into [`inject_mongo`]. Grouped so the
-/// inject entry point stays within the argument-count limit (mirrors `db::DbDeps`).
-pub(crate) struct MongoDeps<'a> {
+/// Runtime and deadline dependencies threaded into [`MongoBackend::connect_resource`].
+///
+/// Grouped so the connect entry point stays within the argument-count limit (mirrors
+/// [`crate::db::DbDeps`]). Public so a consumer building a [`MongoBackend`] directly (the
+/// in-process adapter, or a sidecar) can supply them.
+#[derive(Debug)]
+pub struct MongoDeps<'a> {
     /// Runtime handle driving the async driver from this blocking thread (`block_on`).
-    pub(crate) handle: &'a Handle,
+    pub handle: &'a Handle,
     /// Execution wall-clock budget, used as the per-operation client-side deadline (Tier 2).
-    pub(crate) timeout: Duration,
+    pub timeout: Duration,
 }
 
-/// Connects (lazily) and injects the `mongo` global. Returns a metrics collector.
+/// A connected, JS-free `mongo` backend: the database handle (driver connects lazily) plus the
+/// per-execution deadline, limits, and its own metrics, exposing a single
+/// [`call`](MongoBackend::call).
+///
+/// The reusable async dispatch core behind the in-process
+/// [`Resource`](crate::resource::Resource) adapter (and the shape a sidecar hosts). See
+/// `docs/design/resource-egress.md`.
+pub struct MongoBackend {
+    /// Runtime handle for `block_on` (the driver is async; the engine thread is blocking).
+    handle: Handle,
+    /// Per-request database handle (the driver connects lazily on first op).
+    database: Database,
+    /// Absolute client-side deadline applied to every operation (Tier 2).
+    deadline: Instant,
+    /// Max documents returned by a read.
+    max_docs: usize,
+    /// Server-side per-operation time limit.
+    op_timeout: Duration,
+    /// Per-operation metrics, drained by the consumer into `meta.mongo_requests`.
+    metrics: Collector<MongoMetric>,
+}
+
+impl fmt::Debug for MongoBackend {
+    #[expect(
+        clippy::renamed_function_params,
+        reason = "`formatter` reads better than the trait's single-char `f` (min_ident_chars)"
+    )]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MongoBackend")
+            .field("deadline", &self.deadline)
+            .field("max_docs", &self.max_docs)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MongoBackend {
+    /// Builds the client (inside the runtime context so monitors spawn) and anchors the
+    /// per-execution deadline. The driver connects lazily, so a build failure here is only a
+    /// bad URI / option error, classified to a [`ResourceError`] (source `mongo`); an
+    /// unreachable database surfaces as a `MONGO_CONNECTION` error on the first op.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ResourceError`] if client construction fails.
+    pub fn connect_resource(
+        config: &MongoConfig,
+        deps: &MongoDeps<'_>,
+    ) -> Result<Self, ResourceError> {
+        let uri = build_uri(config);
+        let client = deps
+            .handle
+            .block_on(async {
+                let options = ClientOptions::parse(&uri).await?;
+                Client::with_options(options)
+            })
+            .map_err(|err: DriverError| MongoError::from_driver(&err).into_resource_error())?;
+        Ok(Self {
+            database: client.database(&config.database),
+            handle: deps.handle.clone(),
+            deadline: Instant::now()
+                .checked_add(deps.timeout)
+                .unwrap_or_else(Instant::now),
+            max_docs: config.max_docs,
+            op_timeout: Duration::from_millis(config.op_timeout_ms),
+            metrics: sandbox::new_collector(),
+        })
+    }
+
+    /// Runs one mongo action on `collection`, records a [`MongoMetric`], returns the result JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`MongoError`] on a driver failure, deadline elapse, or a usage error.
+    pub fn call(
+        &self,
+        action: &str,
+        collection: &str,
+        payload_json: &str,
+    ) -> Result<String, MongoError> {
+        let start = Instant::now();
+        let mongo_call = MongoCall {
+            handle: &self.handle,
+            database: &self.database,
+            deadline: self.deadline,
+            max_docs: self.max_docs,
+            op_timeout: self.op_timeout,
+        };
+        let result = dispatch(&mongo_call, action, collection, payload_json);
+        sandbox::record(
+            &self.metrics,
+            build_metric(action, result.as_ref().ok(), start),
+        );
+        result.map(|outcome| outcome.json)
+    }
+
+    /// Drains (clones out) the metrics recorded so far.
+    #[must_use]
+    pub fn drain_metrics(&self) -> Vec<MongoMetric> {
+        sandbox::drain(Some(&self.metrics))
+    }
+}
+
+/// Injects the `mongo` global (the `mongo.js` wrapper, routing through `resource.call`). No
+/// client is built here — the wired [`Resource`](crate::resource::Resource) adapter serves it.
 ///
 /// # Errors
 ///
-/// Returns an error if client construction or registration fails. The driver connects
-/// lazily, so an unreachable database does not fail here — it surfaces as a
-/// `MONGO_CONNECTION` throw on the first operation.
-pub(crate) fn inject_mongo(
-    qctx: &Ctx<'_>,
-    config: &MongoConfig,
-    deps: &MongoDeps<'_>,
-    max_ops: usize,
-) -> Result<Collector<MongoMetric>, Box<dyn Error + Send + Sync>> {
-    let uri = build_uri(config);
-    // Parse + construct inside the runtime context so the driver's background monitors spawn.
-    let client = deps.handle.block_on(async {
-        let options = ClientOptions::parse(&uri).await?;
-        Client::with_options(options)
-    })?;
-    let database = client.database(&config.database);
-    let max_docs = config.max_docs;
-    let op_timeout = Duration::from_millis(config.op_timeout_ms);
-    let deadline = Instant::now()
-        .checked_add(deps.timeout)
-        .unwrap_or_else(Instant::now);
-    let handle_owned = deps.handle.clone();
-
-    let metrics: Collector<MongoMetric> = sandbox::new_collector();
-    let metrics_clone = Arc::clone(&metrics);
-
-    let mongo_fn = Function::new(
-        qctx.clone(),
-        move |action: String, collection: String, payload_json: String| -> String {
-            if let Err(err) = sandbox::check_op_limit(&metrics_clone, max_ops) {
-                return errors::capability_fault_json(
-                    ErrorSource::Mongo,
-                    MONGO_OP_LIMIT,
-                    &err,
-                    None,
-                );
-            }
-            let start = Instant::now();
-            let call = MongoCall {
-                handle: &handle_owned,
-                database: &database,
-                deadline,
-                max_docs,
-                op_timeout,
-            };
-            let result = dispatch(&call, &action, &collection, &payload_json);
-            let metric = build_metric(&action, result.as_ref().ok(), start);
-            sandbox::record(&metrics_clone, metric);
-            match result {
-                Ok(outcome) => outcome.json,
-                Err(mongo_err) => errors::capability_fault_json(
-                    ErrorSource::Mongo,
-                    mongo_err.fault,
-                    &mongo_err.message,
-                    mongo_err.details,
-                ),
-            }
-        },
-    )?
-    .with_name("__mongo")?;
-
-    qctx.globals().set("__mongo", mongo_fn)?;
-
+/// Returns an error if evaluating the wrapper fails.
+pub(crate) fn inject_wrapper(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     let wrapper: JsValue<'_> = qctx.eval(MONGO_WRAPPER)?;
     drop(wrapper);
-
-    Ok(metrics)
+    Ok(())
 }
 
 /// Builds a `mongodb://` connection URI for a single operator-supplied host.
@@ -687,9 +745,7 @@ fn bson_to_json(value: Bson) -> Value {
         reason = "mongodb::bson::Bson is #[non_exhaustive]; exotic BSON types fall back to a string"
     )]
     match value {
-        Bson::Double(num) => {
-            serde_json::Number::from_f64(num).map_or(Value::Null, Value::Number)
-        }
+        Bson::Double(num) => serde_json::Number::from_f64(num).map_or(Value::Null, Value::Number),
         Bson::String(text) => Value::String(text),
         Bson::Boolean(flag) => Value::Bool(flag),
         Bson::Null => Value::Null,

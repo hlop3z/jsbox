@@ -1,13 +1,9 @@
 (function() {
+  // Routes every db operation through the generic `resource.call("db", …)` egress (which packs
+  // {sql, params} into one payload, dispatches to the wired Resource backend, and throws a
+  // tagged capability error on failure — see js/resource.js). No direct native call here.
   function call(action, sql, params) {
-    var raw = __db(action, sql, JSON.stringify(params || []));
-    var res = JSON.parse(raw);
-    if (res && res.error) {
-      var err = new Error(res.error);
-      err.__jsbox = res; // { error, code, retryable, source } — engine classifies off this
-      throw err;
-    }
-    return res;
+    return resource.call('db', action, { sql: sql, params: params || [] });
   }
   globalThis.db = {
     query: function(sql, params) { return call('query', sql, params); },

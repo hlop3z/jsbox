@@ -1,13 +1,7 @@
 (function() {
+  // Routes through the generic resource egress (throws a tagged capability error on failure).
   function call(action, payload) {
-    var raw = __amq(action, JSON.stringify(payload || {}));
-    var res = JSON.parse(raw);
-    if (res && res.error) {
-      var err = new Error(res.error);
-      err.__jsbox = res; // { error, code, retryable, owner, source } — engine classifies off this
-      throw err;
-    }
-    return res;
+    return resource.call('amq', action, payload || {});
   }
   globalThis.amq = {
     // Publish a batch: amq.send([[routingKey, payload], ...]). Rust owns batching.

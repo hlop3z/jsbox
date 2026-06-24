@@ -11,12 +11,15 @@ use std::error::Error;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use std::fmt::{self, Formatter};
+
 use redis::{Commands, Connection};
-use rquickjs::{Ctx, Function, Value as JsValue};
+use rquickjs::{Ctx, Value as JsValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::errors::{self, ErrorOwner, ErrorSource, Fault};
+use crate::errors::{ErrorOwner, Fault};
+use crate::resource::ResourceError;
 use crate::sandbox::{self, Collector};
 
 /// JS wrapper — loaded from `src/js/redis.js` at compile time.
@@ -24,8 +27,6 @@ const KV_WRAPPER: &str = include_str!("js/redis.js");
 
 /// Fallback fault for a Redis error with no specific predicate.
 const REDIS_FALLBACK: Fault = Fault::new("REDIS_ERROR", true, ErrorOwner::Operator);
-/// Fault for exhausting the per-execution op budget mid-call.
-const REDIS_OP_LIMIT: Fault = Fault::new("REDIS_OP_LIMIT", false, ErrorOwner::Developer);
 /// Fault for a Redis command that timed out.
 const REDIS_TIMEOUT: Fault = Fault::new("REDIS_TIMEOUT", true, ErrorOwner::Operator);
 /// Fault for a failure to reach Redis (inject-time connect, or a mid-session IO error).
@@ -70,7 +71,7 @@ impl RedisMetric {
 
 /// A Redis error carrying its classified [`Fault`] plus the raw message.
 #[derive(Debug)]
-struct RedisError {
+pub struct RedisError {
     /// Classified code + retry hint + owner.
     fault: Fault,
     /// Raw driver/usage message.
@@ -92,6 +93,20 @@ impl RedisError {
         Self {
             fault: classify(err),
             message: err.to_string(),
+        }
+    }
+
+    /// Converts into the capability-agnostic [`ResourceError`] for the egress seam (source
+    /// `redis`), preserving the classified code / retryable / owner.
+    #[must_use]
+    pub fn into_resource_error(self) -> ResourceError {
+        ResourceError {
+            code: self.fault.code.to_owned(),
+            message: self.message,
+            source: "redis".to_owned(),
+            details: None,
+            retryable: self.fault.retryable,
+            owner: self.fault.owner,
         }
     }
 }
@@ -116,59 +131,91 @@ fn classify(err: &redis::RedisError) -> Fault {
 
 // -- Public API -------------------------------------------------------------
 
-/// Connects and injects the `redis` global. Returns a metrics collector.
+/// A connected, JS-free `redis` backend: a shared connection plus its own metrics, exposing a
+/// single string-in/string-out [`call`](RedisBackend::call).
+///
+/// The reusable dispatch core behind the in-process [`Resource`](crate::resource::Resource)
+/// adapter (and the shape a sidecar hosts). Sync — no runtime handle needed. See
+/// `docs/design/resource-egress.md`.
+pub struct RedisBackend {
+    /// Shared connection (one per request; serialized through the mutex).
+    conn: Arc<Mutex<Connection>>,
+    /// Per-operation metrics, drained by the consumer into `meta.redis_requests`.
+    metrics: Collector<RedisMetric>,
+}
+
+impl fmt::Debug for RedisBackend {
+    #[expect(
+        clippy::renamed_function_params,
+        reason = "`formatter` reads better than the trait's single-char `f` (min_ident_chars)"
+    )]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RedisBackend")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RedisBackend {
+    /// Connects, mapping a failure to a [`ResourceError`] (source `redis`): an IO failure →
+    /// retryable `REDIS_CONNECTION`, else the retryable `REDIS_ERROR` fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ResourceError`] if the connection cannot be established.
+    pub fn connect_resource(config: &RedisConfig) -> Result<Self, ResourceError> {
+        match connect(config) {
+            Ok(conn) => Ok(Self {
+                conn: Arc::new(Mutex::new(conn)),
+                metrics: sandbox::new_collector(),
+            }),
+            Err(err) => {
+                let fault = if is_connect_error(err.as_ref()) {
+                    REDIS_CONNECTION_FAULT
+                } else {
+                    REDIS_FALLBACK
+                };
+                Err(ResourceError {
+                    code: fault.code.to_owned(),
+                    message: err.to_string(),
+                    source: "redis".to_owned(),
+                    details: None,
+                    retryable: fault.retryable,
+                    owner: fault.owner,
+                })
+            }
+        }
+    }
+
+    /// Runs one redis action, records a [`RedisMetric`], and returns the result JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RedisError`] on a driver failure or a usage error.
+    pub fn call(&self, action: &str, payload_json: &str) -> Result<String, RedisError> {
+        let start = Instant::now();
+        let result = dispatch(&self.conn, action, payload_json);
+        sandbox::record(&self.metrics, build_metric(action, &result, start));
+        result
+    }
+
+    /// Drains (clones out) the metrics recorded so far.
+    #[must_use]
+    pub fn drain_metrics(&self) -> Vec<RedisMetric> {
+        sandbox::drain(Some(&self.metrics))
+    }
+}
+
+/// Injects the `redis` global (the `redis.js` wrapper, routing through `resource.call`). No
+/// connection happens here — the wired [`Resource`](crate::resource::Resource) adapter serves it.
 ///
 /// # Errors
 ///
-/// Returns an error if connection or registration fails.
-pub fn inject_redis(
-    qctx: &Ctx<'_>,
-    config: &RedisConfig,
-    max_ops: usize,
-) -> Result<Collector<RedisMetric>, Box<dyn Error + Send + Sync>> {
-    let conn = connect(config)?;
-    let shared_conn = Arc::new(Mutex::new(conn));
-
-    let metrics: Collector<RedisMetric> = sandbox::new_collector();
-    let metrics_clone = Arc::clone(&metrics);
-    let conn_clone = Arc::clone(&shared_conn);
-
-    let redis_fn = Function::new(
-        qctx.clone(),
-        move |action: String, payload_json: String| -> String {
-            if let Err(err) = sandbox::check_op_limit(&metrics_clone, max_ops) {
-                return errors::capability_fault_json(
-                    ErrorSource::Redis,
-                    REDIS_OP_LIMIT,
-                    &err,
-                    None,
-                );
-            }
-
-            let start = Instant::now();
-            let result = dispatch(&conn_clone, &action, &payload_json);
-            let metric = build_metric(&action, &result, start);
-            sandbox::record(&metrics_clone, metric);
-
-            match result {
-                Ok(json_out) => json_out,
-                Err(redis_err) => errors::capability_fault_json(
-                    ErrorSource::Redis,
-                    redis_err.fault,
-                    &redis_err.message,
-                    None,
-                ),
-            }
-        },
-    )?
-    .with_name("__redis")?;
-
-    qctx.globals().set("__redis", redis_fn)?;
-
+/// Returns an error if evaluating the wrapper fails.
+pub(crate) fn inject_wrapper(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     let wrapper: JsValue<'_> = qctx.eval(KV_WRAPPER)?;
     drop(wrapper);
-
-    Ok(metrics)
+    Ok(())
 }
 
 /// Builds a Redis connection with read/write timeouts applied.

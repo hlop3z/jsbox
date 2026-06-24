@@ -1,13 +1,9 @@
 (function() {
+  // Routes through the generic resource egress; the collection is packed into the payload
+  // ({collection, data}) since resource.call carries a single payload. resource.call throws a
+  // tagged capability error on failure (see js/resource.js).
   function call(action, collection, payload) {
-    var raw = __mongo(action, collection, JSON.stringify(payload || {}));
-    var res = JSON.parse(raw);
-    if (res && res.error) {
-      var err = new Error(res.error);
-      err.__jsbox = res; // { error, code, retryable, owner, source } — engine classifies off this
-      throw err;
-    }
-    return res;
+    return resource.call('mongo', action, { collection: collection, data: payload || {} });
   }
   globalThis.mongo = {
     // Reads. Values that don't fit a JS number exactly come back as strings

@@ -1,7 +1,7 @@
 //! HTTP handler for the `/execute` endpoint.
 
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::State;
@@ -11,6 +11,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task;
 use tracing::warn;
@@ -21,16 +22,18 @@ use runlet_core::auth::{AuthConfig, AuthMetric};
 use runlet_core::breaker::CircuitBreaker;
 use runlet_core::config::EngineConfig;
 use runlet_core::db::{DbConfig, DbMetric};
-use runlet_core::engine::{EngineError, ExecOutcome, Profile};
+use runlet_core::engine::{EngineError, ExecOutcome};
 use runlet_core::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
-use runlet_core::host::{CapabilitySet, CodeRef, ExecMetrics, Invocation, LogicHost, Outcome};
+use runlet_core::host::{CapabilitySet, ExecMetrics, Invocation, LogicHost, Outcome};
 use runlet_core::http::HttpMetric;
+use runlet_core::inproc::{AsyncDeps, InProcessResource};
 use runlet_core::kv::{RedisConfig, RedisMetric};
 use runlet_core::mail::{MailConfig, MailMetric};
 use runlet_core::metrics::{Capability, Metrics};
 use runlet_core::mongo::{MongoConfig, MongoMetric};
 use runlet_core::partition::PartitionLimiter;
 use runlet_core::registry::ScriptRegistry;
+use runlet_core::resource::Resource;
 use runlet_core::s3::{S3Config, S3Metric};
 use runlet_core::sandbox;
 use runlet_core::sys::SysConfig;
@@ -281,6 +284,60 @@ fn raw_null_ref() -> &'static RawValue {
     &RAW_NULL
 }
 
+/// Builds the per-request in-process [`Resource`] egress: wires every driver-backed capability
+/// present in the request config (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`), each connecting
+/// lazily on first use. Dispatch + metrics live in the adapter rather than the engine. `timeout`
+/// is the per-execution wall-clock budget (the per-query/op deadline).
+fn build_egress(
+    state: &AppState,
+    config: &RequestConfig,
+    db_config: Option<DbConfig>,
+    timeout: Duration,
+) -> Arc<InProcessResource> {
+    let deps = AsyncDeps {
+        handle: Handle::current(),
+        breaker: state.db_breaker.clone(),
+        timeout,
+    };
+    let mut adapter = InProcessResource::new();
+    if let Some(cfg) = db_config {
+        adapter = adapter.with_db(cfg, &deps);
+    }
+    if let Some(cfg) = config.mongo.clone() {
+        adapter = adapter.with_mongo(cfg, &deps);
+    }
+    if let Some(cfg) = config.mail.clone() {
+        adapter = adapter.with_mail(cfg);
+    }
+    if let Some(cfg) = config.redis.clone() {
+        adapter = adapter.with_redis(cfg);
+    }
+    if let Some(cfg) = config.amq.clone() {
+        adapter = adapter.with_amq(cfg);
+    }
+    if let Some(cfg) = config.auth.clone() {
+        adapter = adapter.with_auth(cfg);
+    }
+    Arc::new(adapter)
+}
+
+/// Merges the driver-backed capability metrics from the egress adapter into the outcome's
+/// `meta.<cap>_requests` (they ran in the adapter, not the engine). `http`/`s3` metrics still
+/// come from the engine outcome. A no-op unless the run produced an outcome.
+fn merge_egress_metrics(
+    result: &mut Result<Result<Outcome, EngineError>, task::JoinError>,
+    adapter: &InProcessResource,
+) {
+    if let Ok(Ok(exec)) = result {
+        exec.metrics.db = adapter.db_metrics();
+        exec.metrics.mongo = adapter.mongo_metrics();
+        exec.metrics.mail = adapter.mail_metrics();
+        exec.metrics.redis = adapter.redis_metrics();
+        exec.metrics.amq = adapter.amq_metrics();
+        exec.metrics.auth = adapter.auth_metrics();
+    }
+}
+
 /// Executes a JS `handler(context)` and returns `{data, error, meta}` JSON.
 ///
 /// Takes `Result<Json<…>, JsonRejection>` rather than `Json<…>` so a malformed or
@@ -347,8 +404,9 @@ pub(crate) async fn execute(
     }
 
     let context_json: String = context.get().into();
-    // Tier 0: clamp the per-request db statement_timeout to the operator ceiling.
-    let db_config = clamp_db(config.db, engine_cfg.max_statement_timeout_ms);
+    // Tier 0: clamp the per-request db statement_timeout to the operator ceiling. Clone so
+    // `config` stays whole for `build_egress` to read the other capability configs.
+    let db_config = clamp_db(config.db.clone(), engine_cfg.max_statement_timeout_ms);
 
     let start = Instant::now();
 
@@ -370,35 +428,47 @@ pub(crate) async fn execute(
     // runtime, and applies the SSRF/wildcard policy. The HTTP front always runs the
     // full-capability profile with no read-hook.
     let host = state.host.clone();
+    // The in-process `Resource` egress: `db` now dispatches through it (connecting lazily on
+    // first use and recording its own metrics), instead of the engine connecting directly. A
+    // fresh adapter per request carries the per-execution deadline; its `db` metrics are merged
+    // into the outcome after the run. The concrete `Arc` is kept here for that drain; a `dyn`
+    // clone moves into the blocking task.
+    let adapter = build_egress(&state, &config, db_config.clone(), engine_cfg.timeout());
+    let adapter_run: Arc<dyn Resource> = Arc::<InProcessResource>::clone(&adapter);
     // Namespace the bytecode cache by partition so identical source from different tenants
     // never shares an entry (no cross-tenant dedup / compile-timing leak). Cloned because the
     // closure is `move` and `partition` is still needed for `meta` after the await.
     let cache_ns = partition.clone();
-    let result = task::spawn_blocking(move || -> Result<Outcome, EngineError> {
-        host.run(Invocation {
-            code: CodeRef::Inline(source.as_str()),
-            context_json: &context_json,
-            profile: Profile::Full,
-            caps: CapabilitySet {
-                allowed_hosts: &config.allowed_hosts,
-                db: db_config.as_ref(),
-                mongo: config.mongo.as_ref(),
-                mail: config.mail.as_ref(),
-                s3: config.s3.as_ref(),
-                redis: config.redis.as_ref(),
-                amq: config.amq.as_ref(),
-                auth: config.auth.as_ref(),
-                sys: config.sys.as_ref(),
-            },
-            read_hook: None,
-            cache_namespace: cache_ns.as_deref(),
-        })
+    let mut result = task::spawn_blocking(move || -> Result<Outcome, EngineError> {
+        // `Invocation` is `#[non_exhaustive]`; build via the constructor + builder setters. The
+        // HTTP front always runs the full-capability profile (the default) with no read-hook, so
+        // only `caps`, the resource egress, and the cache namespace differ from the defaults.
+        let caps = CapabilitySet {
+            allowed_hosts: &config.allowed_hosts,
+            db: db_config.as_ref(),
+            mongo: config.mongo.as_ref(),
+            mail: config.mail.as_ref(),
+            s3: config.s3.as_ref(),
+            redis: config.redis.as_ref(),
+            amq: config.amq.as_ref(),
+            auth: config.auth.as_ref(),
+            sys: config.sys.as_ref(),
+        };
+        let mut invocation = Invocation::inline(source.as_str(), &context_json)
+            .caps(caps)
+            .resource(adapter_run);
+        if let Some(namespace) = cache_ns.as_deref() {
+            invocation = invocation.cache_namespace(namespace);
+        }
+        host.run(invocation)
     })
     .await;
 
     // Execution finished — free the bulkhead + per-partition permits for the next request.
     drop(permit);
     drop(partition_permit);
+
+    merge_egress_metrics(&mut result, &adapter);
 
     let exec_time_us = start.elapsed().as_micros();
     let base_meta = Meta::new(trace_id, script_bytes, context_bytes, exec_time_us)

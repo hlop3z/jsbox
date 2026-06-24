@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use rquickjs::{Ctx, Function, Value as JsValue};
+use rquickjs::{Ctx, Value as JsValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -23,7 +23,8 @@ use tokio_postgres::types::{FromSql, IsNull, ToSql, Type};
 use tokio_postgres::{Client, Connection, NoTls};
 
 use crate::breaker::CircuitBreaker;
-use crate::errors::{self, ErrorOwner, ErrorSource, Fault};
+use crate::errors::{ErrorOwner, Fault};
+use crate::resource::ResourceError;
 use crate::sandbox::{self, Collector};
 
 /// JS wrapper — loaded from `src/js/db.js` at compile time.
@@ -31,20 +32,16 @@ const DB_WRAPPER: &str = include_str!("js/db.js");
 
 /// Fallback fault for any db error without a recognized driver `SqlState`.
 const DB_FALLBACK: Fault = Fault::new("DB_ERROR", true, ErrorOwner::Operator);
-/// Fault for exhausting the per-execution op budget mid-db-call.
-const DB_OP_LIMIT: Fault = Fault::new("DB_OP_LIMIT", false, ErrorOwner::Developer);
 /// Fault for a failure to reach the database — used for inject-time connect failures
 /// (a query-time `08xxx` drop is classified the same way in [`classify_by_class`]).
-pub const DB_CONNECTION_FAULT: Fault =
-    Fault::new("DB_CONNECTION", true, ErrorOwner::Operator);
+pub const DB_CONNECTION_FAULT: Fault = Fault::new("DB_CONNECTION", true, ErrorOwner::Operator);
 /// Fault for a query that exceeded the client-side execution deadline (Tier 2). Frees
 /// the blocking thread even when the server-side `statement_timeout` was lost through a
 /// transaction-mode pooler (see `docs/design/resilience.md`).
 const DB_TIMEOUT: Fault = Fault::new("DB_TIMEOUT", true, ErrorOwner::Operator);
 /// Fault for a `db` request refused because the circuit breaker is open (Tier 3) — the
 /// target has been failing to connect, so we fast-fail instead of waiting on the timeout.
-pub const DB_CIRCUIT_OPEN_FAULT: Fault =
-    Fault::new("DB_CIRCUIT_OPEN", true, ErrorOwner::Operator);
+pub const DB_CIRCUIT_OPEN_FAULT: Fault = Fault::new("DB_CIRCUIT_OPEN", true, ErrorOwner::Operator);
 
 /// Marker error returned at inject time when the breaker is open (no connect attempted).
 #[derive(Debug)]
@@ -74,7 +71,7 @@ pub(crate) fn is_circuit_open(err: &(dyn Error + Send + Sync + 'static)) -> bool
 
 /// A db error carrying its classified [`Fault`], the raw message, and structured details.
 #[derive(Debug)]
-struct DbError {
+pub struct DbError {
     /// Classified code + retry hint + owner.
     fault: Fault,
     /// Raw driver/usage message.
@@ -115,14 +112,20 @@ impl DbError {
             details: None,
         }
     }
-}
 
-/// Returns `true` if an `inject_db` error is a driver (connection) failure — a boxed
-/// `tokio_postgres::Error` — vs an engine-setup failure (function registration / eval). Lets
-/// the engine map a dead database to a retryable `capability/db/DB_CONNECTION` instead
-/// of an alert-worthy `runtime/INTERNAL`.
-pub(crate) fn is_connect_error(err: &(dyn Error + Send + Sync + 'static)) -> bool {
-    err.downcast_ref::<tokio_postgres::Error>().is_some()
+    /// Converts into the capability-agnostic [`ResourceError`] for the egress seam (source
+    /// `db`), preserving the classified code / retryable / owner and the structured details.
+    #[must_use]
+    pub fn into_resource_error(self) -> ResourceError {
+        ResourceError {
+            code: self.fault.code.to_owned(),
+            message: self.message,
+            source: "db".to_owned(),
+            details: self.details.map(Box::new),
+            retryable: self.fault.retryable,
+            owner: self.fault.owner,
+        }
+    }
 }
 
 /// Maps a `tokio_postgres::Error` to a [`Fault`] by `SqlState` (docs/99-errors.md).
@@ -214,85 +217,158 @@ impl DbMetric {
 
 // -- Public API -------------------------------------------------------------
 
-/// Runtime and resilience dependencies threaded into [`inject_db`]. Grouped so the
-/// connect/inject entry point stays within the argument-count limit as the async
-/// plumbing (Tier 2) and breaker (Tier 3) are added.
-pub(crate) struct DbDeps<'a> {
+/// Runtime and resilience dependencies threaded into [`inject_db`] / [`DbBackend::connect`].
+///
+/// Grouped so the connect entry point stays within the argument-count limit as the async
+/// plumbing (Tier 2) and breaker (Tier 3) are added. Public so a consumer building a
+/// [`DbBackend`] directly (e.g. the in-process adapter, or a sidecar) can supply them.
+#[derive(Debug)]
+pub struct DbDeps<'a> {
     /// Runtime handle driving the async driver from this blocking thread (`block_on`).
-    pub(crate) handle: &'a Handle,
+    pub handle: &'a Handle,
     /// Execution wall-clock budget, used as the per-query client-side deadline (Tier 2).
-    pub(crate) timeout: Duration,
+    pub timeout: Duration,
     /// Optional per-target circuit breaker fast-failing a flapping database (Tier 3).
-    pub(crate) breaker: Option<&'a CircuitBreaker>,
+    pub breaker: Option<&'a CircuitBreaker>,
 }
 
-/// Connects and injects the `db` global. Returns a metrics collector.
+/// A connected, JS-free `db` backend: a pooled async client plus the per-execution deadline
+/// and row cap, exposing a single string-in/string-out [`call`](DbBackend::call).
 ///
-/// `deps.handle` drives the async driver from this blocking thread (`block_on`);
-/// `deps.timeout` is the execution wall-clock budget, used as the per-query client-side
-/// deadline so a hung query frees its thread even when the server-side `statement_timeout`
-/// is lost through a transaction-mode pooler (Tier 2, see `docs/design/resilience.md`).
+/// This is the reusable dispatch core, holding no `QuickJS` state — shared by the in-process
+/// `__db` capability (via [`inject_db`]) and the in-process
+/// [`Resource`](crate::resource::Resource) adapter (`crate::inproc`), and the same shape a
+/// sidecar will host when the driver moves out of the sandbox process. See
+/// `docs/design/resource-egress.md`.
+pub struct DbBackend {
+    /// Shared async client — one fresh connection per request; transactions reuse it.
+    client: Arc<Client>,
+    /// Runtime handle for `block_on` (the driver is async; the engine thread is blocking).
+    handle: Handle,
+    /// Absolute client-side deadline applied to every query (Tier 2).
+    deadline: Instant,
+    /// Max rows a query returns before truncation.
+    max_rows: usize,
+    /// Per-operation metrics, recorded by [`call`](DbBackend::call) and drained by the consumer
+    /// (the egress adapter) into the response `meta.db_requests`.
+    metrics: Collector<DbMetric>,
+}
+
+impl fmt::Debug for DbBackend {
+    #[expect(
+        clippy::renamed_function_params,
+        reason = "`formatter` reads better than the trait's single-char `f` (min_ident_chars)"
+    )]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        // The async client holds a live connection (not meaningfully printable); show only the
+        // scalar config so `Debug` carries no socket/credential state.
+        formatter
+            .debug_struct("DbBackend")
+            .field("deadline", &self.deadline)
+            .field("max_rows", &self.max_rows)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DbBackend {
+    /// Connects (guarded by the optional breaker) and anchors the per-execution deadline.
+    ///
+    /// The deadline is anchored at connect time (≈ execution start) so total db time stays
+    /// bounded by the wall-clock budget. A breaker-open refusal or a connect failure is
+    /// returned as a boxed error the caller classifies (`is_circuit_open` / `is_connect_error`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the breaker is open or the connection fails.
+    pub fn connect(
+        config: &DbConfig,
+        deps: &DbDeps<'_>,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let client = connect_through_breaker(config, deps.handle, deps.breaker)?;
+        // On the (practically impossible) `Instant` overflow, fall back to "now", which simply
+        // makes queries deadline immediately.
+        let deadline = Instant::now()
+            .checked_add(deps.timeout)
+            .unwrap_or_else(Instant::now);
+        Ok(Self {
+            client: Arc::new(client),
+            handle: deps.handle.clone(),
+            deadline,
+            max_rows: config.max_rows,
+            metrics: sandbox::new_collector(),
+        })
+    }
+
+    /// Connects, mapping a failure straight to a [`ResourceError`] (source `db`) for the egress
+    /// seam: a breaker-open refusal → retryable `DB_CIRCUIT_OPEN`, any other connect failure →
+    /// retryable `DB_CONNECTION`. The adapter surfaces this as a thrown capability error,
+    /// identical to a query-time connection drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ResourceError`] if the breaker is open or the connection fails.
+    pub fn connect_resource(config: &DbConfig, deps: &DbDeps<'_>) -> Result<Self, ResourceError> {
+        Self::connect(config, deps).map_err(|err| connect_error_to_resource(err.as_ref()))
+    }
+
+    /// Runs one db action (`query`/`execute`/`begin`/`commit`/`rollback`), records a
+    /// [`DbMetric`], and returns the result JSON — the string-in/string-out FFI contract, with
+    /// no `QuickJS` involvement.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] (classified fault) on driver failure, deadline elapse, or a usage
+    /// error (bad params, unknown action).
+    pub fn call(&self, action: &str, query: &str, params_json: &str) -> Result<String, DbError> {
+        let start = Instant::now();
+        let call = DbCall {
+            handle: &self.handle,
+            client: &self.client,
+            deadline: self.deadline,
+        };
+        let result = dispatch(&call, action, query, params_json, self.max_rows);
+        sandbox::record(&self.metrics, build_metric(action, &result, start));
+        result
+    }
+
+    /// Drains (clones out) the per-operation metrics recorded so far.
+    #[must_use]
+    pub fn drain_metrics(&self) -> Vec<DbMetric> {
+        sandbox::drain(Some(&self.metrics))
+    }
+}
+
+/// Maps a `db` connect failure to a [`ResourceError`]: breaker-open → `DB_CIRCUIT_OPEN`,
+/// otherwise `DB_CONNECTION` (connect failures are the only outcome of `connect_through_breaker`).
+fn connect_error_to_resource(err: &(dyn Error + Send + Sync + 'static)) -> ResourceError {
+    let fault = if is_circuit_open(err) {
+        DB_CIRCUIT_OPEN_FAULT
+    } else {
+        DB_CONNECTION_FAULT
+    };
+    ResourceError {
+        code: fault.code.to_owned(),
+        message: err.to_string(),
+        source: "db".to_owned(),
+        details: None,
+        retryable: fault.retryable,
+        owner: fault.owner,
+    }
+}
+
+/// Injects the `db` global — the `db.js` wrapper, which routes every call through the
+/// `resource.call("db", …)` egress. **No connection happens here**: dispatch is served by the
+/// wired [`Resource`](crate::resource::Resource) (e.g. the in-process [`DbBackend`] adapter, or
+/// a sidecar), so the `resource` global must already be injected. The presence of a `db` config
+/// on the invocation is what gates this wrapper (the engine no longer reads its credentials).
 ///
 /// # Errors
 ///
-/// Returns an error if connection or registration fails.
-pub(crate) fn inject_db(
-    qctx: &Ctx<'_>,
-    config: &DbConfig,
-    deps: &DbDeps<'_>,
-    max_ops: usize,
-) -> Result<Collector<DbMetric>, Box<dyn Error + Send + Sync>> {
-    let pg_client = connect_through_breaker(config, deps.handle, deps.breaker)?;
-    let shared_client = Arc::new(pg_client);
-    let max_rows = config.max_rows;
-    // Anchor the deadline at inject time (≈ execution start) so total db time is bounded
-    // by the wall-clock budget. On the (practically impossible) `Instant` overflow we
-    // fall back to "now", which simply makes queries deadline immediately.
-    let deadline = Instant::now()
-        .checked_add(deps.timeout)
-        .unwrap_or_else(Instant::now);
-    let handle_owned = deps.handle.clone();
-
-    let metrics: Collector<DbMetric> = sandbox::new_collector();
-    let metrics_clone = Arc::clone(&metrics);
-    let client_clone = Arc::clone(&shared_client);
-
-    let db_fn = Function::new(
-        qctx.clone(),
-        move |action: String, query: String, params_json: String| -> String {
-            if let Err(err) = sandbox::check_op_limit(&metrics_clone, max_ops) {
-                return errors::capability_fault_json(ErrorSource::Db, DB_OP_LIMIT, &err, None);
-            }
-
-            let start = Instant::now();
-            let call = DbCall {
-                handle: &handle_owned,
-                client: &client_clone,
-                deadline,
-            };
-            let result = dispatch(&call, &action, &query, &params_json, max_rows);
-            let metric = build_metric(&action, &result, start);
-            sandbox::record(&metrics_clone, metric);
-
-            match result {
-                Ok(json) => json,
-                Err(db_err) => errors::capability_fault_json(
-                    ErrorSource::Db,
-                    db_err.fault,
-                    &db_err.message,
-                    db_err.details,
-                ),
-            }
-        },
-    )?
-    .with_name("__db")?;
-
-    qctx.globals().set("__db", db_fn)?;
-
+/// Returns an error if evaluating the wrapper fails.
+pub(crate) fn inject_wrapper(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     let wrapper: JsValue<'_> = qctx.eval(DB_WRAPPER)?;
     drop(wrapper);
-
-    Ok(metrics)
+    Ok(())
 }
 
 // -- Dispatch ---------------------------------------------------------------
@@ -689,5 +765,44 @@ fn extract_metric_info(action: &str, json: &str) -> (usize, u64, bool) {
             (0, affected, false)
         }
         _ => (0, 0, false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Verifies the `DbError` → `ResourceError` mapping used by the in-process egress adapter
+    //! preserves the classified fault (code / retryable / owner) and the `db` source tag.
+
+    use super::{DB_CONNECTION_FAULT, DbError};
+    use crate::errors::ErrorOwner;
+    use serde_json::json;
+
+    /// A fallback (`DB_ERROR`) maps across with its retry hint and operator owner, source `db`.
+    #[test]
+    fn fallback_maps_to_resource_error() {
+        let resource_err = DbError::fallback("boom".to_owned()).into_resource_error();
+        assert_eq!(resource_err.source, "db");
+        assert_eq!(resource_err.code, "DB_ERROR");
+        assert_eq!(resource_err.message, "boom");
+        assert!(resource_err.retryable, "DB_ERROR is retryable");
+        assert!(matches!(resource_err.owner, ErrorOwner::Operator));
+        assert!(resource_err.details.is_none());
+    }
+
+    /// A classified driver fault carries its code, owner, and structured details through.
+    #[test]
+    fn driver_fault_preserves_code_and_details() {
+        let resource_err = DbError {
+            fault: DB_CONNECTION_FAULT,
+            message: "connection refused".to_owned(),
+            details: Some(json!({ "sqlstate": "08006" })),
+        }
+        .into_resource_error();
+        assert_eq!(resource_err.code, "DB_CONNECTION");
+        assert!(resource_err.retryable);
+        assert_eq!(
+            resource_err.details.as_deref(),
+            Some(&json!({ "sqlstate": "08006" }))
+        );
     }
 }

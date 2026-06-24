@@ -246,7 +246,8 @@ impl Metrics {
             EngineError::Malformed(_) | EngineError::OutputTooLarge { .. } => {
                 &self.malformed_response
             }
-            EngineError::Internal(_) => &self.internal_error,
+            // `ShuttingDown` is an operational/internal condition — bucket it with internal errors.
+            EngineError::Internal(_) | EngineError::ShuttingDown => &self.internal_error,
         };
         let _ = counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -391,7 +392,10 @@ mod tests {
             stored: 2,
         };
         let text = metrics.render(1, 1, 0, stats);
-        assert!(text.contains("jsbox_bytecode_cache_entries 3"), "entries gauge");
+        assert!(
+            text.contains("jsbox_bytecode_cache_entries 3"),
+            "entries gauge"
+        );
         assert!(text.contains("jsbox_bytecode_cache_events_total{event=\"hit\"} 10"));
         assert!(text.contains("jsbox_bytecode_cache_events_total{event=\"miss\"} 4"));
         assert!(text.contains("jsbox_bytecode_cache_events_total{event=\"stored\"} 2"));

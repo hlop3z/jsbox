@@ -7,17 +7,18 @@
 //! internal/self-hosted relays are intended to work. Each send is metered.
 
 use std::error::Error;
-use std::sync::Arc;
+use std::fmt::{self, Formatter};
 use std::time::{Duration, Instant};
 
 use lettre::message::{Mailbox, Message, MessageBuilder, MultiPart, SinglePart};
 use lettre::transport::smtp::Error as SmtpError;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{SmtpTransport, Transport};
-use rquickjs::{Ctx, Function, Value as JsValue};
+use rquickjs::{Ctx, Value as JsValue};
 use serde::{Deserialize, Serialize};
 
-use crate::errors::{self, ErrorOwner, ErrorSource, Fault};
+use crate::errors::{ErrorOwner, Fault};
+use crate::resource::ResourceError;
 use crate::sandbox::{self, Collector};
 
 /// JS wrapper — loaded from `src/js/mail.js` at compile time.
@@ -30,7 +31,7 @@ const MAIL_OP_LIMIT: Fault = Fault::new("MAIL_OP_LIMIT", false, ErrorOwner::Deve
 
 /// A mail error carrying its classified [`Fault`] plus the raw message.
 #[derive(Debug)]
-struct MailError {
+pub struct MailError {
     /// Classified code + retry hint.
     fault: Fault,
     /// Raw driver/usage message.
@@ -52,6 +53,20 @@ impl MailError {
         Self {
             fault: classify(err),
             message: err.to_string(),
+        }
+    }
+
+    /// Converts into the capability-agnostic [`ResourceError`] for the egress seam (source
+    /// `mail`), preserving the classified code / retryable / owner.
+    #[must_use]
+    pub fn into_resource_error(self) -> ResourceError {
+        ResourceError {
+            code: self.fault.code.to_owned(),
+            message: self.message,
+            source: "mail".to_owned(),
+            details: None,
+            retryable: self.fault.retryable,
+            owner: self.fault.owner,
         }
     }
 }
@@ -210,67 +225,111 @@ struct SendCtx<'a> {
 
 // -- Public API -------------------------------------------------------------
 
-/// Builds the transport and injects the `mail` global. Returns a metrics collector.
+/// A `mail` backend: the pre-built SMTP transport plus send policy and its own metrics,
+/// exposing a single [`call`](MailBackend::call).
+///
+/// The reusable dispatch core behind the in-process [`Resource`](crate::resource::Resource)
+/// adapter. Sync. See `docs/design/resource-egress.md`.
+pub struct MailBackend {
+    /// Pre-built SMTP transport (connects per send, internally).
+    transport: SmtpTransport,
+    /// Default From address.
+    default_from: String,
+    /// Recipient cap per send.
+    max_recipients: usize,
+    /// Recipient-domain allowlist (empty = unrestricted).
+    allowed_domains: Vec<String>,
+    /// Per-execution `send` cap (`0` = bounded only by the global `max_ops` seam).
+    max_sends: usize,
+    /// Per-operation metrics, drained by the consumer into `meta.mail_requests`.
+    metrics: Collector<MailMetric>,
+}
+
+impl fmt::Debug for MailBackend {
+    #[expect(
+        clippy::renamed_function_params,
+        reason = "`formatter` reads better than the trait's single-char `f` (min_ident_chars)"
+    )]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MailBackend")
+            .field("max_recipients", &self.max_recipients)
+            .field("max_sends", &self.max_sends)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MailBackend {
+    /// Builds the SMTP transport from config; a setup failure maps to a retryable
+    /// `MAIL_ERROR` [`ResourceError`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ResourceError`] if transport construction fails.
+    pub fn connect_resource(config: &MailConfig) -> Result<Self, ResourceError> {
+        let transport = build_transport(config).map_err(|err| ResourceError {
+            code: MAIL_FALLBACK.code.to_owned(),
+            message: err.to_string(),
+            source: "mail".to_owned(),
+            details: None,
+            retryable: MAIL_FALLBACK.retryable,
+            owner: MAIL_FALLBACK.owner,
+        })?;
+        Ok(Self {
+            transport,
+            default_from: config.from.clone(),
+            max_recipients: config.max_recipients,
+            allowed_domains: config.allowed_recipient_domains.clone(),
+            max_sends: config.max_sends,
+            metrics: sandbox::new_collector(),
+        })
+    }
+
+    /// Runs one mail action, records a [`MailMetric`], and returns the result JSON. Enforces the
+    /// mail-specific `max_sends` sub-cap (the global `max_ops` is enforced by the egress seam).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`MailError`] on a send/validation failure or when `max_sends` is exhausted.
+    pub fn call(&self, action: &str, payload_json: &str) -> Result<String, MailError> {
+        if self.max_sends != 0 && sandbox::op_count(&self.metrics) >= self.max_sends {
+            return Err(MailError {
+                fault: MAIL_OP_LIMIT,
+                message: format!("too many mail.send calls: limit is {}", self.max_sends),
+            });
+        }
+        let start = Instant::now();
+        let send_ctx = SendCtx {
+            transport: &self.transport,
+            default_from: &self.default_from,
+            max_recipients: self.max_recipients,
+            allowed_domains: &self.allowed_domains,
+        };
+        let result = dispatch(&send_ctx, action, payload_json);
+        sandbox::record(
+            &self.metrics,
+            build_metric(action, result.as_ref().ok(), start),
+        );
+        result.map(|outcome| outcome.json)
+    }
+
+    /// Drains (clones out) the metrics recorded so far.
+    #[must_use]
+    pub fn drain_metrics(&self) -> Vec<MailMetric> {
+        sandbox::drain(Some(&self.metrics))
+    }
+}
+
+/// Injects the `mail` global (the `mail.js` wrapper, routing through `resource.call`). No
+/// transport is built here — the wired [`Resource`](crate::resource::Resource) adapter serves it.
 ///
 /// # Errors
 ///
-/// Returns an error if transport construction or registration fails.
-pub fn inject_mail(
-    qctx: &Ctx<'_>,
-    config: &MailConfig,
-    max_ops: usize,
-) -> Result<Collector<MailMetric>, Box<dyn Error + Send + Sync>> {
-    let transport = build_transport(config)?;
-    let default_from = config.from.clone();
-    let max_recipients = config.max_recipients;
-    let allowed_domains = config.allowed_recipient_domains.clone();
-    // Per-execution send cap (Tier: mail abuse): tighter of the mail cap and the global budget.
-    let send_cap = if config.max_sends == 0 {
-        max_ops
-    } else {
-        config.max_sends.min(max_ops)
-    };
-
-    let metrics: Collector<MailMetric> = sandbox::new_collector();
-    let metrics_clone = Arc::clone(&metrics);
-
-    let mail_fn = Function::new(
-        qctx.clone(),
-        move |action: String, payload_json: String| -> String {
-            if let Err(err) = sandbox::check_op_limit(&metrics_clone, send_cap) {
-                return errors::capability_fault_json(ErrorSource::Mail, MAIL_OP_LIMIT, &err, None);
-            }
-
-            let start = Instant::now();
-            let send_ctx = SendCtx {
-                transport: &transport,
-                default_from: &default_from,
-                max_recipients,
-                allowed_domains: &allowed_domains,
-            };
-            let result = dispatch(&send_ctx, &action, &payload_json);
-            let metric = build_metric(&action, result.as_ref().ok(), start);
-            sandbox::record(&metrics_clone, metric);
-
-            match result {
-                Ok(outcome) => outcome.json,
-                Err(mail_err) => errors::capability_fault_json(
-                    ErrorSource::Mail,
-                    mail_err.fault,
-                    &mail_err.message,
-                    None,
-                ),
-            }
-        },
-    )?
-    .with_name("__mail")?;
-
-    qctx.globals().set("__mail", mail_fn)?;
-
+/// Returns an error if evaluating the wrapper fails.
+pub(crate) fn inject_wrapper(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     let wrapper: JsValue<'_> = qctx.eval(MAIL_WRAPPER)?;
     drop(wrapper);
-
-    Ok(metrics)
+    Ok(())
 }
 
 // -- Dispatch ---------------------------------------------------------------

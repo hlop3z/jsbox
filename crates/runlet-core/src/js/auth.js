@@ -4,17 +4,10 @@
   // (and so correctly consumes no max_ops slot). No cross-request/global state.
   var cache = {};
 
+  // Routes through the generic resource egress. An infra failure carries `error` and is thrown
+  // by resource.call (tagged); an in-band result ({ ok: ... }) has no `error` → returned as data.
   function call(action, token) {
-    var raw = __auth(action, token || '');
-    var res = JSON.parse(raw);
-    // A thrown capability fault carries `error` + `code` (engine classifies off the
-    // __jsbox tag). An in-band result ({ ok: ... }) has no `error` → returned as data.
-    if (res && res.error !== undefined) {
-      var err = new Error(res.error);
-      err.__jsbox = res;
-      throw err;
-    }
-    return res;
+    return resource.call('auth', action, { token: token || '' });
   }
 
   function memo(action, token) {

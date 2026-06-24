@@ -157,6 +157,39 @@ struct CapabilityFault {
     details: Option<Value>,
 }
 
+/// Serializable `__jsbox` tag built from dynamic (caller-owned) string fields, for the
+/// always-on [`crate::resource::Resource`] egress. Mirrors [`CapabilityFault`] but borrows
+/// `&str`/`&Value` and is not feature-gated (the resource seam is core).
+#[derive(Debug, Serialize)]
+pub(crate) struct DynamicFault<'a> {
+    /// Raw cause (the human-readable message — surfaced gated, in `debug.raw`).
+    pub(crate) error: &'a str,
+    /// Stable machine code.
+    pub(crate) code: &'a str,
+    /// Retry hint.
+    pub(crate) retryable: bool,
+    /// Responsible owner (serialized lowercase: `caller`/`developer`/`operator`).
+    pub(crate) owner: ErrorOwner,
+    /// Originating capability source tag (lowercase: `db`/`mongo`/…).
+    pub(crate) source: &'a str,
+    /// Structured, safe machine context (e.g. `{sqlstate}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) details: Option<&'a Value>,
+}
+
+/// Last-resort JSON if a [`DynamicFault`] ever fails to serialize (always compiled).
+const FALLBACK_DYNAMIC_FAULT_JSON: &str = r#"{"error":"internal error","code":"INTERNAL","retryable":true,"owner":"operator","source":"engine"}"#;
+
+/// Builds the `__jsbox` tag JSON for a [`crate::resource::Resource`] egress failure.
+///
+/// The always-compiled sibling of [`capability_fault_json`]: the resource seam is core (not
+/// feature-gated), and a resource's `source`/`code`/`owner` are supplied dynamically by the
+/// sidecar rather than from a static per-capability [`Fault`]. Produces the identical
+/// `{ error, code, retryable, owner, source, details? }` shape the engine classifies.
+pub(crate) fn dynamic_fault_json(fault: &DynamicFault<'_>) -> String {
+    serde_json::to_string(fault).unwrap_or_else(|_err| FALLBACK_DYNAMIC_FAULT_JSON.to_owned())
+}
+
 /// In-band `api` transport-error payload (§13): HTTP never throws, so a transport
 /// failure is returned as data the script can inspect, not an exception.
 #[cfg(feature = "http")]

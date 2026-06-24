@@ -5,7 +5,12 @@
 
 ## Associations (adapter / port / domain)
 
-_None recorded yet._
+- **`./crates/runlet-core/`** — the reusable logic host (the `LogicHost` port: `Invocation` →
+  `Outcome`). External consumer-feedback inbox at **`./crates/runlet-core/CONSUMER_NOTES.md`**:
+  gaps hit by embedders (notably reactive-database-pg) — top item is a missing graceful
+  **shutdown/teardown** API on `LogicHost` (no `shutdown()`/`Drop` today); also `Invocation` not
+  being `#[non_exhaustive]` (field adds break consumers), and `run` being a concrete method rather
+  than a trait port. Triage there.
 
 <!-- Example:
 - `./src/domain/order/` — domain. Ports: `./src/domain/order/ports/`. Adapters: `./src/adapters/persistence/order/`.

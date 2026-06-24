@@ -15,8 +15,7 @@ context and returns `{data, error, meta}`. The single endpoint is the whole prod
   [`LogicHost`] port (`Invocation` → `Outcome`). Knows nothing about HTTP. The public entry
   is `runlet_core::host::LogicHost`; each I/O capability is a cargo **feature** (`db`, `http`,
   `mongo`, `mail`, `s3`, `redis`, `amq`, `auth`), so a deterministic-only consumer builds with
-  `default-features = false` and links no network drivers. See `TODO.md` for the extraction
-  brief and `docs/design/` for the design.
+  `default-features = false` and links no network drivers. See `docs/design/` for the design.
 - **`runlet`** (`crates/runlet/`) — the binary: the axum HTTP `/execute` front + server config,
   a thin adapter over `LogicHost::run`. Enables all `runlet-core` features. Behavior is
   unchanged from the pre-workspace `jsbox` (the binary/image are renamed to `runlet`; the

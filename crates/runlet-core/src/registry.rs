@@ -30,10 +30,7 @@ impl ScriptRegistry {
     ///
     /// Returns an error if the directory or a file can't be read, a script exceeds
     /// `max_script_size`, or a script path isn't valid UTF-8.
-    pub fn load(
-        dir: &Path,
-        max_script_size: usize,
-    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    pub fn load(dir: &Path, max_script_size: usize) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let mut scripts = HashMap::new();
         let mut pending: Vec<PathBuf> = vec![dir.to_path_buf()];
         while let Some(current) = pending.pop() {

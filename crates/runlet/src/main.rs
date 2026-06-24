@@ -151,6 +151,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             allow_private_targets: config.debug,
         },
     );
+    // A cheap clone (all `Arc`-backed) kept out of `AppState` so the warm runtime pool can be
+    // disposed after axum has drained in-flight requests.
+    let host_lifecycle = host.clone();
     let state = AppState {
         host,
         registry,
@@ -184,6 +187,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // axum has drained in-flight requests (so every `host.run` has returned); reject any
+    // stragglers and dispose the warm runtime pool before exit.
+    host_lifecycle.shutdown();
 
     info!("server shut down gracefully");
     Ok(())

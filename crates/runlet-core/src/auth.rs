@@ -14,24 +14,23 @@
 //! can't act on (issuer down, misconfig) **throw** a tagged capability error (like
 //! `db`/`mail`). Each call is metered.
 
-use std::error::Error;
-use std::sync::{Arc, Mutex};
+use std::fmt::{self, Formatter};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::blocking::{Client, RequestBuilder};
-use rquickjs::{Ctx, Function, Value as JsValue};
+use rquickjs::{Ctx, Value as JsValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::errors::{self, ErrorOwner, ErrorSource, Fault};
+use crate::errors::{ErrorOwner, Fault};
+use crate::resource::ResourceError;
 use crate::sandbox::{self, Collector};
 
 /// JS wrapper — loaded from `src/js/auth.js` at compile time.
 const AUTH_WRAPPER: &str = include_str!("js/auth.js");
 
-/// Per-execution op budget exhausted before the call.
-const AUTH_OP_LIMIT: Fault = Fault::new("AUTH_OP_LIMIT", false, ErrorOwner::Developer);
 /// Issuer unreachable / 5xx / timeout — transient, page ops.
 const AUTH_UNAVAILABLE: Fault = Fault::new("AUTH_UNAVAILABLE", true, ErrorOwner::Operator);
 /// Deterministic request failure (misconfig, bad endpoint, unexpected status).
@@ -96,7 +95,7 @@ struct Endpoints {
 
 /// An auth error carrying its classified [`Fault`], a raw message, and optional details.
 #[derive(Debug)]
-struct AuthError {
+pub struct AuthError {
     /// Classified code + retry hint.
     fault: Fault,
     /// Raw cause (surfaced gated, in `debug.raw`).
@@ -128,6 +127,20 @@ impl AuthError {
     fn from_transport(err: &reqwest::Error) -> Self {
         Self::new(AUTH_UNAVAILABLE, format!("auth request failed: {err}"))
     }
+
+    /// Converts into the capability-agnostic [`ResourceError`] for the egress seam (source
+    /// `auth`), preserving the classified code / retryable / owner and the structured details.
+    #[must_use]
+    pub fn into_resource_error(self) -> ResourceError {
+        ResourceError {
+            code: self.fault.code.to_owned(),
+            message: self.message,
+            source: "auth".to_owned(),
+            details: self.details.map(Box::new),
+            retryable: self.fault.retryable,
+            owner: self.fault.owner,
+        }
+    }
 }
 
 /// In-band success/invalid result of one call: the JSON returned to JS + its status.
@@ -155,88 +168,100 @@ struct AuthState {
 
 // -- Public API -------------------------------------------------------------
 
-/// Builds the client and injects the `auth` global. Returns a metrics collector.
+/// An `auth` backend: the blocking client + resolved config (with request-scoped discovery
+/// memo) plus its own metrics, exposing a single [`call`](AuthBackend::call).
+///
+/// The reusable dispatch core behind the in-process [`Resource`](crate::resource::Resource)
+/// adapter. Sync. See `docs/design/resource-egress.md`.
+pub struct AuthBackend {
+    /// Shared auth runtime (client + config + request-scoped discovery memo).
+    state: AuthState,
+    /// Issuer host (for the metric; no path/query).
+    host: String,
+    /// Per-operation metrics, drained by the consumer into `meta.auth_requests`.
+    metrics: Collector<AuthMetric>,
+}
+
+impl fmt::Debug for AuthBackend {
+    #[expect(
+        clippy::renamed_function_params,
+        reason = "`formatter` reads better than the trait's single-char `f` (min_ident_chars)"
+    )]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthBackend")
+            .field("host", &self.host)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthBackend {
+    /// Builds the blocking HTTP client; a build failure maps to a retryable `AUTH_UNAVAILABLE`
+    /// [`ResourceError`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ResourceError`] if client construction fails.
+    pub fn connect_resource(config: &AuthConfig) -> Result<Self, ResourceError> {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(config.timeout_ms))
+            .build()
+            .map_err(|err| ResourceError {
+                code: AUTH_UNAVAILABLE.code.to_owned(),
+                message: format!("auth client build failed: {err}"),
+                source: "auth".to_owned(),
+                details: None,
+                retryable: AUTH_UNAVAILABLE.retryable,
+                owner: AUTH_UNAVAILABLE.owner,
+            })?;
+        Ok(Self {
+            host: issuer_host(&config.issuer),
+            state: AuthState {
+                client,
+                config: config.clone(),
+                discovery: Mutex::new(None),
+            },
+            metrics: sandbox::new_collector(),
+        })
+    }
+
+    /// Runs one auth action (`user_info`/`introspect`), records an [`AuthMetric`], and returns
+    /// the result JSON. An invalid/expired token is **in-band** (`Ok` with `{ok:false}`); infra
+    /// failures are an `Err` the seam surfaces as a thrown capability error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ResourceError`] for an infra failure (issuer down / misconfig / bad status).
+    pub fn call(&self, action: &str, token: &str) -> Result<String, ResourceError> {
+        let start = Instant::now();
+        let result = dispatch(&self.state, action, token);
+        let status = result.as_ref().map_or(0, |outcome| outcome.status);
+        sandbox::record(
+            &self.metrics,
+            build_metric(action, &self.host, status, start),
+        );
+        result
+            .map(|outcome| outcome.json)
+            .map_err(AuthError::into_resource_error)
+    }
+
+    /// Drains (clones out) the metrics recorded so far.
+    #[must_use]
+    pub fn drain_metrics(&self) -> Vec<AuthMetric> {
+        sandbox::drain(Some(&self.metrics))
+    }
+}
+
+/// Injects the `auth` global (the `auth.js` wrapper, routing through `resource.call`). No client
+/// is built here — the wired [`Resource`](crate::resource::Resource) adapter serves it.
 ///
 /// # Errors
 ///
-/// Returns an error if client construction or registration fails.
-pub fn inject_auth(
-    qctx: &Ctx<'_>,
-    config: &AuthConfig,
-    max_ops: usize,
-) -> Result<Collector<AuthMetric>, Box<dyn Error + Send + Sync>> {
-    let client = Client::builder()
-        .timeout(Duration::from_millis(config.timeout_ms))
-        .build()?;
-    let host = issuer_host(&config.issuer);
-    let state = Arc::new(AuthState {
-        client,
-        config: config.clone(),
-        discovery: Mutex::new(None),
-    });
-
-    let metrics: Collector<AuthMetric> = sandbox::new_collector();
-    let metrics_clone = Arc::clone(&metrics);
-
-    let auth_fn = Function::new(
-        qctx.clone(),
-        move |action: String, token: String| -> String {
-            let call_ctx = CallCtx {
-                state: state.as_ref(),
-                metrics: &metrics_clone,
-                max_ops,
-                host: &host,
-            };
-            run_call(&call_ctx, &action, &token)
-        },
-    )?
-    .with_name("__auth")?;
-
-    qctx.globals().set("__auth", auth_fn)?;
-
+/// Returns an error if evaluating the wrapper fails.
+pub(crate) fn inject_wrapper(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     let wrapper: JsValue<'_> = qctx.eval(AUTH_WRAPPER)?;
     drop(wrapper);
-
-    Ok(metrics)
-}
-
-// -- Call orchestration -----------------------------------------------------
-
-/// Request-invariant context for one `__auth` call (keeps `run_call` arg count low).
-struct CallCtx<'a> {
-    /// Shared auth runtime.
-    state: &'a AuthState,
-    /// Metrics collector.
-    metrics: &'a Collector<AuthMetric>,
-    /// Per-execution op cap.
-    max_ops: usize,
-    /// Issuer host (for metrics).
-    host: &'a str,
-}
-
-/// One `__auth` invocation: op-limit gate → dispatch → meter → format.
-fn run_call(call_ctx: &CallCtx<'_>, action: &str, token: &str) -> String {
-    if let Err(err) = sandbox::check_op_limit(call_ctx.metrics, call_ctx.max_ops) {
-        return errors::capability_fault_json(ErrorSource::Auth, AUTH_OP_LIMIT, &err, None);
-    }
-
-    let start = Instant::now();
-    let result = dispatch(call_ctx.state, action, token);
-    let status = result.as_ref().map_or(0, |outcome| outcome.status);
-    sandbox::record(
-        call_ctx.metrics,
-        build_metric(action, call_ctx.host, status, start),
-    );
-
-    match result {
-        Ok(outcome) => outcome.json,
-        Err(auth_err) => errors::capability_fault_json(
-            ErrorSource::Auth,
-            auth_err.fault,
-            &auth_err.message,
-            auth_err.details,
-        ),
-    }
+    Ok(())
 }
 
 /// Routes a `__auth` call to the correct handler.

@@ -9,21 +9,20 @@
 //! per-call current-thread `tokio` runtime (`block_on`), publishes every message, and
 //! closes. One `send` call = one metered op, regardless of batch size.
 
-use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use amqprs::BasicProperties;
 use amqprs::channel::BasicPublishArguments;
 use amqprs::connection::{Connection, OpenConnectionArguments};
 use amqprs::tls::TlsAdaptor;
-use rquickjs::{Ctx, Function, Value as JsValue};
+use rquickjs::{Ctx, Value as JsValue};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::runtime::{Builder, Runtime};
 
-use crate::errors::{self, ErrorOwner, ErrorSource, Fault};
+use crate::errors::{ErrorOwner, Fault};
+use crate::resource::ResourceError;
 use crate::sandbox::{self, Collector};
 
 /// JS wrapper — loaded from `src/js/amq.js` at compile time.
@@ -31,8 +30,6 @@ const AMQ_WRAPPER: &str = include_str!("js/amq.js");
 
 /// Fallback fault for a publish/protocol error.
 const AMQ_FALLBACK: Fault = Fault::new("AMQ_ERROR", true, ErrorOwner::Operator);
-/// Fault for exhausting the per-execution op budget.
-const AMQ_OP_LIMIT: Fault = Fault::new("AMQ_OP_LIMIT", false, ErrorOwner::Developer);
 /// Fault for a failure to reach / authenticate with the broker.
 const AMQ_CONNECTION: Fault = Fault::new("AMQ_CONNECTION", true, ErrorOwner::Operator);
 /// Fault for a batch larger than `max_batch`.
@@ -142,7 +139,7 @@ impl AmqMetric {
 
 /// An amq error carrying its classified [`Fault`] plus the raw message.
 #[derive(Debug)]
-struct AmqError {
+pub struct AmqError {
     /// Classified code + retry hint + owner.
     fault: Fault,
     /// Raw message.
@@ -173,6 +170,20 @@ impl AmqError {
             message,
         }
     }
+
+    /// Converts into the capability-agnostic [`ResourceError`] for the egress seam (source
+    /// `amq`), preserving the classified code / retryable / owner.
+    #[must_use]
+    pub fn into_resource_error(self) -> ResourceError {
+        ResourceError {
+            code: self.fault.code.to_owned(),
+            message: self.message,
+            source: "amq".to_owned(),
+            details: None,
+            retryable: self.fault.retryable,
+            owner: self.fault.owner,
+        }
+    }
 }
 
 /// Successful send result plus the stats needed to build a metric.
@@ -188,53 +199,64 @@ struct SendOutcome {
 
 // -- Public API -------------------------------------------------------------
 
-/// Injects the `amq` global. Returns a metrics collector. (No connection is opened
-/// here — `send` connects lazily so a broker outage surfaces as a capability error.)
+/// A `amq` producer: the operator config plus its own metrics, exposing a single
+/// [`call`](AmqProducer::call).
+///
+/// Stateless beyond config — each `send`/`request` opens its own
+/// connection lazily (see module docs), so there is no setup I/O and construction is infallible.
+/// The reusable dispatch core behind the in-process
+/// [`Resource`](crate::resource::Resource) adapter. (Named `AmqProducer`, not `*Backend`, since
+/// [`AmqBackend`] is already the rabbitmq/nats selector enum.) See
+/// `docs/design/resource-egress.md`.
+#[derive(Debug)]
+pub struct AmqProducer {
+    /// Operator messaging config (host, backend, auth, batch cap, …).
+    config: AmqConfig,
+    /// Per-operation metrics, drained by the consumer into `meta.amq_requests`.
+    metrics: Collector<AmqMetric>,
+}
+
+impl AmqProducer {
+    /// Builds the producer from config (no I/O — connections are opened per call).
+    #[must_use]
+    pub fn new(config: AmqConfig) -> Self {
+        Self {
+            config,
+            metrics: sandbox::new_collector(),
+        }
+    }
+
+    /// Runs one amq action (`send`/`request`), records an [`AmqMetric`], returns the result JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`AmqError`] on a connect/publish/protocol failure or a usage error.
+    pub fn call(&self, action: &str, payload_json: &str) -> Result<String, AmqError> {
+        let start = Instant::now();
+        let result = dispatch(&self.config, action, payload_json);
+        sandbox::record(
+            &self.metrics,
+            build_metric(action, result.as_ref().ok(), start),
+        );
+        result.map(|outcome| outcome.json)
+    }
+
+    /// Drains (clones out) the metrics recorded so far.
+    #[must_use]
+    pub fn drain_metrics(&self) -> Vec<AmqMetric> {
+        sandbox::drain(Some(&self.metrics))
+    }
+}
+
+/// Injects the `amq` global (the `amq.js` wrapper, routing through `resource.call`).
 ///
 /// # Errors
 ///
-/// Returns an error if function registration or JS eval fails.
-pub fn inject_amq(
-    qctx: &Ctx<'_>,
-    config: &AmqConfig,
-    max_ops: usize,
-) -> Result<Collector<AmqMetric>, Box<dyn Error + Send + Sync>> {
-    let owned = config.clone();
-
-    let metrics: Collector<AmqMetric> = sandbox::new_collector();
-    let metrics_clone = Arc::clone(&metrics);
-
-    let amq_fn = Function::new(
-        qctx.clone(),
-        move |action: String, payload_json: String| -> String {
-            if let Err(err) = sandbox::check_op_limit(&metrics_clone, max_ops) {
-                return errors::capability_fault_json(ErrorSource::Amq, AMQ_OP_LIMIT, &err, None);
-            }
-
-            let start = Instant::now();
-            let result = dispatch(&owned, &action, &payload_json);
-            let metric = build_metric(&action, result.as_ref().ok(), start);
-            sandbox::record(&metrics_clone, metric);
-
-            match result {
-                Ok(outcome) => outcome.json,
-                Err(amq_err) => errors::capability_fault_json(
-                    ErrorSource::Amq,
-                    amq_err.fault,
-                    &amq_err.message,
-                    None,
-                ),
-            }
-        },
-    )?
-    .with_name("__amq")?;
-
-    qctx.globals().set("__amq", amq_fn)?;
-
+/// Returns an error if evaluating the wrapper fails.
+pub(crate) fn inject_wrapper(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     let wrapper: JsValue<'_> = qctx.eval(AMQ_WRAPPER)?;
     drop(wrapper);
-
-    Ok(metrics)
+    Ok(())
 }
 
 // -- Dispatch ---------------------------------------------------------------
@@ -311,12 +333,8 @@ fn build_runtime() -> Result<Runtime, AmqError> {
 async fn publish_batch(config: &AmqConfig, messages: &[AmqMessage]) -> Result<usize, AmqError> {
     let username = config.username.as_deref().unwrap_or("guest");
     let password = config.password.as_deref().unwrap_or("guest");
-    let mut args = OpenConnectionArguments::new(
-        &config.host,
-        config.resolved_port(),
-        username,
-        password,
-    );
+    let mut args =
+        OpenConnectionArguments::new(&config.host, config.resolved_port(), username, password);
     let _ = args.virtual_host(&config.vhost);
     if config.tls {
         let ca = config.ca_cert.as_deref().map(Path::new);
@@ -403,7 +421,10 @@ async fn nats_request(
     let client = nats_connect(config).await?;
     let request_bytes = payload.len();
     let reply = client
-        .request(subject.to_owned(), bytes::Bytes::from(payload.as_bytes().to_vec()))
+        .request(
+            subject.to_owned(),
+            bytes::Bytes::from(payload.as_bytes().to_vec()),
+        )
         .await
         .map_err(|err| AmqError {
             fault: classify_request_error(&err.to_string()),
@@ -421,7 +442,9 @@ async fn nats_request(
 /// request error carries the cause in its `Display`, above the stringify cliff for callers.)
 fn classify_request_error(message: &str) -> Fault {
     let lowered = message.to_lowercase();
-    if lowered.contains("no responders") || lowered.contains("timed out") || lowered.contains("timeout")
+    if lowered.contains("no responders")
+        || lowered.contains("timed out")
+        || lowered.contains("timeout")
     {
         AMQ_TIMEOUT
     } else {
