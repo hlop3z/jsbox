@@ -16,6 +16,10 @@ categories.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+# For the box↔fabricd UDS wire framing (`wire.rs`): `io-util` provides the `AsyncReadExt`/
+# `AsyncWriteExt` traits (`read_exact`/`write_all`). Added explicitly so a deterministic-core build
+# (which doesn't unify the drivers' tokio features) still has them. Not a driver.
+tokio = { workspace = true, features = ["io-util"] }
 
 [lints]
 workspace = true

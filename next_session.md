@@ -20,79 +20,67 @@ pure compute (`$`/Decimal/determinism), `http` (SSRF-guarded), and `s3` (SigV4 s
   `config.io`). The in-process adapter is **`BackendSet`** (was `InProcessEgress`).
 - `Gate` (engine.rs) = a 2-variant `Off`/`On` enum for the per-capability inject gates.
 
-## Crate layout (AS OF Step 4b — the current shape)
+## Crate layout (AS OF Step 5 — the current shape)
 
 Six workspace members (`Cargo.toml`): `fabric-wire`, `fabric-backends`, `fabricd`, `runlet-core`,
 `runlet`, `runlet-bench`.
-- **`fabric-wire`** — shared leaf, no drivers/QuickJS: `Egress` trait + `EgressError`, the error
-  taxonomy (`ErrorOwner`/`Fault`/`DynamicFault` + `dynamic_fault_json`), `CircuitBreaker`/
-  `BreakerConfig`, and the metric `Collector`. Depended on by both core and backends.
-- **`fabric-backends`** — the driver bag (featureless, always all 6): `db`/`mongo`/`mail`/`kv`/
-  `amq`/`auth` `*Backend`s + `*Config`/`*Metric`/`*Error`/`*Deps`, and `BackendSet`/`AsyncDeps`
-  (`backendset.rs`). Depends on `fabric-wire` ONLY (never `runlet-core`). This is the shape
-  `fabricd` will host.
-- **`runlet-core`** — the sandbox. Links NO driver even with `full` (proven via `cargo tree`).
-  Keeps the JS wrappers: `db.rs`/`mongo.rs`/`mail.rs`/`kv.rs`/`amq.rs`/`auth.rs` are now private
-  `mod`s with just `inject_wrapper` (+ `js/*.js`). `egress.rs`/`breaker.rs` re-export from
-  `fabric-wire`; `errors.rs` re-exports `ErrorOwner`/`Fault`/`DynamicFault`/`dynamic_fault_json`;
-  `sandbox.rs` re-exports the `Collector` apparatus (gated `any(http, s3)`). `http`/`s3` stay
-  in-engine.
-- **`fabricd`** — NEW bin (Step 4b): the egress sidecar. Hosts `BackendSet` behind a UDS wire
-  protocol (`fabric_backends::wire`); one connection = one box-request session
-  (`Init`→`Call`*→`Drain`). Dispatches each call on `spawn_blocking` (the backends `block_on`).
-- **`runlet`** — the binary. `build_adapter` (in `handler.rs`) wires either an in-process
-  `BackendSet` or a `uds::UdsEgress` client (when `config.fabricd_socket` is set) with in-process
-  fallback — both as `Arc<dyn MeteredEgress>`, built + drained INSIDE the `spawn_blocking` task
-  (UDS connect/calls/drain all `block_on`). Imports `*Config`/`*Metric`/`BackendMetrics`/`WireInit`
-  from `fabric_backends`, `Egress`/`EgressError` from `fabric_wire`.
-- **`runlet-bench`** — unchanged (no runlet-core dep).
+- **`fabric-wire`** — shared leaf, no drivers/QuickJS: `Egress`+`EgressError`, the taxonomy
+  (`ErrorOwner`/`Fault`/`DynamicFault`), `CircuitBreaker`, the metric `Collector`, **and** the
+  box↔fabricd wire protocol (`wire.rs`: `WireInit`(names)/`WireCall`/`WireRequest`/`WireResponse` +
+  framing, the `*Metric` types, `BackendMetrics`, `MeteredEgress`). Needs tokio `io-util` (framing).
+- **`fabric-backends`** — the driver bag (featureless, all 6): `*Backend`s + `*Config` +
+  `BackendSet`/`AsyncDeps` + the operator `ResourceBinding` table & `resolve` (`resources.rs`).
+  Depends on `fabric-wire` ONLY. **Only `fabricd` links it.**
+- **`runlet-core`** — the sandbox. Links NO driver even with `full`. Slim JS-wrapper modules
+  (`db.rs`/… private `mod`s) + `js/*.js`; `egress`/`breaker`/`errors`/`sandbox` re-export from
+  `fabric-wire`. `http`/`s3` in-engine. `LogicHost::new(pool, registry, settings)` — handle/breaker
+  gone.
+- **`fabricd`** — the egress sidecar bin. Loads its own `resources` cred table (`FABRICD_CONFIG`,
+  default `fabricd.json`); per connection reads `Init`(names) → `resolve` → `BackendSet::from_configs`
+  → `Ack`/`InitError`, then `Call`*/`Drain`. Dispatches each call on `spawn_blocking`.
+- **`runlet`** — the box binary. **No drivers, no creds, no `fabric-backends` dep.** `handler.rs`:
+  if `config.io.any()`, `uds::connect_session` opens a fabricd session (async, validates `Init`:
+  `InitError`→400, unreachable→503), then the `spawn_blocking` task wraps it as `UdsEgress`
+  (`from_stream`), runs, and drains. No in-process path.
+- **`runlet-bench`** — unchanged.
 
 ## Branch / commits
 
-On branch **`resource-egress`** (off `main`). Prior commits did steps 1–3 + the in-box trust-flip
-+ Egress/io rename + docs/live-smoke. **Step 4a committed** as `88a1eff` (extract fabric-wire +
-fabric-backends). **Step 4b is implemented in the working tree** (fabricd + UdsEgress) — commit it
-(suggested: "Step 4b: fabricd UDS egress sidecar + UdsEgress client with in-process fallback").
+On branch **`resource-egress`** (off `main`). `88a1eff` Step 4a, `87dfba6` Step 4b. **Step 5 is in
+the working tree** — commit it (suggested: "Step 5: trust flip — box driver-free, creds only in
+fabricd; drop LogicHost handle/db_breaker").
 
-## Status: Steps 4a + 4b DONE & verified (this session)
+## Status: Steps 4a + 4b + 5 DONE & verified (this session)
 
-- **4a:** Drivers fully gone from `runlet-core` (`cargo tree -p runlet-core` with `full` shows none;
-  `fabric-backends` carries them all). The driver-backed `ExecMetrics`/`ExecResult` fields left the
-  engine (`host::ExecMetrics` = `http`/`s3` only); the binary drains driver metrics from the
-  adapter. `inject_apis` reworked (cfg-params for `http`/`s3` collectors; the `Collectors` struct is
-  gone).
-- **4b:** `fabricd` sidecar hosts `BackendSet` over UDS; `runlet::uds::UdsEgress` is the client with
-  in-process fallback; wire protocol in `fabric_backends::wire`. `*Config` gained `Serialize`,
-  `*Metric` + `EgressError` gained `Deserialize` so they round-trip. The adapter is built + drained
-  INSIDE the `spawn_blocking` task (UDS connect/call/drain all `block_on`).
-- **Verified (Docker `rust:1.92-alpine`, the only way to build on this Windows host):**
-  - `cargo clippy` whole workspace — clean.
-  - Per-cap cfg sweep `runlet-core --no-default-features [--features …]` + NONE — clean
-    (`sweep.sh`; `fabric-backends`/`fabricd` are featureless, not swept). Gate is plain `cargo
-    clippy`, NOT `--all-targets`.
-  - `cargo test` — green (fabric-wire 5, fabric-backends 16, runlet-core 40, runlet 12).
-  - **Live-smoke (`smoke_4b.sh`)** box→UDS→`fabricd`→Postgres PASSED: `db.query` returned `n=41`
-    through the daemon with `db_requests` metrics; after killing `fabricd` the box fell back to
-    in-process and still returned `n=41`. (Ran a throwaway `postgres:17-alpine` on a dedicated
-    docker network aliased `postgres` — host 5432 is taken by another project.)
+- **Step 5 (full trust flip):** creds live ONLY in `fabricd`. The `ResourceBinding` table +
+  name→config resolution moved box→`fabricd` (`fabric_backends::resources`); the box sends logical
+  names in `WireInit`. The box **dropped `fabric-backends`** → links no driver (proven via
+  `cargo tree -p runlet`). The wire protocol + `*Metric` types + `BackendMetrics` + `MeteredEgress`
+  moved `fabric-backends`→`fabric-wire`. **No in-process fallback:** driver request + no/unreachable
+  fabricd → `503 EGRESS_UNAVAILABLE`; unknown name → `400 RESOURCE_NOT_FOUND` (resolved daemon-side).
+  `LogicHost::new` lost `handle`/`db_breaker` (breaker → daemon; `/metrics` reports 0 trips).
+- **Verified (Docker `rust:1.92-alpine`):** full `cargo clippy` clean; per-cap cfg sweep clean
+  (`sweep.sh`; needed `tokio` `io-util` on `fabric-wire` so the deterministic-core build has the
+  framing traits); `cargo test` green (fabric-wire 8, fabric-backends 17, runlet-core 40, runlet 9);
+  **live-smoke `smoke_5.sh`** box→UDS→fabricd→Postgres PASSED — query+metrics (box holds no creds),
+  the `503` no-fallback path, and the `400` unknown-name path. (Throwaway `postgres:17-alpine` on a
+  dedicated docker net aliased `postgres`; host 5432 is taken by another project.)
 
 ## What's next (in order)
 
-1. **Commit Step 4b** (see above) if not already done.
-2. **DEFERRED — rewrite `test_simple.py`:** the in-box hard cut (steps 1–3) broke it (it still
-   sends `config.db`). Needs a generated server `config.json` `resources` map for the named
-   variants (pg, pg-maxrows5, pg-badhost, pg-fast, pgbouncer, redis, mongo, nats, nats-fast, mail)
-   and ~40 `config={"db":creds}` → `config={"io":{"db":["name"]}}` rewrites, plus reordering
-   `main()` so auth/zitadel discovery runs BEFORE `_start_server`. Needs all backends up.
-3. **Step 5 (Task #4) — trust-flip finalize:** the box still resolves creds and ships them to
-   `fabricd` in `WireInit` (local UDS, fine for 4b). The full flip: `fabricd` holds the operator
-   `resources` table and resolves creds itself; the box sends only logical names — then `runlet`
-   can drop the `fabric-backends` dep entirely (no drivers in the box binary). Also remove the
-   vestigial `#[expect(dead_code)]` `handle`/`db_breaker` from `LogicHost::new` + struct (coordinate
-   the one-time signature break with external consumer `reactive-database-pg`; update
-   `CONSUMER_NOTES.md` — see item #7 for the 4a API moves).
-4. **`smoke_4b.sh`** in repo root is the reusable live-smoke (run a `postgres:17-alpine` on a docker
-   network aliased `postgres`, then `docker run --network <net> … sh smoke_4b.sh`).
+1. **Commit Step 5** (see above) if not already done. **Project A (resource egress) is complete.**
+2. **DEFERRED — rewrite `test_simple.py`:** the request surface is now `config.io` names + a
+   `fabricd` sidecar. The harness must (a) start `fabricd` with a `resources` config covering the
+   named variants (pg, pg-maxrows5, pg-badhost, pg-fast, pgbouncer, redis, mongo, nats, nats-fast,
+   mail), (b) start `runlet` with `fabricd_socket` set (no `resources` on the box), (c) rewrite
+   `config={"db":creds}` → `config={"io":{"db":["name"]}}`. `smoke_5.sh` is the working reference for
+   the two-process setup. Needs all backends up.
+3. **Project B — network fabric** (`docs/design/network-fabric.md`): grow `fabricd` from a local UDS
+   sidecar into a cross-node QUIC/NATS fabric. Parked until needed.
+4. **`smoke_5.sh`** / **`smoke_4b.sh`** in repo root are the reusable live-smokes (run a
+   `postgres:17-alpine` on a docker network aliased `postgres`, then `docker run --network <net> …
+   sh smoke_5.sh`). `smoke_4b.sh` predates the trust flip (puts creds on the box) — `smoke_5.sh` is
+   the current one.
 
 ## How to build/test/smoke (Windows host — native cargo CAN'T build; use Docker via PowerShell)
 

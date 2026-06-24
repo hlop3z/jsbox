@@ -2,11 +2,12 @@
 
 Companion to [resilience.md](resilience.md) and [network-fabric.md](network-fabric.md).
 
-> **Status: design / in progress.** This is the rationale and the staged plan for moving the
-> driver-backed I/O capabilities (`db`, `mongo`, `mail`, `redis`, `amq`, `auth`) out of
-> `runlet-core` and behind a single network egress port, leaving the core as
-> deterministic-compute + pure-signing capabilities + one `Resource` seam. The behavioral
-> contract for the seam will land in `openspec/specs/` as the implementation settles.
+> **Status: implemented (Project A complete).** All five phases below have landed: the
+> driver-backed I/O capabilities (`db`, `mongo`, `mail`, `redis`, `amq`, `auth`) are out of
+> `runlet-core` and the box binary, behind a single egress port served by the `fabricd` sidecar;
+> the box links no driver and holds no credentials. This doc is the rationale + the (now-historical)
+> staged plan; the live system is the source of truth. Next horizon is
+> [network-fabric.md](network-fabric.md) (Project B): `fabricd` growing into a cross-node fabric.
 
 ## The principle
 
@@ -206,10 +207,25 @@ calls them directly (see step 2).
      `block_on`). **Live-smoked** box→UDS→`fabricd`→Postgres: a `db.query` returned through the
      daemon with metrics, and after killing `fabricd` the box fell back to in-process and still
      served the query. localhost-QUIC (`quinn`) is the cross-node step (Project B).
-5. **Trust-model flip.** `CapabilitySet` driver configs → logical resource allowlist; all
-   creds move into `fabricd`. Remove operator-secret fields from the request surface. *(The
-   in-box half already landed — the request carries `config.io` logical names, not creds; step 5
-   is the `fabricd`-side move + removing the vestigial `handle`/`db_breaker` from `LogicHost::new`.)*
+5. ✅ **Trust-model flip — done.** Credentials now live **only** in `fabricd`. The operator
+   `resources` table (the `ResourceBinding` enum + name→config resolution) moved out of the box
+   into `fabric-backends` (`resources.rs`) / `fabricd`; the box's request still carries `config.io`
+   logical names, and the box forwards the selected name per kind to `fabricd` in the `WireInit`,
+   which resolves it against its own config. Consequences:
+   - The box (`runlet`) **dropped the `fabric-backends` dep entirely** — it links **no** network
+     driver and holds **no** credentials (proven via `cargo tree -p runlet`). The driver-free wire
+     contract (the `Egress` trait, the wire protocol, the `*Metric` types, `BackendMetrics`,
+     `MeteredEgress`) moved to `fabric-wire`; `fabric-backends` keeps the drivers + `*Config` +
+     `ResourceBinding`.
+   - **No in-process fallback:** a request that names a driver resource requires `fabricd`. An
+     unreachable/absent sidecar is `503 EGRESS_UNAVAILABLE`; an unknown/wrong-kind name is resolved
+     daemon-side and surfaced as the same `400 RESOURCE_NOT_FOUND` / `RESOURCE_KIND_MISMATCH` as
+     before. Deterministic / `http` / `s3` requests need no sidecar.
+   - `LogicHost::new` shed its vestigial `handle` + `db_breaker` params (the host drives no I/O); the
+     db circuit breaker moved daemon-side (the box reports zero trips for scrape compatibility).
+   - **Live-smoked** box→UDS→`fabricd`→Postgres with the box holding no creds: query + metrics, the
+     `503` no-fallback path, and the `400` unknown-name path all verified. The one-time
+     `LogicHost::new` signature break is noted for the external consumer in `CONSUMER_NOTES.md`.
 
 Steps 1–3 are the bulk of the value, touch only `runlet-core`, and require no distributed
 systems. Steps 4–5 are the on-ramp to [network-fabric.md](network-fabric.md).

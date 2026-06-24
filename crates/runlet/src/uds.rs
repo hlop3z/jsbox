@@ -1,30 +1,88 @@
 //! Box-side UDS client for the `fabricd` egress sidecar.
 //!
-//! [`UdsEgress`] implements [`Egress`] (and [`MeteredEgress`]) by forwarding each `io.call(...)`
-//! over a Unix-domain socket to `fabricd`, which hosts the real `BackendSet`. One `UdsEgress` owns
-//! one connection for the life of a box-request (so a transaction's `begin`→`commit` hit the same
-//! daemon-side client), opened with a [`WireInit`] handshake carrying the resolved operator configs
-//! + deadline.
+//! [`connect_session`] (async, run on the request's async task) opens the connection and performs
+//! the [`WireInit`] handshake — sending the selected logical resource *names* and the deadline,
+//! and surfacing a name-resolution failure as a [`SessionError`] the handler maps to a status.
+//! [`UdsEgress`] then wraps the live stream and implements [`Egress`] (and [`MeteredEgress`]) by
+//! forwarding each `io.call(...)` over the socket; one `UdsEgress` owns the connection for the life
+//! of a box-request, so a transaction's `begin`→`commit` hit the same daemon-side client.
 //!
-//! Every socket round-trip runs via `Handle::block_on` (the engine drives capabilities
-//! synchronously on a `spawn_blocking` thread), bounded by the per-execution deadline — the same
-//! shape as the in-process async backends. So construct **and** drain this on that blocking thread,
-//! never on a runtime worker. See `docs/design/resource-egress.md` step 4b.
+//! Every `UdsEgress` round-trip runs via `Handle::block_on` (the engine drives capabilities
+//! synchronously on a `spawn_blocking` thread), bounded by the per-execution deadline — so build
+//! and drain it on that blocking thread, never on a runtime worker. The box links no driver and
+//! holds no credentials; `fabricd` does. See `docs/design/resource-egress.md` step 5.
 
 use std::io::{Error as IoError, ErrorKind};
 use std::time::{Duration, Instant};
 
-use fabric_backends::wire::{
-    BackendMetrics, WireCall, WireInit, WireRequest, WireResponse, read_frame, write_frame,
+use fabric_wire::wire::{
+    WireCall, WireInit, WireRequest, WireResponse, read_frame, write_frame,
 };
-use fabric_backends::MeteredEgress;
-use fabric_wire::{Egress, EgressError, ErrorOwner};
+use fabric_wire::{BackendMetrics, Egress, EgressError, ErrorOwner, MeteredEgress};
 use tokio::net::UnixStream;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-/// A box-request session to `fabricd` over a Unix-domain socket.
+/// Why opening a `fabricd` session failed — mapped by the handler to an HTTP status.
+#[derive(Debug)]
+pub(crate) enum SessionError {
+    /// No sidecar configured, or it couldn't be reached / handshaked → retryable `503`.
+    Unavailable(String),
+    /// A requested resource name didn't resolve at `Init` → the caller's `400` (`code` is
+    /// `RESOURCE_NOT_FOUND` / `RESOURCE_KIND_MISMATCH`).
+    Resolve {
+        /// Stable request-category code from the daemon.
+        code: String,
+        /// Human-safe detail.
+        message: String,
+    },
+    /// An unexpected daemon response to `Init` → `500`.
+    Protocol(String),
+}
+
+/// Opens a `fabricd` session: connects to `socket` and performs the [`WireInit`] handshake.
+///
+/// Async — run on the request's async task (no `block_on`), so a name-resolution `400` or an
+/// unreachable-sidecar `503` is decided before the blocking execution is admitted.
+///
+/// # Errors
+///
+/// Returns a [`SessionError`]: `Unavailable` (no socket / unreachable / closed), `Resolve` (a name
+/// failed to resolve), or `Protocol` (an unexpected response).
+pub(crate) async fn connect_session(
+    socket: Option<&str>,
+    init: &WireInit,
+) -> Result<UnixStream, SessionError> {
+    let Some(path) = socket else {
+        return Err(SessionError::Unavailable(
+            "no fabricd egress sidecar configured".to_owned(),
+        ));
+    };
+    let mut stream = UnixStream::connect(path)
+        .await
+        .map_err(|err| SessionError::Unavailable(format!("fabricd unreachable: {err}")))?;
+    write_frame(&mut stream, &WireRequest::Init(Box::new(init.clone())))
+        .await
+        .map_err(|err| SessionError::Unavailable(format!("fabricd write failed: {err}")))?;
+    match read_frame::<_, WireResponse>(&mut stream).await {
+        Ok(Some(WireResponse::Ack)) => Ok(stream),
+        Ok(Some(WireResponse::InitError { code, message })) => {
+            Err(SessionError::Resolve { code, message })
+        }
+        Ok(Some(
+            WireResponse::Reply(_) | WireResponse::Metrics(_) | WireResponse::ProtocolError(_),
+        )) => Err(SessionError::Protocol("unexpected response to Init".to_owned())),
+        Ok(None) => Err(SessionError::Unavailable(
+            "fabricd closed the connection during handshake".to_owned(),
+        )),
+        Err(err) => Err(SessionError::Unavailable(format!(
+            "fabricd handshake read failed: {err}"
+        ))),
+    }
+}
+
+/// A box-request session to `fabricd` over an already-connected Unix-domain socket.
 #[derive(Debug)]
 pub(crate) struct UdsEgress {
     /// Runtime handle to drive the socket I/O via `block_on` (on the `spawn_blocking` thread).
@@ -37,45 +95,17 @@ pub(crate) struct UdsEgress {
 }
 
 impl UdsEgress {
-    /// Connects to `socket_path`, performs the [`WireInit`] handshake, and anchors the deadline.
-    ///
-    /// Must run on the `spawn_blocking` thread (it `block_on`s the connect + handshake).
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`EgressError`] (source `engine`, retryable) if the socket can't be reached or the
-    /// daemon doesn't acknowledge the session.
-    pub(crate) fn connect(
-        socket_path: &str,
-        init: WireInit,
-        handle: &Handle,
-        budget: Duration,
-    ) -> Result<Self, EgressError> {
-        let stream = handle.block_on(async {
-            let mut stream = UnixStream::connect(socket_path)
-                .await
-                .map_err(|err| connect_error(&err.to_string()))?;
-            write_frame(&mut stream, &WireRequest::Init(Box::new(init)))
-                .await
-                .map_err(|err| connect_error(&err.to_string()))?;
-            match read_frame::<_, WireResponse>(&mut stream).await {
-                Ok(Some(WireResponse::Ack)) => Ok(stream),
-                Ok(Some(WireResponse::ProtocolError(msg))) => Err(connect_error(&msg)),
-                Ok(Some(WireResponse::Reply(_) | WireResponse::Metrics(_))) => {
-                    Err(connect_error("unexpected response to Init"))
-                }
-                Ok(None) => Err(connect_error("daemon closed the connection during handshake")),
-                Err(err) => Err(connect_error(&err.to_string())),
-            }
-        })?;
+    /// Wraps an already-handshaked stream (from [`connect_session`]) and anchors the deadline.
+    /// Build this on the `spawn_blocking` thread — its calls `block_on`.
+    pub(crate) fn from_stream(stream: UnixStream, handle: Handle, budget: Duration) -> Self {
         let deadline = Instant::now()
             .checked_add(budget)
             .unwrap_or_else(Instant::now);
-        Ok(Self {
-            handle: handle.clone(),
+        Self {
+            handle,
             conn: Mutex::new(stream),
             deadline,
-        })
+        }
     }
 }
 
@@ -95,9 +125,13 @@ impl Egress for UdsEgress {
                 Ok(Ok(WireResponse::ProtocolError(msg))) => {
                     Err(transport_error(&source, "IO_PROTOCOL", &msg))
                 }
-                Ok(Ok(WireResponse::Ack | WireResponse::Metrics(_))) => {
-                    Err(transport_error(&source, "IO_PROTOCOL", "unexpected daemon response"))
-                }
+                Ok(Ok(
+                    WireResponse::Ack | WireResponse::InitError { .. } | WireResponse::Metrics(_),
+                )) => Err(transport_error(
+                    &source,
+                    "IO_PROTOCOL",
+                    "unexpected daemon response",
+                )),
                 Ok(Err(err)) => Err(transport_error(&source, "IO_TRANSPORT", &err.to_string())),
                 Err(_elapsed) => Err(transport_error(
                     &source,
@@ -117,7 +151,12 @@ impl MeteredEgress for UdsEgress {
             let mut conn = self.conn.lock().await;
             match roundtrip(&mut conn, &WireRequest::Drain).await {
                 Ok(WireResponse::Metrics(metrics)) => *metrics,
-                Ok(WireResponse::Ack | WireResponse::Reply(_) | WireResponse::ProtocolError(_))
+                Ok(
+                    WireResponse::Ack
+                    | WireResponse::InitError { .. }
+                    | WireResponse::Reply(_)
+                    | WireResponse::ProtocolError(_),
+                )
                 | Err(_) => BackendMetrics::default(),
             }
         })
@@ -131,17 +170,6 @@ async fn roundtrip(conn: &mut UnixStream, request: &WireRequest) -> Result<WireR
     read_frame::<_, WireResponse>(conn)
         .await?
         .ok_or_else(|| IoError::new(ErrorKind::UnexpectedEof, "fabricd closed the connection"))
-}
-
-/// Builds the connect-failure error (source `engine`, retryable) the caller uses to decide on the
-/// in-process fallback — it never reaches a script.
-fn connect_error(message: &str) -> EgressError {
-    EgressError::new(
-        "engine",
-        "IO_CONNECT",
-        format!("fabricd connect failed: {message}"),
-    )
-    .retryable()
 }
 
 /// Builds a transport/protocol error tagged to the calling capability `source` so the engine

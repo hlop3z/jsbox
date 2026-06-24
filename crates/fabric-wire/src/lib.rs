@@ -18,8 +18,13 @@ pub mod breaker;
 pub mod egress;
 pub mod errors;
 pub mod metrics;
+pub mod wire;
 
 pub use crate::breaker::{BreakerConfig, CircuitBreaker};
 pub use crate::egress::{Egress, EgressError};
 pub use crate::errors::{DynamicFault, ErrorOwner, Fault, dynamic_fault_json};
 pub use crate::metrics::{Collector, check_op_limit, drain, new_collector, op_count, record};
+pub use crate::wire::{
+    AmqMetric, AuthMetric, BackendMetrics, DbMetric, MailMetric, MeteredEgress, MongoMetric,
+    RedisMetric, WireCall, WireInit, WireRequest, WireResponse,
+};

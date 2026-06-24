@@ -7,18 +7,11 @@
 //! Size fields accept human-readable strings: `"8mb"`, `"256kb"`, `"1gb"`,
 //! or plain numbers in bytes: `8388608`.
 
-use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use fabric_backends::amq::AmqConfig;
-use fabric_backends::auth::AuthConfig;
-use fabric_backends::db::DbConfig;
-use fabric_backends::kv::RedisConfig;
-use fabric_backends::mail::MailConfig;
-use fabric_backends::mongo::MongoConfig;
 use runlet_core::config::EngineConfig;
 use serde::Deserialize;
 
@@ -69,40 +62,15 @@ pub(crate) struct Config {
     /// loopback bind never needs this.
     #[serde(default)]
     pub(crate) allow_unauthenticated: bool,
-    /// Operator-declared logical resources the egress port resolves by name. A request names
-    /// these in `config.io` (e.g. `{"db":["orders-db"]}`); the endpoint/credentials live here,
-    /// never in the request body — so a compromised caller can only reach the resources the
-    /// operator provisioned, and never learns a credential. Omit to disable all driver-backed
-    /// capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`).
-    #[serde(default)]
-    pub(crate) resources: HashMap<String, ResourceBinding>,
-    /// Optional path to a `fabricd` egress sidecar's Unix-domain socket. When set, the
-    /// driver-backed capabilities route over UDS to the daemon (which holds the drivers), with an
-    /// automatic fallback to the in-process backends if the daemon is unreachable. Omit (default)
-    /// to always run the backends in-process. See `docs/design/resource-egress.md` step 4b.
+    /// Path to the `fabricd` egress sidecar's Unix-domain socket. **Required** to use any
+    /// driver-backed capability (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`): the box links no
+    /// driver and holds no credentials — it sends the request's `config.io` logical names to
+    /// `fabricd`, which resolves them against its own operator config and performs the I/O. Omit
+    /// when the deployment serves only deterministic / `http` / `s3` capabilities; a request that
+    /// names a driver resource with no `fabricd_socket` set is rejected `503 EGRESS_UNAVAILABLE`.
+    /// See `docs/design/resource-egress.md` step 5.
     #[serde(default)]
     pub(crate) fabricd_socket: Option<String>,
-}
-
-/// One operator-declared logical resource: a driver `kind` tag plus that driver's connection
-/// config (the remaining fields). Internally tagged, so `{"kind":"db","host":…}` selects the
-/// `db` capability and deserializes the rest into its [`DbConfig`]. Boxed variants keep the enum
-/// small (the configs differ widely in size).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum ResourceBinding {
-    /// A Postgres-family `db` resource.
-    Db(Box<DbConfig>),
-    /// A `mongo` document-database resource.
-    Mongo(Box<MongoConfig>),
-    /// A `mail`/SMTP resource.
-    Mail(Box<MailConfig>),
-    /// A `redis` resource.
-    Redis(Box<RedisConfig>),
-    /// An `amq` (`RabbitMQ`/`NATS`) message-broker resource.
-    Amq(Box<AmqConfig>),
-    /// An `auth` (OIDC/IAM) resource.
-    Auth(Box<AuthConfig>),
 }
 
 /// HTTP server settings.

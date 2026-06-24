@@ -7,7 +7,6 @@ mod uds;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -15,13 +14,11 @@ use axum::routing::{get, post};
 use axum::serve::ListenerExt as _;
 use rustls::crypto::aws_lc_rs;
 use tokio::net::TcpListener;
-use tokio::runtime::Handle;
 use tokio::signal;
 use tokio::sync::Semaphore;
 use tracing::info;
 use tracing_subscriber::fmt::init as init_tracing;
 
-use runlet_core::breaker::{BreakerConfig, CircuitBreaker};
 use runlet_core::host::{HostSettings, LogicHost};
 use runlet_core::metrics::Metrics;
 use runlet_core::modules::ModuleRegistry;
@@ -126,42 +123,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             "per-partition fairness: {per_partition} concurrent/partition across {partition_buckets} buckets"
         );
     }
-    let breaker_threshold = engine_cfg.db_breaker_threshold;
-    let breaker_cooldown_ms = engine_cfg.resolved_breaker_cooldown_ms();
-    let db_breaker = CircuitBreaker::new(BreakerConfig {
-        threshold: breaker_threshold,
-        cooldown: Duration::from_millis(breaker_cooldown_ms),
-    })
-    .map(Arc::new);
-    if db_breaker.is_some() {
-        info!(
-            "db circuit breaker: trip after {breaker_threshold} fails, {breaker_cooldown_ms}ms cool-down"
-        );
-    }
-
-    // The operator's logical-resource table — endpoints/credentials the request never sees. A
-    // request names these in `config.io`; the handler resolves names to configs (see
-    // `handler::resolve_egress`). Cloned out of `config` (read-only thereafter) into the shared
-    // state. Loaded before the engine config moves into the pool.
-    let resources = Arc::new(config.resources.clone());
-    if !resources.is_empty() {
-        info!("logical resources: {} declared", resources.len());
-    }
-
-    // Optional egress sidecar: when set, driver-backed capabilities route over UDS to `fabricd`
-    // (with in-process fallback). Captured before the engine config moves into the pool.
-    let fabricd_socket = config.fabricd_socket.clone();
+    // The egress sidecar socket. Driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/
+    // `auth`) route over UDS to `fabricd`, which holds the drivers + credentials; the box links no
+    // driver. Captured before the engine config moves into the pool.
+    let fabricd_socket: Option<Arc<str>> = config.fabricd_socket.clone().map(Arc::from);
     if let Some(socket) = fabricd_socket.as_deref() {
-        info!(socket, "fabricd egress sidecar configured (UDS, in-process fallback)");
+        info!(socket, "fabricd egress sidecar configured (UDS)");
+    } else {
+        info!("no fabricd egress sidecar: driver-backed capabilities are unavailable");
     }
 
     let registry = Arc::new(script_registry);
-    // The callable logic host owns the pool + resilience wiring; the HTTP front is one
-    // consumer of it (a non-HTTP scheduler could be another).
+    // The callable logic host owns the pool + engine limits; the HTTP front is one consumer of it
+    // (a non-HTTP scheduler could be another). It drives no I/O itself — driver capabilities run in
+    // the wired `fabricd` egress.
     let host = LogicHost::new(
         js_pool,
-        Handle::current(),
-        db_breaker.clone(),
         Arc::clone(&registry),
         HostSettings {
             limits: engine_cfg,
@@ -178,8 +155,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         error_debug: config.error_debug,
         limiter: Arc::new(Semaphore::new(max_concurrent)),
         partition_limiter,
-        db_breaker,
-        resources,
         fabricd_socket,
         metrics: Arc::new(Metrics::default()),
         bulkhead_capacity: max_concurrent,

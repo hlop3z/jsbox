@@ -7,17 +7,16 @@
 //! per-capability metrics). The HTTP front (`runlet`) is one consumer; a write-path / CDC /
 //! action scheduler is another.
 //!
-//! `run` is synchronous and must be called from a blocking context (the host captures a
-//! tokio [`Handle`] at construction to drive async capability I/O via `block_on`, exactly as
-//! the engine requires — `QuickJS` is single-threaded and must not run on a runtime worker).
+//! `run` is synchronous and must be called from a blocking context — `QuickJS` is
+//! single-threaded and must not run on a runtime worker. The host drives no I/O itself; any
+//! async capability work happens in the consumer's wired [`Egress`] (e.g. a `fabricd` sidecar),
+//! which carries its own runtime handle.
 
 use core::fmt;
 use std::sync::Arc;
 
 use serde_json::value::RawValue;
-use tokio::runtime::Handle;
 
-use crate::breaker::CircuitBreaker;
 use crate::bytecode::BytecodeCacheStats;
 use crate::config::EngineConfig;
 use crate::egress::Egress;
@@ -39,28 +38,6 @@ use crate::sys::SysConfig;
 pub struct LogicHost {
     /// Pool of pre-warmed runtimes.
     pool: JsPool,
-    /// Tokio handle, retained for `LogicHost::new` API stability.
-    ///
-    /// Vestigial: every async driver (`db`, `mongo`) now runs in the consumer's `Egress`
-    /// adapter, which carries its own handle (`Handle::current()` on the request thread), so the
-    /// engine no longer drives `block_on` and never reads this. Kept on the constructor pending
-    /// the step-4/5 cleanup — see `docs/design/resource-egress.md`.
-    #[expect(
-        dead_code,
-        reason = "async drivers moved to the Egress adapter; kept on new() for API stability"
-    )]
-    handle: Handle,
-    /// `db` circuit breaker (Tier 3), shared across invocations. `None` = disabled.
-    ///
-    /// Vestigial on the host: `db` connections now happen in the consumer's `Egress` adapter
-    /// (the binary's handler holds the breaker via `AppState` and passes it there), so the
-    /// engine no longer reads this. Retained on [`LogicHost::new`] for API stability pending the
-    /// step-4/5 cleanup — see `docs/design/resource-egress.md`.
-    #[expect(
-        dead_code,
-        reason = "db connect/breaker moved to the Egress adapter; kept on new() for API stability"
-    )]
-    db_breaker: Option<Arc<CircuitBreaker>>,
     /// Engine sandbox limits (timeout, `max_ops`, output cap, wildcard policy, …).
     limits: EngineConfig,
     /// Relax the SSRF private-IP block (`api`/`s3`) — local-dev only.
@@ -326,20 +303,19 @@ impl ResolvedSource<'_> {
 }
 
 impl LogicHost {
-    /// Builds a host from a runtime pool, a tokio handle, the optional `db` breaker, the
-    /// script registry, and the engine [`HostSettings`].
+    /// Builds a host from a runtime pool, the script registry, and the engine [`HostSettings`].
+    ///
+    /// As of the resource-egress trust flip the host drives no I/O itself — every driver runs in
+    /// the consumer's wired [`Egress`] (a `fabricd` sidecar) — so it no longer takes a tokio
+    /// `Handle` or a `db` circuit breaker (see `docs/design/resource-egress.md` step 5).
     #[must_use]
     pub const fn new(
         pool: JsPool,
-        handle: Handle,
-        db_breaker: Option<Arc<CircuitBreaker>>,
         registry: Arc<ScriptRegistry>,
         settings: HostSettings,
     ) -> Self {
         Self {
             pool,
-            handle,
-            db_breaker,
             limits: settings.limits,
             allow_private_targets: settings.allow_private_targets,
             registry,

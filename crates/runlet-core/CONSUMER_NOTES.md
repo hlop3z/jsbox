@@ -166,6 +166,30 @@ into a new leaf **`fabric-wire`** crate. `runlet-core` now links **no** network 
   in-engine `http`/`s3` metrics; the driver-backed metrics are drained directly from the
   `BackendSet` (`.db_metrics()` etc.). The `runlet` binary is converted as the reference.
 
+## 8. `LogicHost::new` signature change — **breaking, action required** *(2026-06-24, Step 5)*
+
+> Affects **every** consumer, including the deterministic-only embed (reactive-database-pg).
+
+**What changed:** `LogicHost::new` dropped its two vestigial parameters. The host drives no I/O
+itself anymore — all driver work runs in the consumer's wired `Egress` (a `fabricd` sidecar) — so
+the tokio `Handle` and the `Option<Arc<CircuitBreaker>>` it used to take are gone:
+
+```rust
+// before
+LogicHost::new(pool, handle, db_breaker, registry, settings)
+// after
+LogicHost::new(pool, registry, settings)
+```
+
+**Action:** drop the two arguments at your `LogicHost::new` call site. Nothing else in the blessed
+surface changed — `Invocation`, `CapabilitySet`, `Outcome`, `Egress`/`EgressError` (still
+`runlet_core::egress`), and the `read_hook` seam are unchanged. If you wired a breaker only to pass
+it here, you can delete it; resilience for driver egress now lives in `fabricd`.
+
+**Also (Step 5, driver-feature consumers only):** the operator credential table + name→config
+resolution moved out of the request/box into `fabricd`. The box sends logical names only and holds
+no credentials; there is no in-process driver path. See `docs/design/resource-egress.md`.
+
 ---
 
 *Maintainer: triage/close items here as they're addressed; this file is a consumer-feedback inbox, not

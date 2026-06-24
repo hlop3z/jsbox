@@ -1,6 +1,5 @@
 //! HTTP handler for the `/execute` endpoint.
 
-use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -18,16 +17,12 @@ use tokio::task;
 use tracing::warn;
 use uuid::Uuid;
 
-use fabric_backends::amq::{AmqConfig, AmqMetric};
-use fabric_backends::auth::{AuthConfig, AuthMetric};
-use fabric_backends::db::{DbConfig, DbMetric};
-use fabric_backends::kv::{RedisConfig, RedisMetric};
-use fabric_backends::mail::{MailConfig, MailMetric};
-use fabric_backends::mongo::{MongoConfig, MongoMetric};
-use fabric_backends::{AsyncDeps, BackendMetrics, BackendSet, MeteredEgress, WireInit};
-use runlet_core::breaker::CircuitBreaker;
+use fabric_wire::wire::WireInit;
+use fabric_wire::{
+    AmqMetric, AuthMetric, BackendMetrics, DbMetric, Egress, MailMetric, MeteredEgress,
+    MongoMetric, RedisMetric,
+};
 use runlet_core::config::EngineConfig;
-use runlet_core::egress::Egress;
 use runlet_core::engine::{EngineError, ExecOutcome, Gate};
 use runlet_core::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
 use runlet_core::host::{CapabilitySet, ExecMetrics, Invocation, LogicHost, Outcome};
@@ -39,8 +34,7 @@ use runlet_core::s3::{S3Config, S3Metric};
 use runlet_core::sandbox;
 use runlet_core::sys::SysConfig;
 
-use crate::config::ResourceBinding;
-use crate::uds::UdsEgress;
+use crate::uds::{SessionError, UdsEgress, connect_session};
 
 /// Shared application state for the router: the logic host, the script registry, and
 /// the concurrency bulkhead.
@@ -51,8 +45,7 @@ pub(crate) struct AppState {
     /// Read-only registry of scripts loaded at startup (execute-by-key). Resolved here for
     /// input-sizing/meta before the source is handed to the host as inline code.
     pub(crate) registry: Arc<ScriptRegistry>,
-    /// Engine sandbox limits, used outside the host for input-size validation and the
-    /// `statement_timeout` clamp.
+    /// Engine sandbox limits, used outside the host for input-size validation.
     pub(crate) engine_cfg: EngineConfig,
     /// Include `error.debug` (stack traces + raw causes) in responses.
     pub(crate) error_debug: bool,
@@ -64,17 +57,12 @@ pub(crate) struct AppState {
     /// disabled. Acquired *before* the global bulkhead so a noisy partition fast-fails on its
     /// own share (`429 PARTITION_OVERLOADED`) while global capacity stays free for others.
     pub(crate) partition_limiter: Option<PartitionLimiter>,
-    /// `db` circuit breaker (Tier 3): fast-fails requests to a target that keeps failing
-    /// to connect. `None` = disabled. Shared across requests.
-    pub(crate) db_breaker: Option<Arc<CircuitBreaker>>,
-    /// Operator-declared logical resources, resolved by name from a request's `config.io`
-    /// allowlist. The endpoint/credentials live here (operator-supplied at startup), never in
-    /// the request body — a script names `"orders-db"`, never a host or password.
-    pub(crate) resources: Arc<HashMap<String, ResourceBinding>>,
-    /// Optional `fabricd` egress sidecar socket path. When set, each request routes its
-    /// driver-backed capabilities over UDS to the daemon (which holds the drivers), falling back to
-    /// the in-process `BackendSet` if the daemon is unreachable. `None` = always in-process.
-    pub(crate) fabricd_socket: Option<String>,
+    /// Path to the `fabricd` egress sidecar's Unix-domain socket, or `None`. The box links no
+    /// driver and holds no credentials: a request that names a driver resource in `config.io`
+    /// routes over this socket to `fabricd`, which resolves the name against its own operator
+    /// config and performs the I/O. `None` ⇒ driver capabilities are unavailable
+    /// (`503 EGRESS_UNAVAILABLE`).
+    pub(crate) fabricd_socket: Option<Arc<str>>,
     /// Process-wide observability counters, exposed at `GET /metrics`.
     pub(crate) metrics: Arc<Metrics>,
     /// Configured global bulkhead capacity, surfaced as the `_total` permit gauge.
@@ -132,9 +120,9 @@ impl ScriptSource {
 
 /// Per-request configuration sent by the caller.
 ///
-/// Driver-backed capabilities no longer carry connection config here: the request names
-/// logical resources in [`io`](Self::io) and the endpoint/credentials are resolved
-/// operator-side (see [`AppState::resources`]). `http` (`allowed_hosts`) and `s3` stay
+/// Driver-backed capabilities carry no connection config here: the request names logical resources
+/// in [`io`](Self::io) and the box forwards those names to `fabricd`, which resolves the
+/// endpoint/credentials operator-side. `http` (`allowed_hosts`) and `s3` stay
 /// script-controlled/in-engine and keep their config.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RequestConfig {
@@ -148,15 +136,15 @@ pub(crate) struct RequestConfig {
     #[serde(default)]
     pub(crate) sys: Option<SysConfig>,
     /// Logical resources this invocation may reach, keyed by capability kind (e.g.
-    /// `{"db":["orders-db"]}`). Names are resolved to operator config server-side; the request
-    /// never carries endpoints or credentials.
+    /// `{"db":["orders-db"]}`). The names are sent to `fabricd`, which resolves them against its
+    /// operator config; the request never carries endpoints or credentials.
     #[serde(default)]
     pub(crate) io: RequestIo,
 }
 
 /// The `config.io` allowlist: which logical resources the script may address, per capability
-/// kind. The interim in-process egress wires the first named resource of each kind (single
-/// binding per kind); the names are resolved to operator config in [`resolve_egress`].
+/// kind. The box selects the first named resource of each kind (single binding per kind) and
+/// sends those names to `fabricd` in the session `WireInit`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RequestIo {
     /// `db` logical resource names.
@@ -179,27 +167,8 @@ pub(crate) struct RequestIo {
     pub(crate) auth: Vec<String>,
 }
 
-/// Operator configs resolved from a request's logical-resource names, ready to wire into the
-/// in-process [`Egress`](runlet_core::egress::Egress). Each field is `Some` only when the
-/// request named a resource of that kind that resolved to a matching operator binding.
-#[derive(Debug, Default)]
-struct ResolvedEgress {
-    /// Resolved `db` connection config.
-    db: Option<DbConfig>,
-    /// Resolved `mongo` config.
-    mongo: Option<MongoConfig>,
-    /// Resolved `mail` config.
-    mail: Option<MailConfig>,
-    /// Resolved `redis` config.
-    redis: Option<RedisConfig>,
-    /// Resolved `amq` config.
-    amq: Option<AmqConfig>,
-    /// Resolved `auth` config.
-    auth: Option<AuthConfig>,
-}
-
-/// Per-capability gates derived from a [`ResolvedEgress`] — which capability wrapper the engine
-/// injects. `Copy` so it can move into the blocking task.
+/// Per-capability gates derived from `config.io` — which capability wrapper the engine injects.
+/// `Copy` so it can move into the blocking task.
 #[derive(Debug, Clone, Copy)]
 struct CapabilityGates {
     /// Expose `db`.
@@ -216,110 +185,46 @@ struct CapabilityGates {
     auth: Gate,
 }
 
-impl ResolvedEgress {
-    /// The engine-side capability gates (which wrappers to inject) for this resolution.
+impl RequestIo {
+    /// `true` if any driver capability is requested (so a `fabricd` session is needed).
+    fn any(&self) -> bool {
+        [
+            &self.db,
+            &self.mongo,
+            &self.mail,
+            &self.redis,
+            &self.amq,
+            &self.auth,
+        ]
+        .iter()
+        .any(|names| !names.is_empty())
+    }
+
+    /// The engine-side capability gates — a kind is exposed iff the request named a resource for it.
     const fn gates(&self) -> CapabilityGates {
         CapabilityGates {
-            db: Gate::from_enabled(self.db.is_some()),
-            mongo: Gate::from_enabled(self.mongo.is_some()),
-            mail: Gate::from_enabled(self.mail.is_some()),
-            redis: Gate::from_enabled(self.redis.is_some()),
-            amq: Gate::from_enabled(self.amq.is_some()),
-            auth: Gate::from_enabled(self.auth.is_some()),
+            db: Gate::from_enabled(!self.db.is_empty()),
+            mongo: Gate::from_enabled(!self.mongo.is_empty()),
+            mail: Gate::from_enabled(!self.mail.is_empty()),
+            redis: Gate::from_enabled(!self.redis.is_empty()),
+            amq: Gate::from_enabled(!self.amq.is_empty()),
+            auth: Gate::from_enabled(!self.auth.is_empty()),
         }
     }
-}
 
-/// Resolves a request's logical-resource names against the operator resource table, returning
-/// the concrete configs to wire. The request only ever names resources — credentials live in
-/// the table — so this is the trust boundary: an unknown name or a kind mismatch is rejected
-/// (boxed status + envelope) before any I/O is wired.
-fn resolve_egress(
-    table: &HashMap<String, ResourceBinding>,
-    io: &RequestIo,
-) -> Result<ResolvedEgress, Box<(u16, ErrorEnvelope)>> {
-    Ok(ResolvedEgress {
-        db: pick(table, &io.db, "db", |binding| match binding {
-            ResourceBinding::Db(cfg) => Some((**cfg).clone()),
-            ResourceBinding::Mongo(_)
-            | ResourceBinding::Mail(_)
-            | ResourceBinding::Redis(_)
-            | ResourceBinding::Amq(_)
-            | ResourceBinding::Auth(_) => None,
-        })?,
-        mongo: pick(table, &io.mongo, "mongo", |binding| match binding {
-            ResourceBinding::Mongo(cfg) => Some((**cfg).clone()),
-            ResourceBinding::Db(_)
-            | ResourceBinding::Mail(_)
-            | ResourceBinding::Redis(_)
-            | ResourceBinding::Amq(_)
-            | ResourceBinding::Auth(_) => None,
-        })?,
-        mail: pick(table, &io.mail, "mail", |binding| match binding {
-            ResourceBinding::Mail(cfg) => Some((**cfg).clone()),
-            ResourceBinding::Db(_)
-            | ResourceBinding::Mongo(_)
-            | ResourceBinding::Redis(_)
-            | ResourceBinding::Amq(_)
-            | ResourceBinding::Auth(_) => None,
-        })?,
-        redis: pick(table, &io.redis, "redis", |binding| match binding {
-            ResourceBinding::Redis(cfg) => Some((**cfg).clone()),
-            ResourceBinding::Db(_)
-            | ResourceBinding::Mongo(_)
-            | ResourceBinding::Mail(_)
-            | ResourceBinding::Amq(_)
-            | ResourceBinding::Auth(_) => None,
-        })?,
-        amq: pick(table, &io.amq, "amq", |binding| match binding {
-            ResourceBinding::Amq(cfg) => Some((**cfg).clone()),
-            ResourceBinding::Db(_)
-            | ResourceBinding::Mongo(_)
-            | ResourceBinding::Mail(_)
-            | ResourceBinding::Redis(_)
-            | ResourceBinding::Auth(_) => None,
-        })?,
-        auth: pick(table, &io.auth, "auth", |binding| match binding {
-            ResourceBinding::Auth(cfg) => Some((**cfg).clone()),
-            ResourceBinding::Db(_)
-            | ResourceBinding::Mongo(_)
-            | ResourceBinding::Mail(_)
-            | ResourceBinding::Redis(_)
-            | ResourceBinding::Amq(_) => None,
-        })?,
-    })
-}
-
-/// Resolves the first named resource of one kind: `None` when none is named; the extracted
-/// config when the name exists and matches the kind; a `400` envelope when the name is unknown
-/// or is the wrong kind. Only the first name is wired (single binding per kind, interim).
-fn pick<T>(
-    table: &HashMap<String, ResourceBinding>,
-    names: &[String],
-    kind: &str,
-    extract: impl Fn(&ResourceBinding) -> Option<T>,
-) -> Result<Option<T>, Box<(u16, ErrorEnvelope)>> {
-    let Some(name) = names.first() else {
-        return Ok(None);
-    };
-    let Some(binding) = table.get(name) else {
-        return Err(Box::new((
-            400,
-            request_error(
-                "RESOURCE_NOT_FOUND",
-                format!("no operator resource named `{name}`"),
-            ),
-        )));
-    };
-    extract(binding).map(Some).ok_or_else(|| {
-        Box::new((
-            400,
-            request_error(
-                "RESOURCE_KIND_MISMATCH",
-                format!("resource `{name}` is not a {kind} resource"),
-            ),
-        ))
-    })
+    /// The `fabricd` session-open message: the first named resource per kind + the per-execution
+    /// deadline. `fabricd` resolves each name against its operator config.
+    fn wire_init(&self, timeout: Duration) -> WireInit {
+        WireInit {
+            db: self.db.first().cloned(),
+            mongo: self.mongo.first().cloned(),
+            mail: self.mail.first().cloned(),
+            redis: self.redis.first().cloned(),
+            amq: self.amq.first().cloned(),
+            auth: self.auth.first().cloned(),
+            timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
 }
 
 /// Returns a clone of the pre-allocated default context.
@@ -457,67 +362,36 @@ fn raw_null_ref() -> &'static RawValue {
     &RAW_NULL
 }
 
-/// Builds the per-request egress adapter (on the blocking thread): a UDS client to `fabricd` when a
-/// socket is configured, falling back to the in-process [`BackendSet`] if the daemon is
-/// unreachable; else the in-process `BackendSet`. Either connects each backend lazily on first use,
-/// so dispatch + metrics live in the adapter, not the engine. `deps`/`timeout` carry the runtime
-/// handle, optional breaker, and per-execution deadline.
-///
-/// Returns `dyn MeteredEgress` so the caller can pass it as `dyn Egress` to the invocation and
-/// drain its metrics after — uniform across the UDS and in-process paths.
-fn build_adapter(
-    resolved: &ResolvedEgress,
-    socket: Option<&str>,
-    deps: &AsyncDeps,
-    timeout: Duration,
-) -> Arc<dyn MeteredEgress> {
-    if let Some(path) = socket {
-        match UdsEgress::connect(path, wire_init(resolved, timeout), &deps.handle, timeout) {
-            Ok(egress) => return Arc::new(egress),
-            Err(err) => warn!(
-                error = %err.message,
-                "fabricd unreachable; falling back to in-process backends"
-            ),
+/// Maps a [`SessionError`] (opening the `fabricd` session) to a response: a resolution failure is
+/// the caller's `400`, an unreachable/absent sidecar is a retryable `503`, a protocol slip is a
+/// `500`.
+fn session_error_response(err: SessionError, meta: Meta) -> AxumResponse {
+    match err {
+        SessionError::Resolve { code, message } => {
+            system_error_response(request_error(&code, message), 400, meta)
         }
-    }
-    Arc::new(build_backend_set(resolved, deps))
-}
-
-/// Builds the in-process `BackendSet` from the resolved operator configs (lazy connect per backend).
-fn build_backend_set(resolved: &ResolvedEgress, deps: &AsyncDeps) -> BackendSet {
-    let mut adapter = BackendSet::new();
-    if let Some(cfg) = resolved.db.clone() {
-        adapter = adapter.with_db(cfg, deps);
-    }
-    if let Some(cfg) = resolved.mongo.clone() {
-        adapter = adapter.with_mongo(cfg, deps);
-    }
-    if let Some(cfg) = resolved.mail.clone() {
-        adapter = adapter.with_mail(cfg);
-    }
-    if let Some(cfg) = resolved.redis.clone() {
-        adapter = adapter.with_redis(cfg);
-    }
-    if let Some(cfg) = resolved.amq.clone() {
-        adapter = adapter.with_amq(cfg);
-    }
-    if let Some(cfg) = resolved.auth.clone() {
-        adapter = adapter.with_auth(cfg);
-    }
-    adapter
-}
-
-/// Builds the `fabricd` session-open message ([`WireInit`]) from the resolved operator configs +
-/// the per-execution deadline.
-fn wire_init(resolved: &ResolvedEgress, timeout: Duration) -> WireInit {
-    WireInit {
-        db: resolved.db.clone(),
-        mongo: resolved.mongo.clone(),
-        mail: resolved.mail.clone(),
-        redis: resolved.redis.clone(),
-        amq: resolved.amq.clone(),
-        auth: resolved.auth.clone(),
-        timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        SessionError::Unavailable(message) => {
+            let envelope = ErrorEnvelope::new(
+                ErrorCategory::Runtime,
+                ErrorSource::Engine,
+                "EGRESS_UNAVAILABLE".to_owned(),
+                true,
+                ErrorOwner::Operator,
+            )
+            .with_message(message);
+            system_error_response(envelope, 503, meta)
+        }
+        SessionError::Protocol(_raw) => {
+            let envelope = ErrorEnvelope::new(
+                ErrorCategory::Runtime,
+                ErrorSource::Engine,
+                "EGRESS_PROTOCOL".to_owned(),
+                false,
+                ErrorOwner::Operator,
+            )
+            .with_message("egress protocol error".to_owned());
+            system_error_response(envelope, 500, meta)
+        }
     }
 }
 
@@ -528,7 +402,7 @@ fn wire_init(resolved: &ResolvedEgress, timeout: Duration) -> WireInit {
 /// instead of axum short-circuiting with its default plain-text rejection.
 #[expect(
     clippy::too_many_lines,
-    reason = "linear request pipeline: auth → resolve egress → admit → execute → respond"
+    reason = "linear request pipeline: auth → open egress session → admit → execute → respond"
 )]
 pub(crate) async fn execute(
     State(state): State<AppState>,
@@ -591,27 +465,31 @@ pub(crate) async fn execute(
     }
 
     let context_json: String = context.get().into();
-    // Trust boundary: resolve the request's logical-resource names (`config.io`) to operator
-    // configs. The request names resources; credentials live operator-side. An unknown name or
-    // kind mismatch is rejected here, before any I/O is wired.
-    let mut resolved = match resolve_egress(&state.resources, &config.io) {
-        Ok(resolved) => resolved,
-        Err(rejection) => {
-            state.metrics.record_rejection();
-            let (status, envelope) = *rejection;
-            let meta = Meta::new(trace_id, script_bytes, context_bytes, 0)
-                .with_key(key)
-                .with_partition(partition);
-            return system_error_response(envelope, status, meta);
+    let gates = config.io.gates();
+
+    // Open the `fabricd` egress session when any driver capability is requested. The box holds no
+    // credentials: it sends the selected logical names; `fabricd` resolves them against its own
+    // operator config. An unknown name (400), or an unreachable/absent sidecar (503), is rejected
+    // here — before admission — exactly where the old in-box resolution used to reject.
+    let session = if config.io.any() {
+        match connect_session(
+            state.fabricd_socket.as_deref(),
+            &config.io.wire_init(engine_cfg.timeout()),
+        )
+        .await
+        {
+            Ok(stream) => Some(stream),
+            Err(err) => {
+                state.metrics.record_rejection();
+                let meta = Meta::new(trace_id, script_bytes, context_bytes, 0)
+                    .with_key(key)
+                    .with_partition(partition);
+                return session_error_response(err, meta);
+            }
         }
+    } else {
+        None
     };
-    // Tier 0: clamp the resolved db statement_timeout to the operator ceiling.
-    if let Some(db) = resolved.db.as_mut() {
-        clamp_statement_timeout(db, engine_cfg.max_statement_timeout_ms);
-    }
-    // Engine-side capability gates (which wrappers to inject) — derived before the configs move
-    // into the egress adapter, so they can travel into the blocking task as a `Copy` value.
-    let gates = resolved.gates();
 
     let start = Instant::now();
 
@@ -628,32 +506,27 @@ pub(crate) async fn execute(
         Err(shed) => return *shed,
     };
 
-    // Everything happens inside the blocking task: it builds the egress adapter (a UDS client to
-    // `fabricd`, or the in-process `BackendSet` fallback), runs the invocation, then drains the
-    // adapter's driver-backed metrics — all on the same blocking thread, because both the lazy
-    // connect and the UDS round-trips `block_on` (forbidden on a runtime worker). The driver
-    // metrics come back with the outcome so the response `meta.<cap>_requests` is unchanged.
+    // The blocking task wraps the pre-connected `fabricd` session as the egress, runs the
+    // invocation, then drains the session's metrics — the UDS round-trips and the drain `block_on`,
+    // which must run on the `spawn_blocking` thread, not a runtime worker. The driver metrics come
+    // back with the outcome so the response `meta.<cap>_requests` is unchanged.
     let host = state.host.clone();
     let handle = Handle::current();
-    let breaker = state.db_breaker.clone();
     let timeout = engine_cfg.timeout();
-    let socket = state.fabricd_socket.clone();
     // Namespace the bytecode cache by partition so identical source from different tenants
     // never shares an entry (no cross-tenant dedup / compile-timing leak). Cloned because the
     // closure is `move` and `partition` is still needed for `meta` after the await.
     let cache_ns = partition.clone();
     let result = task::spawn_blocking(
         move || -> (Result<Outcome, EngineError>, BackendMetrics) {
-            let deps = AsyncDeps {
-                handle: handle.clone(),
-                breaker,
-                timeout,
-            };
-            let adapter = build_adapter(&resolved, socket.as_deref(), &deps, timeout);
-            // Clone the ref-counted adapter, then upcast `dyn MeteredEgress` → `dyn Egress` for the
-            // invocation (the original `adapter` stays for the post-run metric drain).
-            let metered = Arc::clone(&adapter);
-            let egress: Arc<dyn Egress> = metered;
+            let adapter = session
+                .map(|stream| Arc::new(UdsEgress::from_stream(stream, handle.clone(), timeout)));
+            let egress: Option<Arc<dyn Egress>> = adapter.as_ref().map(|metered| {
+                // Upcast `Arc<UdsEgress>` → `Arc<dyn Egress>`; the turbofish pins the source type so
+                // the clone resolves before the coercion (the original `adapter` stays for draining).
+                let dynamic: Arc<dyn Egress> = Arc::<UdsEgress>::clone(metered);
+                dynamic
+            });
             // `Invocation` is `#[non_exhaustive]`; build via the constructor + builder setters. The
             // HTTP front always runs the full-capability profile (the default) with no read-hook,
             // so only `caps`, the egress port, and the cache namespace differ from the defaults.
@@ -668,14 +541,17 @@ pub(crate) async fn execute(
                 auth: gates.auth,
                 sys: config.sys.as_ref(),
             };
-            let mut invocation = Invocation::inline(source.as_str(), &context_json)
-                .caps(caps)
-                .egress(egress);
+            let mut invocation = Invocation::inline(source.as_str(), &context_json).caps(caps);
+            if let Some(port) = egress {
+                invocation = invocation.egress(port);
+            }
             if let Some(namespace) = cache_ns.as_deref() {
                 invocation = invocation.cache_namespace(namespace);
             }
             let outcome = host.run(invocation);
-            let metrics = adapter.drain_metrics();
+            let metrics = adapter.map_or_else(BackendMetrics::default, |metered| {
+                metered.drain_metrics()
+            });
             (outcome, metrics)
         },
     )
@@ -693,13 +569,12 @@ pub(crate) async fn execute(
 }
 
 /// `GET /metrics` — Prometheus text exposition of the process-wide counters and live
-/// gauges (bulkhead permits read off the semaphore, breaker trips off the breaker).
+/// gauges (bulkhead permits read off the semaphore).
 pub(crate) async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let available = state.limiter.available_permits();
-    let trips = state
-        .db_breaker
-        .as_ref()
-        .map_or(0, |breaker| breaker.trips());
+    // The db circuit breaker moved to `fabricd` (it owns the driver connections now); the box
+    // reports zero trips, keeping the `jsbox_db_breaker_trips_total` series for scrape compatibility.
+    let trips = 0_u64;
     let cache = state.host.bytecode_cache_stats();
     let body = state
         .metrics
@@ -837,20 +712,6 @@ fn malformed_request_response(state: &AppState, rejection: &JsonRejection) -> Ax
         base
     };
     system_error_response(envelope, 400, Meta::new(trace_id, 0, 0, 0))
-}
-
-/// Clamps a db config's `statement_timeout_ms` to the operator ceiling (Tier 0). A
-/// ceiling of `0` means "no ceiling" (leave as-is); a request value of `0` ("unlimited")
-/// is raised to the ceiling so jsbox never issues an unbounded `SET`.
-fn clamp_statement_timeout(db: &mut DbConfig, ceiling_ms: u64) {
-    if ceiling_ms == 0 {
-        return;
-    }
-    db.statement_timeout_ms = if db.statement_timeout_ms == 0 {
-        ceiling_ms
-    } else {
-        db.statement_timeout_ms.min(ceiling_ms)
-    };
 }
 
 /// Builds the `429 OVERLOADED` response when the bulkhead is saturated: a runtime-category
@@ -1146,78 +1007,44 @@ mod tests {
 }
 
 #[cfg(test)]
-mod egress_resolution_tests {
-    //! The trust boundary: the operator resource table (internally-tagged `ResourceBinding`
-    //! serde) and `resolve_egress` mapping a request's logical names → operator configs,
-    //! rejecting unknown names and kind mismatches.
+mod request_io_tests {
+    //! The box-side `config.io` interpretation: which capabilities are requested, the engine
+    //! gates, and the `fabricd` session-open `WireInit` (the first name per kind). Name→config
+    //! resolution itself now lives in `fabricd` (`fabric_backends::resolve`).
 
-    use super::{RequestIo, ResourceBinding, resolve_egress};
-    use std::collections::HashMap;
+    use super::RequestIo;
 
-    /// Builds an operator table with one `db` (`orders-db`) and one `redis` (`cache`) binding,
-    /// parsed from JSON — exercising the internally-tagged `kind` deserialization.
-    fn table() -> HashMap<String, ResourceBinding> {
-        serde_json::from_str(
-            r#"{
-                "orders-db": {"kind":"db","host":"h","user":"u","password":"p","database":"d"},
-                "cache": {"kind":"redis","url":"redis://h:6379"}
-            }"#,
-        )
-        .unwrap_or_else(|err| unreachable!("valid resource table: {err}"))
-    }
-
-    /// A `RequestIo` naming the given db resources (other kinds empty).
-    fn io_db(names: &[&str]) -> RequestIo {
+    /// A `RequestIo` naming one db resource (other kinds empty).
+    fn io_db(name: &str) -> RequestIo {
         RequestIo {
-            db: names.iter().map(|name| (*name).to_owned()).collect(),
+            db: vec![name.to_owned()],
             ..RequestIo::default()
         }
     }
 
-    /// The `kind` tag selects the variant: `orders-db` deserializes as a `db` binding.
+    /// `any()` is true iff some kind is named; `gates()` mirror per-kind presence.
     #[test]
-    fn binding_kind_tag_selects_variant() {
-        let table = table();
-        assert!(
-            matches!(table.get("orders-db"), Some(ResourceBinding::Db(_))),
-            "orders-db is a db binding"
-        );
-        assert!(
-            matches!(table.get("cache"), Some(ResourceBinding::Redis(_))),
-            "cache is a redis binding"
-        );
+    fn any_and_gates_track_named_kinds() {
+        let io = io_db("orders-db");
+        assert!(io.any(), "a named db means a session is needed");
+        assert!(io.gates().db.is_on(), "db gate on");
+        assert!(!io.gates().mongo.is_on(), "unnamed kinds stay off");
+
+        let empty = RequestIo::default();
+        assert!(!empty.any(), "no names → no session");
+        assert!(!empty.gates().db.is_on());
     }
 
-    /// A named, kind-matching resource resolves and its gate turns on.
+    /// `wire_init` carries the first name per kind and the deadline.
     #[test]
-    fn resolves_named_db() {
-        let resolved = resolve_egress(&table(), &io_db(&["orders-db"]))
-            .unwrap_or_else(|_err| unreachable!("orders-db resolves"));
-        assert!(resolved.db.is_some(), "db config resolved");
-        assert!(resolved.gates().db.is_on(), "db gate on");
-        assert!(resolved.mongo.is_none(), "unnamed kinds stay off");
-    }
-
-    /// No names → nothing resolved, every gate off.
-    #[test]
-    fn empty_io_resolves_nothing() {
-        let resolved = resolve_egress(&table(), &RequestIo::default())
-            .unwrap_or_else(|_err| unreachable!("empty io is ok"));
-        assert!(resolved.db.is_none() && !resolved.gates().db.is_on());
-    }
-
-    /// An unknown resource name is rejected `400 RESOURCE_NOT_FOUND` (the request named a
-    /// resource the operator never provisioned).
-    #[test]
-    fn unknown_name_is_rejected() {
-        let err = resolve_egress(&table(), &io_db(&["nope"])).unwrap_err();
-        assert_eq!(err.0, 400, "unknown name is a 400");
-    }
-
-    /// Naming a resource of the wrong kind (a redis under `db`) is rejected.
-    #[test]
-    fn kind_mismatch_is_rejected() {
-        let err = resolve_egress(&table(), &io_db(&["cache"])).unwrap_err();
-        assert_eq!(err.0, 400, "kind mismatch is a 400");
+    fn wire_init_selects_first_name() {
+        let io = RequestIo {
+            db: vec!["orders-db".to_owned(), "ignored".to_owned()],
+            ..RequestIo::default()
+        };
+        let init = io.wire_init(std::time::Duration::from_millis(1500));
+        assert_eq!(init.db.as_deref(), Some("orders-db"), "first name selected");
+        assert_eq!(init.mongo, None, "unnamed kinds stay None");
+        assert_eq!(init.timeout_ms, 1500);
     }
 }

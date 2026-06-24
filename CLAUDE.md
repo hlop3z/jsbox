@@ -10,37 +10,41 @@ context and returns `{data, error, meta}`. The single endpoint is the whole prod
 
 **Cargo workspace (five crates + a bench crate):**
 
-- **`fabric-wire`** (`crates/fabric-wire/`) — the shared egress-port contract: the `Egress`
-  trait + `EgressError`, the error taxonomy (`ErrorOwner`/`Fault`/`DynamicFault` + the `__jsbox`
-  wire envelope), the per-target `CircuitBreaker`, and the metric `Collector`. A driver-free,
-  QuickJS-free leaf depended on by **both** `runlet-core` and `fabric-backends`.
+- **`fabric-wire`** (`crates/fabric-wire/`) — the shared, driver-free, QuickJS-free egress
+  contract, depended on by every other crate: the `Egress` trait + `EgressError`, the error
+  taxonomy (`ErrorOwner`/`Fault`/`DynamicFault` + the `__jsbox` wire envelope), the per-target
+  `CircuitBreaker`, the metric `Collector`, **and** the box↔`fabricd` wire protocol (`wire.rs`:
+  `WireInit`/`WireCall`/`WireRequest`/`WireResponse` + length-prefixed framing, the `*Metric`
+  types, `BackendMetrics`, `MeteredEgress`).
 - **`fabric-backends`** (`crates/fabric-backends/`) — the driver-backed egress backends
   (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`), each a JS-free `*Backend` (string-in/string-out
-  dispatch + metrics + `into_resource_error`), plus the in-process `BackendSet` that wires them
-  behind the `fabric_wire::Egress` port. Holds **all** the vendor drivers. Depends on
-  `fabric-wire` only (never `runlet-core` — no QuickJS), so it is the shape a sidecar (`fabricd`)
-  will host. Featureless (the driver bag always carries every backend). See
-  `docs/design/resource-egress.md`.
+  dispatch + metrics + `into_resource_error`), plus `BackendSet` (wires them behind
+  `fabric_wire::Egress`), the `*Config` types, and the operator `ResourceBinding` table +
+  name→config `resolve`. Holds **all** the vendor drivers. Depends on `fabric-wire` only (never
+  `runlet-core` — no QuickJS); **only `fabricd` links it.** Featureless (the driver bag always
+  carries every backend). See `docs/design/resource-egress.md`.
 - **`runlet-core`** (`crates/runlet-core/`) — the reusable logic host: the QuickJS engine,
   runtime pool, sandbox, resilience, error taxonomy, capabilities, and the callable
   [`LogicHost`] port (`Invocation` → `Outcome`). Knows nothing about HTTP. The public entry
   is `runlet_core::host::LogicHost`; each capability is a cargo **feature** (`db`, `http`,
   `mongo`, `mail`, `s3`, `redis`, `amq`, `auth`), so a deterministic-only consumer builds with
   `default-features = false` and links nothing. **Links no network driver even with `full`** —
-  the driver-backed capabilities now keep only their JS wrapper (`<cap>.rs`'s `inject_wrapper` +
-  `js/*.js`) here and route through the egress port to `fabric-backends`; only `http` (SSRF-guarded)
-  and `s3` (pure SigV4 signing) stay in-engine. See `docs/design/` for the design.
+  the driver-backed capabilities keep only their JS wrapper (`<cap>.rs`'s `inject_wrapper` +
+  `js/*.js`) here and route through the egress port; only `http` (SSRF-guarded) and `s3` (pure
+  SigV4 signing) stay in-engine. See `docs/design/` for the design.
 - **`runlet`** (`crates/runlet/`) — the binary: the axum HTTP `/execute` front + server config,
-  a thin adapter over `LogicHost::run`. Enables `runlet-core`'s `full` and wires the egress port —
-  either an in-process `fabric_backends::BackendSet`, or (when `config.fabricd_socket` is set) a
-  `uds::UdsEgress` client to `fabricd` with automatic in-process fallback. Behavior is unchanged
-  from the pre-workspace `jsbox` (the binary/image are renamed to `runlet`; the `jsbox_*`
-  Prometheus metric names and internal `__jsbox` error tag are kept for compatibility).
-- **`fabricd`** (`crates/fabricd/`) — the optional local egress **sidecar** (bin): hosts
-  `fabric_backends::BackendSet` behind a Unix-domain-socket wire protocol
-  (`fabric_backends::wire`), so the box can reach `db`/`mongo`/`mail`/`redis`/`amq`/`auth` without
-  linking the drivers. One client connection = one box-request session (`Init`→`Call`\*→`Drain`).
-  The on-ramp to the network fabric (`docs/design/network-fabric.md`).
+  a thin adapter over `LogicHost::run`. **Links no network driver and holds no credentials**
+  (it does not depend on `fabric-backends`): when a request names a driver resource in
+  `config.io`, it opens a `fabricd` session over UDS (`uds::UdsEgress`) and forwards the logical
+  names; `fabricd` resolves the credentials. No sidecar configured + a driver request ⇒
+  `503 EGRESS_UNAVAILABLE`. Deterministic/`http`/`s3` requests need no sidecar. The `jsbox_*`
+  Prometheus metric names and internal `__jsbox` error tag are kept for compatibility.
+- **`fabricd`** (`crates/fabricd/`) — the egress **sidecar** (bin): holds the operator
+  credential table (its `resources` config) and **all** the drivers (via `fabric-backends`), and
+  hosts a `BackendSet` per connection behind the `fabric-wire` UDS protocol. One client
+  connection = one box-request session (`Init`(names+deadline)→`Call`\*→`Drain`(metrics)); it
+  resolves the box's logical names to configs, so credentials never reach the box. Required for
+  driver-backed capabilities; the on-ramp to the network fabric (`docs/design/network-fabric.md`).
 
 ## Commands
 

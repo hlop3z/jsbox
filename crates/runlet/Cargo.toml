@@ -16,10 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 runlet-core = { path = "../runlet-core" }
-# The driver-backed egress backends (the `*Config`/`*Metric` types + the in-process `BackendSet`)
-# the binary wires behind the egress port; the drivers the binary links come through here, not
-# `runlet-core`. `fabric-wire` gives the `Egress`/`EgressError` the UDS client (`uds.rs`) implements.
-fabric-backends = { path = "../fabric-backends" }
+# The box links NO network driver: it talks to the `fabricd` sidecar over UDS using the
+# driver-free wire contract in `fabric-wire` (the `Egress` trait, the wire protocol, the metric
+# types). Credentials live in `fabricd`, never here.
 fabric-wire = { path = "../fabric-wire" }
 axum.workspace = true
 mimalloc.workspace = true
