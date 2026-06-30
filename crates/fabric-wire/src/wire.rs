@@ -185,6 +185,13 @@ pub struct WireInit {
     pub auth: Option<String>,
     /// Per-execution wall-clock budget in milliseconds (the per-op client-side deadline).
     pub timeout_ms: u64,
+    /// Opaque client-auth credential proving the box may pull credentials — a static shared
+    /// secret or a k8s projected `ServiceAccount` token. `None` on the local UDS path (filesystem
+    /// permissions gate it); set on the remote QUIC path, where `fabricd` validates it *before*
+    /// resolving any name. Carried in the handshake so it costs no extra round-trip. Treated as a
+    /// secret: never logged. See `docs/design/network-fabric.md` (QUIC remote transport).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// One egress call: capability kind, action, and the script's JSON payload.

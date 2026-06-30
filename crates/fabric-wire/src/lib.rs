@@ -18,6 +18,7 @@ pub mod breaker;
 pub mod egress;
 pub mod errors;
 pub mod metrics;
+pub mod quic;
 pub mod wire;
 
 pub use crate::breaker::{BreakerConfig, CircuitBreaker};

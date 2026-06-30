@@ -20,6 +20,18 @@ serde_json.workspace = true
 # `AsyncWriteExt` traits (`read_exact`/`write_all`). Added explicitly so a deterministic-core build
 # (which doesn't unify the drivers' tokio features) still has them. Not a driver.
 tokio = { workspace = true, features = ["io-util"] }
+# QUIC remote transport (`quic.rs`): the network alternative to the local UDS, on the shared
+# `aws-lc-rs` rustls provider. `rustls`/`rustls-pemfile`/`sha2` back the pinned-self-signed-cert
+# verifier and PEM loading. See `docs/design/network-fabric.md` (QUIC remote transport).
+quinn.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+# Mints a self-signed cert for the QUIC round-trip test.
+rcgen.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "net"] }
 
 [lints]
 workspace = true

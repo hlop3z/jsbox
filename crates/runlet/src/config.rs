@@ -71,6 +71,38 @@ pub(crate) struct Config {
     /// See `docs/design/resource-egress.md` step 5.
     #[serde(default)]
     pub(crate) fabricd_socket: Option<String>,
+    /// Remote `fabricd` over QUIC — the alternative to `fabricd_socket` for a shared `fabricd`
+    /// cluster service on a different host. When set (and `fabricd_socket` is not), driver-backed
+    /// capabilities route over QUIC to one of the configured replicas. See
+    /// `docs/design/network-fabric.md` (QUIC remote transport).
+    #[serde(default)]
+    pub(crate) fabricd_quic: Option<FabricdQuic>,
+}
+
+/// Remote-`fabricd` QUIC transport settings (the box client side).
+///
+/// The box pins the daemon's self-signed certificate by fingerprint (no CA / cert manager) and
+/// presents an auth token; `fabricd` validates the token and resolves the logical names operator-
+/// side. Exactly one of `auth_token` / `auth_token_file` is the credential; omit both only when the
+/// daemon's auth provider is disabled.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FabricdQuic {
+    /// Replica endpoints to dial (`host:port`); a headless-Service DNS name resolving to many pod
+    /// addresses is tried in turn (client-side failover). At least one is required.
+    pub(crate) replicas: Vec<String>,
+    /// TLS server name presented on the handshake — must match the daemon certificate's name.
+    pub(crate) server_name: String,
+    /// The daemon certificate's pinned SHA-256 fingerprint, hex-encoded (64 hex chars). The box
+    /// trusts exactly this certificate.
+    pub(crate) server_cert_pin: String,
+    /// A static opaque shared-secret token (mutually exclusive with `auth_token_file`).
+    #[serde(default)]
+    pub(crate) auth_token: Option<String>,
+    /// Path to a k8s projected `ServiceAccount` token file, re-read per session as it rotates
+    /// (mutually exclusive with `auth_token`).
+    #[serde(default)]
+    pub(crate) auth_token_file: Option<PathBuf>,
 }
 
 /// HTTP server settings.

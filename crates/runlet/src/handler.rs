@@ -34,7 +34,7 @@ use runlet_core::s3::{S3Config, S3Metric};
 use runlet_core::sandbox;
 use runlet_core::sys::SysConfig;
 
-use crate::uds::{SessionError, UdsEgress, connect_session};
+use crate::sidecar::{SessionError, SidecarEgress, SidecarTransport, connect_session};
 
 /// Shared application state for the router: the logic host, the script registry, and
 /// the concurrency bulkhead.
@@ -57,12 +57,12 @@ pub(crate) struct AppState {
     /// disabled. Acquired *before* the global bulkhead so a noisy partition fast-fails on its
     /// own share (`429 PARTITION_OVERLOADED`) while global capacity stays free for others.
     pub(crate) partition_limiter: Option<PartitionLimiter>,
-    /// Path to the `fabricd` egress sidecar's Unix-domain socket, or `None`. The box links no
-    /// driver and holds no credentials: a request that names a driver resource in `config.io`
-    /// routes over this socket to `fabricd`, which resolves the name against its own operator
-    /// config and performs the I/O. `None` ⇒ driver capabilities are unavailable
-    /// (`503 EGRESS_UNAVAILABLE`).
-    pub(crate) fabricd_socket: Option<Arc<str>>,
+    /// How the box reaches the `fabricd` egress sidecar (local UDS, remote QUIC, or none). The box
+    /// links no driver and holds no credentials: a request that names a driver resource in
+    /// `config.io` opens a session over this transport to `fabricd`, which resolves the name against
+    /// its own operator config and performs the I/O. [`SidecarTransport::None`] ⇒ driver
+    /// capabilities are unavailable (`503 EGRESS_UNAVAILABLE`).
+    pub(crate) transport: SidecarTransport,
     /// Process-wide observability counters, exposed at `GET /metrics`.
     pub(crate) metrics: Arc<Metrics>,
     /// Configured global bulkhead capacity, surfaced as the `_total` permit gauge.
@@ -223,6 +223,9 @@ impl RequestIo {
             amq: self.amq.first().cloned(),
             auth: self.auth.first().cloned(),
             timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            // The token (QUIC path) is attached by `connect_session` from the transport's auth
+            // provider — the box-request layer never sees it.
+            token: None,
         }
     }
 }
@@ -473,12 +476,12 @@ pub(crate) async fn execute(
     // here — before admission — exactly where the old in-box resolution used to reject.
     let session = if config.io.any() {
         match connect_session(
-            state.fabricd_socket.as_deref(),
+            &state.transport,
             &config.io.wire_init(engine_cfg.timeout()),
         )
         .await
         {
-            Ok(stream) => Some(stream),
+            Ok(conn) => Some(conn),
             Err(err) => {
                 state.metrics.record_rejection();
                 let meta = Meta::new(trace_id, script_bytes, context_bytes, 0)
@@ -520,11 +523,12 @@ pub(crate) async fn execute(
     let result = task::spawn_blocking(
         move || -> (Result<Outcome, EngineError>, BackendMetrics) {
             let adapter = session
-                .map(|stream| Arc::new(UdsEgress::from_stream(stream, handle.clone(), timeout)));
+                .map(|conn| Arc::new(SidecarEgress::new(conn, handle.clone(), timeout)));
             let egress: Option<Arc<dyn Egress>> = adapter.as_ref().map(|metered| {
-                // Upcast `Arc<UdsEgress>` → `Arc<dyn Egress>`; the turbofish pins the source type so
-                // the clone resolves before the coercion (the original `adapter` stays for draining).
-                let dynamic: Arc<dyn Egress> = Arc::<UdsEgress>::clone(metered);
+                // Upcast `Arc<SidecarEgress>` → `Arc<dyn Egress>`; the turbofish pins the source
+                // type so the clone resolves before the coercion (the original `adapter` stays for
+                // draining).
+                let dynamic: Arc<dyn Egress> = Arc::<SidecarEgress>::clone(metered);
                 dynamic
             });
             // `Invocation` is `#[non_exhaustive]`; build via the constructor + builder setters. The

@@ -2,7 +2,7 @@
 
 mod config;
 mod handler;
-mod uds;
+mod sidecar;
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -28,6 +28,7 @@ use runlet_core::registry::ScriptRegistry;
 
 use crate::config::Config;
 use crate::handler::AppState;
+use crate::sidecar::SidecarTransport;
 
 /// Use `mimalloc` as the global allocator for better small-allocation performance.
 /// `QuickJS` benefits significantly (~20-40%) from this via the `rust-alloc` feature.
@@ -123,14 +124,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             "per-partition fairness: {per_partition} concurrent/partition across {partition_buckets} buckets"
         );
     }
-    // The egress sidecar socket. Driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/
-    // `auth`) route over UDS to `fabricd`, which holds the drivers + credentials; the box links no
-    // driver. Captured before the engine config moves into the pool.
-    let fabricd_socket: Option<Arc<str>> = config.fabricd_socket.clone().map(Arc::from);
-    if let Some(socket) = fabricd_socket.as_deref() {
-        info!(socket, "fabricd egress sidecar configured (UDS)");
-    } else {
-        info!("no fabricd egress sidecar: driver-backed capabilities are unavailable");
+    // The egress sidecar transport. Driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/
+    // `auth`) route to `fabricd` — over a local UDS or a remote QUIC link — which holds the drivers
+    // + credentials; the box links no driver. Built before the engine config moves into the pool.
+    let transport =
+        SidecarTransport::from_config(config.fabricd_socket.as_deref(), config.fabricd_quic.as_ref())?;
+    match transport.label() {
+        "none" => info!("no fabricd egress sidecar: driver-backed capabilities are unavailable"),
+        label => info!(transport = label, "fabricd egress sidecar configured"),
     }
 
     let registry = Arc::new(script_registry);
@@ -155,7 +156,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         error_debug: config.error_debug,
         limiter: Arc::new(Semaphore::new(max_concurrent)),
         partition_limiter,
-        fabricd_socket,
+        transport,
         metrics: Arc::new(Metrics::default()),
         bulkhead_capacity: max_concurrent,
         access_token,

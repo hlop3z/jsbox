@@ -16,9 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 runlet-core = { path = "../runlet-core" }
-# The box links NO network driver: it talks to the `fabricd` sidecar over UDS using the
-# driver-free wire contract in `fabric-wire` (the `Egress` trait, the wire protocol, the metric
-# types). Credentials live in `fabricd`, never here.
+# The box links NO network driver: it talks to the `fabricd` sidecar over UDS or QUIC using the
+# driver-free wire contract in `fabric-wire` (the `Egress` trait, the wire + QUIC transport, the
+# metric types). Credentials live in `fabricd`, never here.
 fabric-wire = { path = "../fabric-wire" }
 axum.workspace = true
 mimalloc.workspace = true
@@ -29,6 +29,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 rustls.workspace = true
+# Remote `fabricd` over QUIC (`sidecar.rs`): the box holds the `quinn` client connection + streams.
+quinn.workspace = true
+# Decodes the configured server-cert pin (hex SHA-256) for the QUIC client.
+hex.workspace = true
 
 [lints]
 workspace = true
