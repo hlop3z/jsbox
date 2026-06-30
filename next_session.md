@@ -68,13 +68,21 @@ fabricd; drop LogicHost handle/db_breaker").
 
 ## What's next (in order)
 
-1. **Commit Step 5** (see above) if not already done. **Project A (resource egress) is complete.**
-2. **DEFERRED — rewrite `test_simple.py`:** the request surface is now `config.io` names + a
-   `fabricd` sidecar. The harness must (a) start `fabricd` with a `resources` config covering the
-   named variants (pg, pg-maxrows5, pg-badhost, pg-fast, pgbouncer, redis, mongo, nats, nats-fast,
-   mail), (b) start `runlet` with `fabricd_socket` set (no `resources` on the box), (c) rewrite
-   `config={"db":creds}` → `config={"io":{"db":["name"]}}`. `smoke_5.sh` is the working reference for
-   the two-process setup. Needs all backends up.
+1. **Commit Step 5** — DONE (`34b05d9`). **Project A (resource egress) is complete.**
+2. **rewrite `test_simple.py`** — DONE & verified (`f1b2a74`). The harness drives the `config.io` +
+   `fabricd` two-process surface: `_start_servers` builds + launches `fabricd` (operator `resources`
+   table + Tier-0 `max_statement_timeout_ms=800`, over a UDS) then `runlet` (no creds,
+   `fabricd_socket` set); `build_resources` holds every named variant
+   (`pg`/`pg-maxrows5`/`-badhost`/`-fast`/`-unlimited`/`-huge`, `db-broken`, `nats`/`nats-fast`,
+   `mongo`, `auth-*`); requests send `config={"io":{"db":["name"]}}`. Auth discovery talks to the
+   IdPs BEFORE startup so introspect creds land in fabricd's table at boot. **Verified** in Docker
+   (`rust:1.92-alpine`) vs compose backends on `jsbox_default`: **196/197** through fabricd
+   (pg/pgbouncer/cockroach/mongo/nats + Tier-0 clamp + Tier-4 pooler). Lone fail "get with wildcard"
+   is a PRE-EXISTING http test (http.rs unchanged on this branch) — not a regression. Run recipe:
+   host 5432 is taken by another project, so run an ad-hoc `postgres:17-alpine` attached to
+   `jsbox_default` with `--network-alias postgres` (+ ditto pgbouncer), then run the harness inside
+   alpine joined to that net with `PG_HOST=postgres PGBOUNCER_HOST=pgbouncer PGBOUNCER_PORT=5432
+   HTTPBIN_URL=http://httpbin:8080` (in-network ports/hostnames).
 3. **Project B — network fabric** (`docs/design/network-fabric.md`): grow `fabricd` from a local UDS
    sidecar into a cross-node QUIC/NATS fabric. Parked until needed.
 4. **`smoke_5.sh`** / **`smoke_4b.sh`** in repo root are the reusable live-smokes (run a
