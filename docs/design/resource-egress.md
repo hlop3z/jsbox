@@ -267,6 +267,18 @@ QuickJS/`rquickjs`.
    - **Live-smoked** box→UDS→`fabricd`→Postgres with the box holding no creds: query + metrics, the
      `503` no-fallback path, and the `400` unknown-name path all verified. The one-time
      `LogicHost::new` signature break is noted for the external consumer in `CONSUMER_NOTES.md`.
+6. ✅ **Remote QUIC transport — done** (Project B's one approved slice; see
+   [network-fabric.md](network-fabric.md)). The same wire framing now rides a `quinn` bidirectional
+   stream so `fabricd` can run on a different host as a shared, stateless cluster service. The box's
+   `runlet::sidecar` generalized `UdsEgress`→`SidecarEgress` over a `SessionConn` (UDS stream **or**
+   QUIC send/recv halves); transport is config-selected (`fabricd_socket` vs `fabricd_quic`, QUIC
+   winning if both). Encryption + anti-MITM use a **pinned self-signed server cert** (the box trusts
+   one cert by SHA-256 fingerprint — no CA / cert manager); client *identity* is a token in
+   `WireInit` validated daemon-side by a pluggable `ClientAuthenticator` (`none` / `static` shipping;
+   k8s SA-token OIDC a wired-but-unimplemented seam). The daemon caps concurrent connections +
+   streams and redacts the token from logs. **Live-smoked** box→QUIC→`fabricd`→Postgres
+   (`smoke_quic.sh`): the happy path plus a wrong-token and an absent-token negative (both
+   `400 UNAUTHENTICATED`, no query). Everything stays on the one `aws-lc-rs` rustls provider.
 
 Steps 1–3 are the bulk of the value, touch only `runlet-core`, and require no distributed
-systems. Steps 4–5 are the on-ramp to [network-fabric.md](network-fabric.md).
+systems. Steps 4–6 are the on-ramp to [network-fabric.md](network-fabric.md).

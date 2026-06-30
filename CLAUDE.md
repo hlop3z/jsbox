@@ -15,7 +15,9 @@ context and returns `{data, error, meta}`. The single endpoint is the whole prod
   taxonomy (`ErrorOwner`/`Fault`/`DynamicFault` + the `__jsbox` wire envelope), the per-target
   `CircuitBreaker`, the metric `Collector`, **and** the box↔`fabricd` wire protocol (`wire.rs`:
   `WireInit`/`WireCall`/`WireRequest`/`WireResponse` + length-prefixed framing, the `*Metric`
-  types, `BackendMetrics`, `MeteredEgress`).
+  types, `BackendMetrics`, `MeteredEgress`) plus the **QUIC remote transport** (`quic.rs`:
+  pinned-self-signed-cert server/client `quinn` endpoint builders + `ServerTls`, on the shared
+  `aws-lc-rs` provider) that the same framing rides for a network `fabricd`.
 - **`fabric-backends`** (`crates/fabric-backends/`) — the driver-backed egress backends
   (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`), each a JS-free `*Backend` (string-in/string-out
   dispatch + metrics + `into_resource_error`), plus `BackendSet` (wires them behind
@@ -35,15 +37,22 @@ context and returns `{data, error, meta}`. The single endpoint is the whole prod
 - **`runlet`** (`crates/runlet/`) — the binary: the axum HTTP `/execute` front + server config,
   a thin adapter over `LogicHost::run`. **Links no network driver and holds no credentials**
   (it does not depend on `fabric-backends`): when a request names a driver resource in
-  `config.io`, it opens a `fabricd` session over UDS (`uds::UdsEgress`) and forwards the logical
-  names; `fabricd` resolves the credentials. No sidecar configured + a driver request ⇒
-  `503 EGRESS_UNAVAILABLE`. Deterministic/`http`/`s3` requests need no sidecar. The `jsbox_*`
-  Prometheus metric names and internal `__jsbox` error tag are kept for compatibility.
-- **`fabricd`** (`crates/fabricd/`) — the egress **sidecar** (bin): holds the operator
+  `config.io`, it opens a `fabricd` session over a **local UDS or a remote QUIC link**
+  (`sidecar::SidecarEgress`, transport chosen by config — `fabricd_socket` vs `fabricd_quic`) and
+  forwards the logical names; `fabricd` resolves the credentials. On the QUIC path the box pins the
+  daemon cert by fingerprint and presents an auth token (`BoxAuth`: static secret or a re-read k8s
+  SA-token file). No sidecar configured + a driver request ⇒ `503 EGRESS_UNAVAILABLE`.
+  Deterministic/`http`/`s3` requests need no sidecar. The `jsbox_*` Prometheus metric names and
+  internal `__jsbox` error tag are kept for compatibility.
+- **`fabricd`** (`crates/fabricd/`) — the egress **sidecar / broker** (bin): holds the operator
   credential table (its `resources` config) and **all** the drivers (via `fabric-backends`), and
-  hosts a `BackendSet` per connection behind the `fabric-wire` UDS protocol. One client
-  connection = one box-request session (`Init`(names+deadline)→`Call`\*→`Drain`(metrics)); it
-  resolves the box's logical names to configs, so credentials never reach the box. Required for
+  hosts a `BackendSet` per session behind the `fabric-wire` protocol over **either transport** —
+  a local **UDS** (the zero-config default) or a remote **QUIC** listener (`quic` config: a shared,
+  network-reachable cluster service). One UDS connection / one QUIC bi-stream = one box-request
+  session (`Init`(names+deadline)→`Call`\*→`Drain`(metrics)); it resolves the box's logical names to
+  configs, so credentials never reach the box. On QUIC it validates the box's `WireInit.token` before
+  resolving anything via a pluggable `ClientAuthenticator` (`auth.rs`: `none` / `static` shipping,
+  k8s SA-token OIDC a wired seam), and caps concurrent connections + streams. Required for
   driver-backed capabilities; the on-ramp to the network fabric (`docs/design/network-fabric.md`).
 
 ## Commands

@@ -8,6 +8,7 @@
 //! one `Call` (kind, action, payload) per `io.call(...)`, then a `Drain` for the metrics. See
 //! `docs/design/resource-egress.md`.
 
+use std::fmt::{self, Formatter};
 use std::io::{Error as IoError, ErrorKind};
 
 use serde::de::DeserializeOwned;
@@ -124,7 +125,14 @@ macro_rules! duration_accessor {
         })+
     };
 }
-duration_accessor!(DbMetric, MongoMetric, MailMetric, RedisMetric, AmqMetric, AuthMetric);
+duration_accessor!(
+    DbMetric,
+    MongoMetric,
+    MailMetric,
+    RedisMetric,
+    AmqMetric,
+    AuthMetric
+);
 
 /// The driver-backed capability metrics drained from one session.
 ///
@@ -163,7 +171,12 @@ pub trait MeteredEgress: Egress {
 /// The box no longer holds credentials — `fabricd` resolves each name against its operator config.
 /// `None` = that capability is not requested this session; `timeout_ms` is the per-execution
 /// wall-clock budget (the per-op client-side deadline).
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written to **redact** the secret [`token`](Self::token): the derived impl would
+/// print it, and a `WireInit` rides inside [`WireRequest`]'s derived `Debug` — so any accidental
+/// `?`-logging of a request frame anywhere would leak the credential. The manual impl shows only
+/// whether a token is present.
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct WireInit {
     /// Selected `db` resource name.
     #[serde(default)]
@@ -192,6 +205,27 @@ pub struct WireInit {
     /// secret: never logged. See `docs/design/network-fabric.md` (QUIC remote transport).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+}
+
+impl fmt::Debug for WireInit {
+    #[expect(
+        clippy::renamed_function_params,
+        reason = "`formatter` reads better than the trait's single-char `f` (min_ident_chars)"
+    )]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WireInit")
+            .field("db", &self.db)
+            .field("mongo", &self.mongo)
+            .field("mail", &self.mail)
+            .field("redis", &self.redis)
+            .field("amq", &self.amq)
+            .field("auth", &self.auth)
+            .field("timeout_ms", &self.timeout_ms)
+            // The token is a secret: print only its presence, never its value.
+            .field("token", &self.token.as_ref().map(|_present| "<redacted>"))
+            .finish()
+    }
 }
 
 /// One egress call: capability kind, action, and the script's JSON payload.
@@ -255,7 +289,10 @@ where
     let len = u32::try_from(bytes.len())
         .map_err(|_err| IoError::new(ErrorKind::InvalidData, "frame too large to encode"))?;
     if len > MAX_FRAME_BYTES {
-        return Err(IoError::new(ErrorKind::InvalidData, "frame exceeds size cap"));
+        return Err(IoError::new(
+            ErrorKind::InvalidData,
+            "frame exceeds size cap",
+        ));
     }
     writer.write_all(&len.to_le_bytes()).await?;
     writer.write_all(&bytes).await?;
@@ -282,7 +319,10 @@ where
     }
     let len = u32::from_le_bytes(len_buf);
     if len > MAX_FRAME_BYTES {
-        return Err(IoError::new(ErrorKind::InvalidData, "frame exceeds size cap"));
+        return Err(IoError::new(
+            ErrorKind::InvalidData,
+            "frame exceeds size cap",
+        ));
     }
     let size = usize::try_from(len)
         .map_err(|_err| IoError::new(ErrorKind::InvalidData, "frame length out of range"))?;

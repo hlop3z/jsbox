@@ -1,6 +1,8 @@
 # Handoff — QUIC remote transport for `fabricd` (Project B, thin slice)
 
-**Branch:** `quic-remote-transport` (off `main`). **Status:** 3 of 5 tasks done & verified in Docker; daemon + final verification remain.
+**Branch:** `quic-remote-transport` (off `main`). **Status: all 5 tasks done & verified in Docker.**
+The slice is complete except the **SA-token (OIDC) authenticator**, which is a deliberate wired-but-
+unimplemented seam (see task 4 below). Ready to commit.
 
 This is the **one approved slice of Project B** (the "network fabric"): let `fabricd` run on a
 *different host* than the box, as a **shared, stateless, replicated cluster service** (egress /
@@ -66,49 +68,67 @@ stack (`cargo tree -i ring` empty).
 
 ---
 
-## Next: task 4 — the daemon (`crates/fabricd/`)
+## Done: task 4 — the daemon (`crates/fabricd/`)
 
-`crates/fabricd/src/main.rs` currently binds a `UnixListener` and runs `serve(stream, …)` (which is
-already written against `AsyncRead`/`AsyncWrite`, so it is **unchanged**). To do:
+1. ✅ **QUIC listener.** `main.rs` now runs UDS and/or QUIC (config selects; UDS stays the
+   zero-config default, QUIC engages when `quic` is set, a QUIC-only daemon binds no UDS). The QUIC
+   accept loop completes the handshake, then serves each inbound `accept_bi()` stream as its own
+   session. `serve` was generalized from `serve(UnixStream)` to `serve<R: AsyncRead, W: AsyncWrite>`
+   so it feeds on the UDS split halves **or** the QUIC send/recv halves (mirroring the box's
+   `SessionConn`). `Init → auth → resolve → Ack → Call*/Drain` unchanged otherwise.
+2. ✅ **Pluggable auth seam** (`crates/fabricd/src/auth.rs`). `ClientAuthenticator` trait validates
+   `WireInit.token` **before** `resolve()`. Providers selected by `quic.auth.mode`:
+   - **`none`** — no client auth (trusted/isolated network).
+   - **`static`** — opaque shared secret, **constant-time compare** (own `ct_eq`, no new dep),
+     accepts `static_token` + `previous_token` for zero-downtime rotation. **Shipping + tested.**
+   - **`sa-token`** (k8s OIDC) — **wired seam, NOT implemented.** **DESIGN DECISION (made, with the
+     user):** the `auth` backend does **delegated** validation (a `userinfo` round-trip) — explicitly
+     *no local JWT/JWKS crypto* — so there was **nothing to reuse** for offline JWKS verification.
+     Full OIDC needs a new JWT/JWKS dep + a cluster to test (un-smoke-testable here), so it was kept
+     out of this thin slice. The provider exists behind the trait and returns a clear "not
+     implemented; use mode: static" rejection. **To finish it:** add JWKS fetch+cache + RS256/`aud`/
+     `exp` verification (the `audience` config field is already plumbed).
+   - On failure: an `InitError { code: "UNAUTHENTICATED" }` (the box maps it to `400`); bumps a
+     `Shared.auth_failures` counter, logged (never the token).
+3. ✅ **Hardening.** Connection cap (`quic.max_connections`, default 1024) via an accept-loop
+   `Semaphore`; per-connection **stream cap** via `max_concurrent_bidi_streams(256)` + uni-streams
+   refused, set in `fabric-wire`'s shared `transport_config`. Token **redacted**: `WireInit` got a
+   hand-written `Debug` that prints `token: Some("<redacted>")`, so even `?`-logging a `WireRequest`
+   can't leak it; `StaticAuthenticator`'s `Debug` redacts its secrets too.
+4. ✅ **Config:** `fabricd` gained `quic { listen, server_cert (PEM), server_key (PEM),
+   max_connections?, auth { mode, static_token?, previous_token?, audience? } }`.
 
-1. **QUIC listener.** When QUIC is configured, bind a `quinn` endpoint via
-   `fabric_wire::quic::server_endpoint(addr, ServerTls::from_pem(cert, key))`. Accept loop:
-   `endpoint.accept()` → `connection.await` → `connection.accept_bi()` per session →
-   `serve(SessionStream, shared)`. Keep UDS as the default (config selects). `serve` already does
-   `Init → resolve → Ack → Call*/Drain`; feed it the QUIC send/recv halves (it splits the stream
-   today — adapt to take the two halves, mirroring the box's `SessionConn`).
-2. **Pluggable auth seam.** Add a `ClientAuthenticator` trait validating `WireInit.token` **before**
-   `resolve()`. Two providers, selected by daemon config:
-   - **Primary: k8s SA-token (OIDC).** Verify the projected token's signature against the cluster
-     **JWKS**, plus `aud` (= `fabricd`) and `exp`. **DESIGN CHOICE TO MAKE FIRST:** reuse
-     `fabricd`'s existing `auth` backend OIDC machinery (it already links `fabric-backends`, which
-     does OIDC discovery + token validation for the `auth` capability — check
-     `crates/fabric-backends/src/auth*`) **vs** add a focused JWT/JWKS dep (e.g. `jsonwebtoken` +
-     a JWKS fetch/cache). Prefer reuse if the surface fits; it avoids a new supply-chain entry.
-     Cache JWKS (don't fetch per request).
-   - **Fallback: opaque static token.** Constant-time compare (`subtle`/`constant_time_eq`),
-     accept `current + previous` for zero-downtime rotation. (Box already sends it via `BoxAuth`.)
-   - On failure: reject (close the connection / an `InitError`-style response) **before** resolve;
-     bump an **auth-failure counter** (a spike is a security signal).
-3. **Hardening.** Cap **max concurrent connections + streams** (the accept loop spawns unbounded
-   today — a DoS surface once network-reachable). **Redact** the token: never log it; consider a
-   manual `Debug`/newtype so `WireInit`'s derived `Debug` can't leak it.
-4. **Config:** `fabricd` gains `quic { listen, server_cert (PEM path), server_key (PEM path),
-   auth: { mode: sa-token|static|none, audience?, jwks/issuer?, static_token?, previous_token? } }`.
+## Done: task 5 — verify
 
-## Next: task 5 — verify
+- ✅ **`smoke_quic.sh`** (new): box → QUIC → `fabricd` → Postgres end-to-end (pinned self-signed cert
+  via `openssl`, pin = `sha256(cert DER)`), **plus two negatives** — a wrong token and an absent
+  token, both `400 UNAUTHENTICATED` with no query run. **Verified:** all three pass (run in
+  `rust:1.92-alpine` on the `jsbox_default` compose network; both ends in one container over loopback
+  UDP — split across hosts by pointing `replicas` elsewhere, nothing else changes). The
+  framing-over-`quinn` round-trip + wrong-pin tests already live in `fabric-wire`; daemon-side auth
+  unit tests (valid/rotation/wrong/missing/none/sa-token) are in `auth.rs` (5 tests, green).
+- ✅ **Supply chain.** The only new crates vs. the prior commit were `pem`/`rcgen`/`rustls-pemfile`/
+  `yasna` (quinn/quinn-proto/quinn-udp/lru-slab were already in-tree + exempted). Added
+  `safe-to-deploy` exemptions for the four in `supply-chain/config.toml` (canonically ordered per
+  `cargo vet fmt`); **`cargo vet` exits 0** (the only change is `config.toml`; `imports.lock`
+  untouched). NB: `cargo vet --locked` *fails* — but only because it can't fetch the imported audit
+  sets offline (22 *pre-existing* bench/cache deps like criterion/clap/moka show as unvetted); the
+  online `cargo vet` that `task supply-chain` runs covers them.
+- ✅ **Docs.** `CLAUDE.md` crate blurbs (`fabric-wire`/`runlet`/`fabricd`), `docs/design/
+  resource-egress.md` (new step 6), and `docs/design/network-fabric.md` (status → *implemented*)
+  all updated.
 
-- **`smoke_quic.sh`** (new): `fabricd` + `runlet` in **separate containers**, box → QUIC → fabricd →
-  Postgres end-to-end, **plus a rejected-token negative** (bad/absent token ⇒ handshake/`Init`
-  refused, no query). Mirror the existing `smoke_5.sh` shape (UDS) but over QUIC + a generated
-  self-signed cert (use `rcgen` in a tiny helper, or `openssl` in the script). Compute the pin =
-  `sha256(cert DER)` and feed it to the box's `server_cert_pin`.
-- Add a framing-over-`quinn` round-trip already exists in `fabric-wire` (lib); add a daemon-side
-  auth unit test (valid/invalid token).
-- **Supply chain:** re-run `cargo vet` / `cargo deny` for `quinn` + `rcgen` + any new OIDC dep; add
-  exemptions as needed (`task supply-chain`).
-- **Docs:** update the `fabric-wire` / `fabricd` / `runlet` crate blurbs in `CLAUDE.md` and
-  `docs/design/resource-egress.md` to mention the QUIC remote transport.
+## Verified clippy/test (Docker, `rust:1.92-alpine`, gate = plain `cargo clippy`)
+
+`fabric-wire` 10/10 + clippy clean · `fabricd` 5/5 (auth) + clippy clean · `runlet` 9/9 + clippy
+clean · `cargo tree -i ring` empty (single crypto stack) · my crates `cargo fmt --check` clean.
+
+## Known pre-existing (NOT introduced here, out of scope)
+
+`cargo fmt --check` flags `crates/fabric-backends/{backendset,kv,mail,mongo,resources}.rs` — those
+files were committed fmt-dirty **before** this work (I touched none of them). Left as-is to keep this
+diff focused; clean them in a separate fmt-only commit if you want the workspace `task fmt-check`
+fully green.
 
 ---
 
@@ -138,6 +158,9 @@ The gate is **plain `cargo clippy`** (per `Taskfile.yml`), so `#[cfg(test)]` cod
 
 ## State
 
-Nothing committed before this handoff's commit. Memory `resource-egress-fabric-direction` carries
-the same status. After this: `git log --oneline -1` should show the box+foundation commit on
-`quic-remote-transport`.
+The foundation (tasks 1–3) is committed as `fee9c86` on `quic-remote-transport`. The daemon +
+verification (tasks 4–5) are **staged in the working tree, not yet committed** — changed:
+`crates/fabricd/{Cargo.toml,src/main.rs}` + new `src/auth.rs`, `crates/fabric-wire/src/{wire,quic}.rs`,
+`supply-chain/config.toml`, `Cargo.lock`, new `smoke_quic.sh`, and docs (`CLAUDE.md`,
+`docs/design/{resource-egress,network-fabric}.md`). Ready to commit as the task-4/5 slice. Memory
+`resource-egress-fabric-direction` carries the same status.

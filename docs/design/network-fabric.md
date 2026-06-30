@@ -2,9 +2,9 @@
 
 Companion to [resource-egress.md](resource-egress.md).
 
-> **Status: vision / parked — except one approved slice.** Most of this doc (NATS event bus,
-> custom membership / gossip / discovery mesh) remains parked. **The single exception, approved
-> 2026-06-30 for build, is the [QUIC remote transport](#quic-remote-transport-approved-slice)**:
+> **Status: vision / parked — except one built slice.** Most of this doc (NATS event bus,
+> custom membership / gossip / discovery mesh) remains parked. **The single exception, approved and
+> built 2026-06-30, is the [QUIC remote transport](#quic-remote-transport-approved-slice)**:
 > the one increment that lets `fabricd` run on a *different host* than the box. It deliberately
 > does **not** pull in NATS, SWIM/HyParView/Plumtree, or any of the autonomous-mesh machinery —
 > those stay shelved until a measured need (see [resource-egress.md](resource-egress.md)). The
@@ -124,8 +124,13 @@ the drivers that leave `runlet-core` land here.
 
 # QUIC remote transport (approved slice)
 
-> **Status: approved 2026-06-30.** The one piece of the fabric vision being built now. Everything
-> below the `## Deferred` line at the end stays parked.
+> **Status: implemented 2026-06-30** (approved same day). The one piece of the fabric vision built
+> so far: `fabric-wire::quic` (pinned-cert endpoints), the box's `runlet::sidecar` (UDS-or-QUIC
+> egress with cert pinning + client-side failover), and `fabricd`'s QUIC listener + pluggable
+> `ClientAuthenticator` (`none`/`static` shipping; k8s SA-token OIDC a wired seam) + connection/
+> stream caps. Verified end-to-end by `smoke_quic.sh` (happy path + wrong/absent-token negatives).
+> The one piece still open is the **SA-token OIDC** authenticator (needs offline JWKS verification +
+> a cluster to test). Everything below the `## Deferred` line at the end stays parked.
 
 ## Why only this slice
 

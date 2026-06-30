@@ -42,6 +42,14 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// stays up across the broker.
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
 
+/// Daemon-side hardening: cap how many concurrent bidirectional streams (= in-flight box-request
+/// sessions) one connection may open. A box multiplexes one stream per request over a single
+/// long-lived connection, so this bounds a single box's fan-out and, with the connection cap, the
+/// blast radius of a misbehaving or hostile peer once `fabricd` is network-reachable. Enforced by
+/// QUIC flow control (the peer can't open beyond it). Harmless on the client (the daemon opens no
+/// streams), so it lives in the shared transport config.
+const MAX_BIDI_STREAMS: u32 = 256;
+
 /// The SHA-256 fingerprint of a certificate's DER encoding — what the box pins for the daemon.
 #[must_use]
 pub fn cert_fingerprint(cert_der: &CertificateDer<'_>) -> [u8; 32] {
@@ -83,7 +91,10 @@ impl ServerTls {
 
     /// Builds [`ServerTls`] directly from DER (used by tests and any in-process cert generator).
     #[must_use]
-    pub const fn from_der(chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Self {
+    pub const fn from_der(
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Self {
         Self { chain, key }
     }
 }
@@ -136,12 +147,16 @@ pub fn client_endpoint(bind: SocketAddr, server_pin: [u8; 32]) -> io::Result<End
     Ok(endpoint)
 }
 
-/// Shared QUIC transport tuning (idle timeout + keep-alive) for both ends.
+/// Shared QUIC transport tuning (idle timeout + keep-alive + stream caps) for both ends.
 fn transport_config() -> io::Result<TransportConfig> {
     let mut transport = TransportConfig::default();
     let idle = quinn::IdleTimeout::try_from(IDLE_TIMEOUT).map_err(io::Error::other)?;
     let _ = transport.max_idle_timeout(Some(idle));
     let _ = transport.keep_alive_interval(Some(KEEP_ALIVE));
+    // Cap concurrent bidi streams (daemon hardening; see `MAX_BIDI_STREAMS`) and refuse
+    // unidirectional streams outright — the wire protocol uses only bidi streams.
+    let _ = transport.max_concurrent_bidi_streams(MAX_BIDI_STREAMS.into());
+    let _ = transport.max_concurrent_uni_streams(0_u32.into());
     Ok(transport)
 }
 
@@ -231,7 +246,10 @@ mod tests {
     use crate::wire::{WireRequest, read_frame, write_frame};
 
     /// Mints a self-signed cert+key for `localhost`/loopback and returns the DER pair.
-    fn self_signed() -> (Vec<rustls::pki_types::CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    fn self_signed() -> (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        PrivateKeyDer<'static>,
+    ) {
         let names = vec!["localhost".to_owned()];
         let certified = rcgen::generate_simple_self_signed(names)
             .unwrap_or_else(|_err| unreachable!("self-signed generation"));
@@ -280,8 +298,8 @@ mod tests {
                 .unwrap_or_else(|_err| unreachable!("read frame"))
         });
 
-        let client = client_endpoint(loopback(), pin)
-            .unwrap_or_else(|_err| unreachable!("client endpoint"));
+        let client =
+            client_endpoint(loopback(), pin).unwrap_or_else(|_err| unreachable!("client endpoint"));
         let connection = client
             .connect(server_addr, "localhost")
             .unwrap_or_else(|_err| unreachable!("connect call"))
