@@ -295,6 +295,78 @@ NATS_HOST = os.environ.get("NATS_HOST", "localhost")
 NATS_PORT = int(os.environ.get("NATS_PORT", "4222"))
 NATS_CONFIG = {"backend": "nats", "host": NATS_HOST, "port": NATS_PORT}
 
+
+# -- Egress resources (Step 5 trust flip: the box sends logical names; fabricd holds the configs) -
+#
+# After the trust flip the box carries no driver credentials: a request names logical resources in
+# `config.io`, and the `fabricd` sidecar resolves them against its own `resources` table. The
+# harness therefore (1) builds that table from the env endpoints + the per-test variants below,
+# (2) starts `fabricd` with it, and (3) sends names, never configs. A down backend just makes its
+# section self-skip (the live probe through the box fails) — the resource still exists in the table.
+
+def _io(kind: str, name: str) -> dict:
+    """A request `config.io` selecting one logical resource of `kind` (e.g. `{"io":{"db":["pg"]}}`)."""
+    return {"io": {kind: [name]}}
+
+
+def _db_io(name: str) -> dict:
+    return _io("db", name)
+
+
+def _mongo_io(name: str) -> dict:
+    return _io("mongo", name)
+
+
+def _amq_io(name: str) -> dict:
+    return _io("amq", name)
+
+
+def _auth_io(name: str) -> dict:
+    return _io("auth", name)
+
+
+def _db_resources(base: str, cfg: dict) -> dict:
+    """Named `db` bindings for one engine: the base plus the variants the tests reference by name."""
+    return {
+        base: {"kind": "db", **cfg},
+        f"{base}-maxrows5": {"kind": "db", **cfg, "max_rows": 5},
+        f"{base}-badhost": {"kind": "db", **cfg, "host": "nonexistent.invalid", "port": 1},
+        f"{base}-fast": {"kind": "db", **cfg, "statement_timeout_ms": 800},
+        f"{base}-unlimited": {"kind": "db", **cfg, "statement_timeout_ms": 0},
+        f"{base}-huge": {"kind": "db", **cfg, "statement_timeout_ms": 60000},
+    }
+
+
+def _auth_resources(label: str, issuer: str, introspect: dict | None) -> dict:
+    """Named `auth` bindings for one provider: the base (issuer only) + an introspect variant."""
+    base = f"auth-{label.lower()}"
+    res = {base: {"kind": "auth", "issuer": issuer}}
+    if introspect:
+        res[f"{base}-introspect"] = {
+            "kind": "auth",
+            "issuer": issuer,
+            "client_id": introspect["client_id"],
+            "client_secret": introspect["client_secret"],
+        }
+    return res
+
+
+def build_resources(auth_resources: dict) -> dict:
+    """The full `fabricd` resources table: every named resource the suite can reference."""
+    res: dict = {}
+    res.update(_db_resources("pg", PG_CONFIG))
+    res.update(_db_resources("pgbouncer", PGB_CONFIG))
+    res.update(_db_resources("cockroach", CR_CONFIG))
+    res["db-broken"] = {
+        "kind": "db", "host": "broken-db.invalid", "port": 1,
+        "user": "x", "password": "x", "database": "x",
+    }
+    res["mongo"] = {"kind": "mongo", **MONGO_CONFIG}
+    res["nats"] = {"kind": "amq", **NATS_CONFIG}
+    res["nats-fast"] = {"kind": "amq", **NATS_CONFIG, "request_timeout_ms": 500}
+    res.update(auth_resources)
+    return res
+
 SETUP_SQL = """
     DROP TABLE IF EXISTS test_types;
     DROP TABLE IF EXISTS test_txn;
@@ -314,143 +386,143 @@ SETUP_SQL = """
 """
 
 
-def _db_available(config: dict) -> bool:
-    """Check if a database is reachable."""
-    resp = _post(h("db.query('SELECT 1 as ok'); return json('up', null);", config={"db": config}))
+def _db_available(name: str) -> bool:
+    """Check if the named `db` resource is reachable (probes through the box → fabricd)."""
+    resp = _post(h("db.query('SELECT 1 as ok'); return json('up', null);", config=_db_io(name)))
     return resp is not None and resp.get("data") == "up"
 
 
-def _setup_db(config: dict):
-    """Create test tables."""
+def _setup_db(name: str):
+    """Create test tables (via the named `db` resource)."""
     for stmt in SETUP_SQL.strip().split(";"):
         stmt = stmt.strip()
         if stmt:
-            _post(h(f"db.execute(\"{stmt}\"); return json('ok', null);", config={{"db": config}}))
+            _post(h(f"db.execute(\"{stmt}\"); return json('ok', null);", config=_db_io(name)))
 
 
-def test_db_engine(t: Runner, label: str, db: dict):
-    """Run DB tests against a specific engine (Postgres or CockroachDB)."""
+def test_db_engine(t: Runner, label: str, db: str):
+    """Run DB tests against a specific engine, named by its `db` resource (`db` = the base name)."""
     t.section(f"Database ({label})")
 
     # Setup tables
     setup_script = SETUP_SQL.replace("'", "\\'").replace("\n", " ")
     for stmt in [s.strip() for s in SETUP_SQL.strip().split(";") if s.strip()]:
         safe = stmt.replace("'", "\\'").replace("\n", " ")
-        _post(h(f"db.execute('{safe}'); return json('ok', null);", config={"db": db}))
+        _post(h(f"db.execute('{safe}'); return json('ok', null);", config=_db_io(db)))
 
     # Basic query (CockroachDB returns INT8 for literals, so "1" as string)
     is_crdb = label == "CockroachDB"
     t.test(f"{label}: SELECT 1",
-           h("var r = db.query('SELECT 1 as num'); return json(r.rows[0].num, null);", config={"db": db}),
+           h("var r = db.query('SELECT 1 as num'); return json(r.rows[0].num, null);", config=_db_io(db)),
            data_eq("1") if is_crdb else data_eq(1))
 
     # Column metadata
     t.test(f"{label}: columns returned",
-           h("var r = db.query('SELECT 1 as a, 2 as b'); return json(r.columns, null);", config={"db": db}),
+           h("var r = db.query('SELECT 1 as a, 2 as b'); return json(r.columns, null);", config=_db_io(db)),
            data_eq(["a", "b"]))
 
     # Row count
     t.test(f"{label}: row_count",
-           h("var r = db.query('SELECT 1 UNION ALL SELECT 2'); return json(r.row_count, null);", config={"db": db}),
+           h("var r = db.query('SELECT 1 UNION ALL SELECT 2'); return json(r.row_count, null);", config=_db_io(db)),
            data_eq(2))
 
     # Parameterized query
     t.test(f"{label}: params",
-           h("var r = db.query('SELECT $1::text as name', ['Bob']); return json(r.rows[0].name, null);", config={"db": db}),
+           h("var r = db.query('SELECT $1::text as name', ['Bob']); return json(r.rows[0].name, null);", config=_db_io(db)),
            data_eq("Bob"))
 
     # Boolean param
     t.test(f"{label}: bool param",
-           h("var r = db.query('SELECT $1::boolean as flag', [true]); return json(r.rows[0].flag, null);", config={"db": db}),
+           h("var r = db.query('SELECT $1::boolean as flag', [true]); return json(r.rows[0].flag, null);", config=_db_io(db)),
            data_eq(True))
 
     # BIGINT always string
     t.test(f"{label}: bigint is string",
-           h("var r = db.query('SELECT big FROM test_types'); return json(typeof r.rows[0].big, null);", config={"db": db}),
+           h("var r = db.query('SELECT big FROM test_types'); return json(typeof r.rows[0].big, null);", config=_db_io(db)),
            data_eq("string"))
 
     t.test(f"{label}: bigint value",
-           h("var r = db.query('SELECT big FROM test_types'); return json(r.rows[0].big, null);", config={"db": db}),
+           h("var r = db.query('SELECT big FROM test_types'); return json(r.rows[0].big, null);", config=_db_io(db)),
            data_eq("9223372036854775807"))
 
     # NUMERIC as string
     t.test(f"{label}: numeric is string",
-           h("var r = db.query('SELECT num FROM test_types'); return json(typeof r.rows[0].num, null);", config={"db": db}),
+           h("var r = db.query('SELECT num FROM test_types'); return json(typeof r.rows[0].num, null);", config=_db_io(db)),
            data_eq("string"))
 
     # INT4 as number (CockroachDB SERIAL is INT8 → string)
     t.test(f"{label}: int4 is number",
-           h("var r = db.query('SELECT id FROM test_types'); return json(typeof r.rows[0].id, null);", config={"db": db}),
+           h("var r = db.query('SELECT id FROM test_types'); return json(typeof r.rows[0].id, null);", config=_db_io(db)),
            data_eq("string") if is_crdb else data_eq("number"))
 
     # Boolean column
     t.test(f"{label}: bool column",
-           h("var r = db.query('SELECT flag FROM test_types'); return json(r.rows[0].flag, null);", config={"db": db}),
+           h("var r = db.query('SELECT flag FROM test_types'); return json(r.rows[0].flag, null);", config=_db_io(db)),
            data_eq(True))
 
     # TEXT column
     t.test(f"{label}: text column",
-           h("var r = db.query('SELECT name FROM test_types'); return json(r.rows[0].name, null);", config={"db": db}),
+           h("var r = db.query('SELECT name FROM test_types'); return json(r.rows[0].name, null);", config=_db_io(db)),
            data_eq("Alice"))
 
     # JSONB pass-through
     t.test(f"{label}: jsonb pass-through",
-           h("var r = db.query('SELECT data FROM test_types'); return json(r.rows[0].data.key, null);", config={"db": db}),
+           h("var r = db.query('SELECT data FROM test_types'); return json(r.rows[0].data.key, null);", config=_db_io(db)),
            data_eq("val"))
 
     # UUID is string
     t.test(f"{label}: uuid is string",
-           h("var r = db.query('SELECT uid FROM test_types'); return json(typeof r.rows[0].uid, null);", config={"db": db}),
+           h("var r = db.query('SELECT uid FROM test_types'); return json(typeof r.rows[0].uid, null);", config=_db_io(db)),
            data_eq("string"))
 
     # TIMESTAMP is string
     t.test(f"{label}: timestamp is string",
-           h("var r = db.query('SELECT ts FROM test_types'); return json(typeof r.rows[0].ts, null);", config={"db": db}),
+           h("var r = db.query('SELECT ts FROM test_types'); return json(typeof r.rows[0].ts, null);", config=_db_io(db)),
            data_eq("string"))
 
     # NULL handling
     t.test(f"{label}: null value",
-           h("var r = db.query('SELECT NULL as x'); return json(r.rows[0].x, null);", config={"db": db}),
+           h("var r = db.query('SELECT NULL as x'); return json(r.rows[0].x, null);", config=_db_io(db)),
            lambda r: r["data"] is None)
 
     # Execute (INSERT)
     t.test(f"{label}: execute insert",
-           h("var r = db.execute(\"INSERT INTO test_txn (val) VALUES ('exec_test')\"); return json(r.rows_affected, null);", config={"db": db}),
+           h("var r = db.execute(\"INSERT INTO test_txn (val) VALUES ('exec_test')\"); return json(r.rows_affected, null);", config=_db_io(db)),
            data_eq(1))
 
     # Execute (UPDATE)
     t.test(f"{label}: execute update",
-           h("var r = db.execute(\"UPDATE test_txn SET val = 'updated' WHERE val = 'exec_test'\"); return json(r.rows_affected, null);", config={"db": db}),
+           h("var r = db.execute(\"UPDATE test_txn SET val = 'updated' WHERE val = 'exec_test'\"); return json(r.rows_affected, null);", config=_db_io(db)),
            data_eq(1))
 
     # Transactions: commit
     t.test(f"{label}: begin + commit",
-           h("db.begin(); db.execute(\"INSERT INTO test_txn (val) VALUES ('txn_commit')\"); db.commit(); var r = db.query(\"SELECT val FROM test_txn WHERE val = 'txn_commit'\"); return json(r.row_count, null);", config={"db": db}),
+           h("db.begin(); db.execute(\"INSERT INTO test_txn (val) VALUES ('txn_commit')\"); db.commit(); var r = db.query(\"SELECT val FROM test_txn WHERE val = 'txn_commit'\"); return json(r.row_count, null);", config=_db_io(db)),
            data_eq(1))
 
     # Transactions: rollback
     t.test(f"{label}: begin + rollback",
-           h("db.begin(); db.execute(\"INSERT INTO test_txn (val) VALUES ('txn_rollback')\"); db.rollback(); var r = db.query(\"SELECT val FROM test_txn WHERE val = 'txn_rollback'\"); return json(r.row_count, null);", config={"db": db}),
+           h("db.begin(); db.execute(\"INSERT INTO test_txn (val) VALUES ('txn_rollback')\"); db.rollback(); var r = db.query(\"SELECT val FROM test_txn WHERE val = 'txn_rollback'\"); return json(r.row_count, null);", config=_db_io(db)),
            data_eq(0))
 
     # Auto-rollback on throw
     t.test(f"{label}: auto-rollback on error",
-           h("db.begin(); db.execute(\"INSERT INTO test_txn (val) VALUES ('txn_auto')\"); throw new Error('oops');", config={"db": db}),
+           h("db.begin(); db.execute(\"INSERT INTO test_txn (val) VALUES ('txn_auto')\"); throw new Error('oops');", config=_db_io(db)),
            has_error())
 
     # max_rows truncation
     t.test(f"{label}: max_rows truncation",
-           h("var r = db.query('SELECT generate_series(1, 50)'); return json(r.truncated, null);", config={"db": {**db, "max_rows": 5}}),
+           h("var r = db.query('SELECT generate_series(1, 50)'); return json(r.truncated, null);", config=_db_io(db + "-maxrows5")),
            data_eq(True))
 
     # max_rows row_count
     t.test(f"{label}: max_rows caps count",
-           h("var r = db.query('SELECT generate_series(1, 50)'); return json(r.row_count, null);", config={"db": {**db, "max_rows": 5}}),
+           h("var r = db.query('SELECT generate_series(1, 50)'); return json(r.row_count, null);", config=_db_io(db + "-maxrows5")),
            data_eq(5))
 
     # SQL error
     t.test(f"{label}: sql error throws",
-           h("db.query('SELECT * FROM nonexistent_table_xyz'); return json('should not reach', null);", config={"db": db}),
+           h("db.query('SELECT * FROM nonexistent_table_xyz'); return json('should not reach', null);", config=_db_io(db)),
            has_error())
 
     # db disabled without config
@@ -460,23 +532,23 @@ def test_db_engine(t: Runner, label: str, db: dict):
 
     # Bad connection
     t.test(f"{label}: bad connection",
-           h("db.query('SELECT 1');", config={"db": {**db, "host": "nonexistent.invalid", "port": 1}}),
+           h("db.query('SELECT 1');", config=_db_io(db + "-badhost")),
            has_error())
 
     # Metrics tracked
     t.test(f"{label}: metrics tracked",
-           h("db.query('SELECT 1'); db.query('SELECT 2'); return json(1, null);", config={"db": db}),
+           h("db.query('SELECT 1'); db.query('SELECT 2'); return json(1, null);", config=_db_io(db)),
            lambda r: len(r["meta"]["db_requests"]) == 2)
 
     # Cleanup
-    _post(h("db.execute('DROP TABLE IF EXISTS test_types'); db.execute('DROP TABLE IF EXISTS test_txn'); return json('ok', null);", config={"db": db}))
+    _post(h("db.execute('DROP TABLE IF EXISTS test_types'); db.execute('DROP TABLE IF EXISTS test_txn'); return json('ok', null);", config=_db_io(db)))
 
 
 # -- Script registry (execute by key) ----------------------------------------
 
-def _mongo_available(config: dict) -> bool:
-    """Check if MongoDB is reachable."""
-    resp = _post(h("mongo.count('t_probe', {}); return json('up', null);", config={"mongo": config}))
+def _mongo_available(name: str) -> bool:
+    """Check if the named `mongo` resource is reachable."""
+    resp = _post(h("mongo.count('t_probe', {}); return json('up', null);", config=_mongo_io(name)))
     return resp is not None and resp.get("data") == "up"
 
 
@@ -484,7 +556,7 @@ def test_mongo(t: Runner):
     """Mongo capability — string `_id`s sidestep the ObjectId-filter caveat (a hex-string
     filter is a BSON string, not an ObjectId, so explicit string ids match cleanly)."""
     t.section("Mongo (document store)")
-    cfg = {"mongo": MONGO_CONFIG}
+    cfg = _mongo_io("mongo")
 
     t.test("clean collection",
            h("mongo.delete_many('t_users', {}); return json('ok', null);", config=cfg),
@@ -529,16 +601,16 @@ def test_mongo(t: Runner):
            lambda r: r["data"] is None and str(_err_code(r) or "").startswith("MONGO_"))
 
 
-def _nats_available(config: dict) -> bool:
-    """Check if NATS is reachable (a publish to an unsubscribed subject still succeeds)."""
-    resp = _post(h("amq.send([['_probe', {p:1}]]); return json('up', null);", config={"amq": config}))
+def _nats_available(name: str) -> bool:
+    """Check if the named `amq` (NATS) resource is reachable (publish to an unsubscribed subject)."""
+    resp = _post(h("amq.send([['_probe', {p:1}]]); return json('up', null);", config=_amq_io(name)))
     return resp is not None and resp.get("data") == "up"
 
 
 def test_nats(t: Runner):
     """NATS backend of the `amq` capability: publish + request-reply (no subscribe)."""
     t.section("NATS (amq backend)")
-    cfg = {"amq": NATS_CONFIG}
+    cfg = _amq_io("nats")
 
     t.test("publish batch -> count",
            h("return json(amq.send([['ev.a', {i:1}], ['ev.b', {i:2}]]), null);", config=cfg),
@@ -547,7 +619,7 @@ def test_nats(t: Runner):
            h("return json(amq.send(['ev.c', {i:3}]), null);", config=cfg),
            data_eq(1))
     # No responder on the subject -> a classified amq error (short timeout keeps it fast).
-    fast = {"amq": dict(NATS_CONFIG, request_timeout_ms=500)}
+    fast = _amq_io("nats-fast")
     t.test("request with no responder -> AMQ_ error",
            h("amq.request('no.responder.here', {ping:1}); return json('nope', null);", config=fast),
            lambda r: r["data"] is None and str(_err_code(r) or "").startswith("AMQ_"))
@@ -997,53 +1069,57 @@ def test_circuit_breaker(t: Runner):
     requests to that target fast-fail DB_CIRCUIT_OPEN instead of waiting on the timeout —
     and a healthy target is unaffected."""
     t.section("Circuit breaker (Tier 3)")
-    bad = {"host": "broken-db.invalid", "port": 1, "user": "x", "password": "x", "database": "x"}
+    # The db breaker moved to `fabricd` with the trust flip (Step 5) and is not yet implemented
+    # there, so repeated connect failures no longer trip `DB_CIRCUIT_OPEN` — this test self-skips
+    # until the daemon grows a breaker. `db-broken` is the operator's unreachable resource.
+    bad = "db-broken"
     script = "db.query('SELECT 1'); return json('ok', null);"
 
-    codes = [_err_code(_post(h(script, config={"db": bad}))) for _ in range(7)]
+    codes = [_err_code(_post(h(script, config=_db_io(bad)))) for _ in range(7)]
     if "DB_CIRCUIT_OPEN" not in codes:
-        print("  \033[33mPROBE\033[0m breaker not active (no db_breaker_threshold) — skipping\n")
+        print("  \033[33mPROBE\033[0m breaker not active (moved to fabricd, not yet implemented) — skipping\n")
         return
 
     t.test("breaker trips DB_CIRCUIT_OPEN after repeated connect failures",
            h("return json(1,null);"), lambda _r: "DB_CIRCUIT_OPEN" in codes)
     # An open breaker fast-fails — no connect attempt, so well under any connect wait.
     start = time.time()
-    r = _post(h(script, config={"db": bad}))
+    r = _post(h(script, config=_db_io(bad)))
     elapsed = time.time() - start
     t.test("open breaker fast-fails (no connect wait)",
            h("return json(1,null);"),
            lambda _r: _err_code(r) == "DB_CIRCUIT_OPEN" and elapsed < 1.5)
     # A different, healthy target is not affected by the bad target's open breaker.
     t.test("healthy db target unaffected by another target's open breaker",
-           h("db.query('SELECT 1'); return json('up', null);", config={"db": PG_CONFIG}),
+           h("db.query('SELECT 1'); return json('up', null);", config=_db_io("pg")),
            data_eq("up"))
 
 
-def test_statement_timeout_clamp(t: Runner, db: dict):
-    """Prove the operator ceiling clamps a per-request statement_timeout it cannot raise
-    (Tier 0). Direct Postgres only — the SET is reliable there."""
+def test_statement_timeout_clamp(t: Runner, db: str):
+    """Prove the operator ceiling clamps a resource's statement_timeout it cannot raise (Tier 0).
+    The clamp now runs in `fabricd` (`max_statement_timeout_ms`); `db` is the engine base name —
+    its `-unlimited` (0) and `-huge` (60000) variants are clamped to the daemon ceiling."""
     t.section("statement_timeout clamp (Tier 0)")
 
-    def killed(config):
-        r = _post(h("db.query('SELECT pg_sleep(2)'); return json('slept', null);", config={"db": config}))
+    def killed(name):
+        r = _post(h("db.query('SELECT pg_sleep(2)'); return json('slept', null);", config=_db_io(name)))
         return r is not None and r["data"] is None and r["error"] is not None
 
-    # Ask for an unbounded timeout. If the operator ceiling is active, the 2s sleep is
-    # killed well before it finishes. If no ceiling is configured, the sleep completes —
-    # probe and skip rather than fail (the suite may run against an unconfigured server).
-    if not killed({**db, "statement_timeout_ms": 0}):
-        print("  \033[33mPROBE\033[0m clamp not active (server has no max_statement_timeout_ms) — skipping\n")
+    # The `-unlimited` resource asks for no timeout. If fabricd's ceiling is active, the 2s sleep is
+    # killed well before it finishes. If no ceiling is configured, the sleep completes — probe and
+    # skip rather than fail.
+    if not killed(db + "-unlimited"):
+        print("  \033[33mPROBE\033[0m clamp not active (fabricd has no max_statement_timeout_ms) — skipping\n")
         return
-    t.test("request statement_timeout=0 (unlimited) is clamped + killed",
+    t.test("resource statement_timeout=0 (unlimited) is clamped + killed",
            h("return json(1,null);"), lambda _r: True)
-    t.test("request statement_timeout=60000 (huge) is clamped + killed",
-           h("return json(1,null);"), lambda _r: killed({**db, "statement_timeout_ms": 60000}))
+    t.test("resource statement_timeout=60000 (huge) is clamped + killed",
+           h("return json(1,null);"), lambda _r: killed(db + "-huge"))
 
 
 # -- Adversarial: PgBouncer transaction-mode sharp edges ---------------------
 
-def test_pgbouncer_edges(t: Runner, db: dict, direct: bool):
+def test_pgbouncer_edges(t: Runner, db: str, direct: bool):
     """Probe the documented hazards of running jsbox's per-request connect model
     behind a transaction-pooling PgBouncer. `direct` = same probes against raw
     Postgres for comparison (those MUST all be safe)."""
@@ -1059,9 +1135,9 @@ def test_pgbouncer_edges(t: Runner, db: dict, direct: bool):
     # is a server-side role default — see docs/design/pooled-capabilities.md.) Either way
     # jsbox's wall-clock interrupt cannot cancel a blocking libpq call, so the DB-side cap
     # is the only thing that stops a slow query.
-    fast = {**db, "statement_timeout_ms": 800}
+    fast = db + "-fast"
     r = _post(h("db.query('SELECT pg_sleep(3)'); return json('slept-full', null);",
-                config={"db": fast}))
+                config=_db_io(fast)))
     enforced = r is not None and r["data"] is None and r["error"] is not None
     if direct:
         t.test(f"{label}: statement_timeout enforced (sleep killed)",
@@ -1082,7 +1158,7 @@ def test_pgbouncer_edges(t: Runner, db: dict, direct: bool):
              "db.execute('INSERT INTO t_edge VALUES (7)');"
              "var r = db.query('SELECT x FROM t_edge');"
              "db.commit();"
-             "return json(r.rows[0].x, null);", config={"db": db}),
+             "return json(r.rows[0].x, null);", config=_db_io(db)),
            data_eq(7))
 
     # (3) Prepared-statement reuse: the Rust driver prepares each query; hammering the
@@ -1090,11 +1166,11 @@ def test_pgbouncer_edges(t: Runner, db: dict, direct: bool):
     # exist" as PgBouncer rotates server connections (needs max_prepared_statements>0).
     t.test(f"{label}: 25x parameterized query reuse",
            h("var n=0; for (var i=0;i<25;i++){var r=db.query('SELECT $1::int AS v',[i]); n+=r.rows[0].v;} return json(n, null);",
-             config={"db": db}),
+             config=_db_io(db)),
            data_eq(sum(range(25))))
 
 
-def test_pooler_query_timeout(t: Runner, db: dict):
+def test_pooler_query_timeout(t: Runner, db: str):
     """Tier 4: PgBouncer's own query_timeout is an INDEPENDENT backstop. Through a
     transaction-mode pooler the session `SET statement_timeout` is best-effort and can be
     lost; query_timeout (2s, set on the pooler) guarantees a runaway query is still killed
@@ -1103,9 +1179,9 @@ def test_pooler_query_timeout(t: Runner, db: dict):
 
     # pg_sleep(3) outlives the 2s pooler ceiling but is under jsbox's 4s wall clock, so the
     # *pooler* is what must catch it (whether or not the session SET also fired).
-    cfg = {**db, "statement_timeout_ms": 800}
+    cfg = db + "-fast"
     start = time.time()
-    r = _post(h("db.query('SELECT pg_sleep(3)'); return json('slept', null);", config={"db": cfg}))
+    r = _post(h("db.query('SELECT pg_sleep(3)'); return json('slept', null);", config=_db_io(cfg)))
     elapsed = time.time() - start
     killed = r is not None and r["data"] is None and r["error"] is not None
 
@@ -1211,10 +1287,13 @@ def _zitadel_token() -> str | None:
     return None
 
 
-def test_auth_provider(t: Runner, label: str, issuer: str, token: str, introspect: dict | None):
-    """Drive the `auth` capability against a real OIDC/IAM (provider-agnostic)."""
+def test_auth_provider(t: Runner, label: str, token: str, has_introspect: bool):
+    """Drive the `auth` capability against a real OIDC/IAM (provider-agnostic). The auth resources
+    (`auth-<label>` and, if creds were minted, `auth-<label>-introspect`) were registered with
+    `fabricd` at startup; here we reference them by name."""
     t.section(f"Auth ({label})")
-    cfg = {"auth": {"issuer": issuer}}
+    base = f"auth-{label.lower()}"
+    cfg = _auth_io(base)
     ctx = {"token": token}
 
     t.test(f"{label}: disabled without config",
@@ -1250,8 +1329,8 @@ def test_auth_provider(t: Runner, label: str, issuer: str, token: str, introspec
            h("try { auth.introspect('x'); return json('no-throw', null); } catch (e) { return json('threw', null); }", config=cfg),
            data_eq("threw"))
 
-    if introspect:
-        icfg = {"auth": {"issuer": issuer, "client_id": introspect["client_id"], "client_secret": introspect["client_secret"]}}
+    if has_introspect:
+        icfg = _auth_io(f"{base}-introspect")
         t.test(f"{label}: introspect(valid) -> active:true",
                h("return json(auth.introspect(ctx.token).claims.active, null);", ctx, icfg),
                data_eq(True))
@@ -1260,13 +1339,22 @@ def test_auth_provider(t: Runner, label: str, issuer: str, token: str, introspec
                data_eq(False))
 
 
-def run_auth_tests(t: Runner):
-    """Run the auth suite against whichever providers are reachable."""
+def discover_auth() -> tuple[dict, list]:
+    """Talk **directly** to the identity providers (before the box/fabricd start) to mint tokens +
+    introspection client creds. Returns `(auth_resources, providers)` where `auth_resources` is the
+    name→binding map to merge into the `fabricd` table (so credentials are present at startup), and
+    `providers` is `[(label, token, has_introspect), ...]` for the reachable ones.
+    """
+    auth_resources: dict = {}
+    providers: list = []
+
     # Keycloak — mint a token + a confidential client live.
     if _discovery_ok(KEYCLOAK_ISSUER):
         kc_token = _keycloak_token()
         if kc_token:
-            test_auth_provider(t, "Keycloak", KEYCLOAK_ISSUER, kc_token, _keycloak_introspect_creds(kc_token))
+            creds = _keycloak_introspect_creds(kc_token)
+            auth_resources.update(_auth_resources("Keycloak", KEYCLOAK_ISSUER, creds))
+            providers.append(("Keycloak", kc_token, creds is not None))
         else:
             print("\n  \033[33mSKIP\033[0m Keycloak auth tests (reachable but token mint failed)\n")
     else:
@@ -1276,11 +1364,20 @@ def run_auth_tests(t: Runner):
     # exercised on Keycloak; ZITADEL covers discovery + userinfo + the throw path).
     zt_token = _zitadel_token()
     if zt_token and _discovery_ok(ZITADEL_ISSUER):
-        test_auth_provider(t, "Zitadel", ZITADEL_ISSUER, zt_token, None)
+        auth_resources.update(_auth_resources("Zitadel", ZITADEL_ISSUER, None))
+        providers.append(("Zitadel", zt_token, False))
     elif zt_token:
         print("\n  \033[33mSKIP\033[0m Zitadel auth tests (PAT set but issuer unreachable)\n")
     else:
         print("\n  \033[33mSKIP\033[0m Zitadel auth tests (no ZITADEL_PAT — see docker-compose.yml)\n")
+
+    return auth_resources, providers
+
+
+def run_auth_tests(t: Runner, providers: list):
+    """Run the auth suite for each provider discovered before startup."""
+    for label, token, has_introspect in providers:
+        test_auth_provider(t, label, token, has_introspect)
 
 
 # -- Main --------------------------------------------------------------------
@@ -1293,12 +1390,13 @@ def _wait_for_server() -> bool:
     return False
 
 
-def _start_server() -> subprocess.Popen:
-    """Start `cargo run` from .test-run/ with a config that loads tests/scripts.
+def _start_servers(resources: dict) -> list:
+    """Start the two-process topology in `.test-run/`: `fabricd` (holds the credential `resources`
+    table + the drivers) over a UDS, then `runlet` (the box, driver-free) pointed at that socket.
 
-    The server reads `config.json` from its cwd, so the harness generates one in a
-    scratch dir (gitignored) — this turns on the script registry for the run without
-    committing a config.json that would change `task run` behavior.
+    The box reads `config.json` from its cwd; `fabricd` reads its table from `FABRICD_CONFIG`. Both
+    live in a gitignored scratch dir so this doesn't change `task run` behavior. Returns the
+    started processes (caller terminates them).
     """
     repo = os.path.dirname(os.path.abspath(__file__))
     run_dir = os.path.join(repo, ".test-run")
@@ -1313,35 +1411,56 @@ def _start_server() -> subprocess.Popen:
     for src in (os.path.join(repo, "tests", "modules"), os.path.join(repo, "modules")):
         if os.path.isdir(src):
             shutil.copytree(src, merged_modules, dirs_exist_ok=True)
-    # debug=true relaxes the SSRF private-IP block so the `api` tests can reach the
-    # local `httpbin` compose service (its documented local-testing purpose).
-    config = {
+
+    socket = os.path.join(run_dir, "fabricd.sock")
+    # fabricd: the operator credential table + the Tier-0 statement_timeout ceiling. Credentials
+    # live ONLY here — the box never sees them.
+    fabricd_cfg = {"socket": socket, "max_statement_timeout_ms": 800, "resources": resources}
+    with open(os.path.join(run_dir, "fabricd.json"), "w", encoding="utf-8") as fh:
+        json.dump(fabricd_cfg, fh)
+    # Box: a fabricd socket + scripts/modules + low bounds. NO `resources`, NO credentials.
+    # debug=true relaxes the SSRF private-IP block so the `api` tests can reach the local httpbin.
+    box_cfg = {
         "debug": True,
         "scripts_dir": os.path.join(repo, "tests", "scripts"),
         "modules_dir": merged_modules,
-        # Low bounds so the resilience tests actually exercise the bulkhead + clamp.
-        "engine": {
-            "max_concurrent_executions": 6,
-            "max_statement_timeout_ms": 800,
-            "max_concurrent_per_partition": 2,
-            "db_breaker_threshold": 3,
-        },
+        "fabricd_socket": socket,
+        "engine": {"max_concurrent_executions": 6, "max_concurrent_per_partition": 2},
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
-        json.dump(config, fh)
-    # cargo walks up from cwd to find the workspace Cargo.toml; `-p runlet` selects the
-    # HTTP-front binary (the workspace has multiple members).
-    return subprocess.Popen(["cargo", "run", "-p", "runlet"], cwd=run_dir,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        json.dump(box_cfg, fh)
+
+    # Build both up front, then launch the binaries directly — two concurrent `cargo run`
+    # invocations would race on the target/ build lock.
+    subprocess.run(["cargo", "build", "-p", "fabricd", "-p", "runlet"], cwd=repo, check=True)
+    bindir = os.path.join(repo, "target", "debug")
+    if os.path.exists(socket):
+        os.remove(socket)
+    fabricd = subprocess.Popen(
+        [os.path.join(bindir, "fabricd")], cwd=run_dir,
+        env={**os.environ, "FABRICD_CONFIG": os.path.join(run_dir, "fabricd.json")},
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(60):  # wait for fabricd to bind the socket before starting the box
+        if os.path.exists(socket):
+            break
+        time.sleep(0.5)
+    runlet = subprocess.Popen(
+        [os.path.join(bindir, "runlet")], cwd=run_dir,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return [fabricd, runlet]
 
 
 def main():
-    server_proc = None
+    procs: list = []
+
+    # Auth discovery talks DIRECTLY to the identity providers (no box), so it must run BEFORE
+    # fabricd starts — the minted introspection client creds have to be in fabricd's resource table
+    # at startup (the box never carries them).
+    auth_resources, auth_providers = discover_auth()
 
     if not _wait_for_server():
-        print("Starting server...")
-        server_proc = _start_server()
-        time.sleep(4)
+        print("Starting fabricd + runlet...")
+        procs = _start_servers(build_resources(auth_resources))
         if not _wait_for_server():
             print("ERROR: Server failed to start")
             sys.exit(1)
@@ -1366,47 +1485,47 @@ def main():
     test_esm(t)
     test_hasura(t)
 
-    # Database tests — only if containers are running
-    if _db_available(PG_CONFIG):
-        test_db_engine(t, "PostgreSQL", PG_CONFIG)
-        test_pgbouncer_edges(t, PG_CONFIG, direct=True)
-        test_statement_timeout_clamp(t, PG_CONFIG)
+    # Database tests — only if the backend is reachable (probed by resource name through fabricd).
+    if _db_available("pg"):
+        test_db_engine(t, "PostgreSQL", "pg")
+        test_pgbouncer_edges(t, "pg", direct=True)
+        test_statement_timeout_clamp(t, "pg")
         test_circuit_breaker(t)
     else:
         print("\n  \033[33mSKIP\033[0m PostgreSQL tests (not running — use: docker compose up -d)\n")
 
     # Same db suite through PgBouncer (transaction pooling) — proves the per-request
     # connect model works unchanged behind a pooler (docs/design/pooled-capabilities.md).
-    if _db_available(PGB_CONFIG):
-        test_db_engine(t, "PgBouncer", PGB_CONFIG)
-        test_pgbouncer_edges(t, PGB_CONFIG, direct=False)
-        test_pooler_query_timeout(t, PGB_CONFIG)
+    if _db_available("pgbouncer"):
+        test_db_engine(t, "PgBouncer", "pgbouncer")
+        test_pgbouncer_edges(t, "pgbouncer", direct=False)
+        test_pooler_query_timeout(t, "pgbouncer")
     else:
         print("\n  \033[33mSKIP\033[0m PgBouncer tests (not running — use: docker compose up -d pgbouncer)\n")
 
-    if _db_available(CR_CONFIG):
-        test_db_engine(t, "CockroachDB", CR_CONFIG)
+    if _db_available("cockroach"):
+        test_db_engine(t, "CockroachDB", "cockroach")
     else:
         print("\n  \033[33mSKIP\033[0m CockroachDB tests (not running — use: docker compose up -d)\n")
 
     # Mongo + NATS — only if their containers are running
-    if _mongo_available(MONGO_CONFIG):
+    if _mongo_available("mongo"):
         test_mongo(t)
     else:
         print("\n  \033[33mSKIP\033[0m Mongo tests (not running — use: docker compose up -d mongo)\n")
 
-    if _nats_available(NATS_CONFIG):
+    if _nats_available("nats"):
         test_nats(t)
     else:
         print("\n  \033[33mSKIP\033[0m NATS tests (not running — use: docker compose up -d nats)\n")
 
-    # Auth tests — only against identity providers that are reachable
-    run_auth_tests(t)
+    # Auth tests — for whichever providers were reachable at discovery (before startup).
+    run_auth_tests(t, auth_providers)
 
     t.summary()
 
-    if server_proc:
-        server_proc.terminate()
+    for proc in procs:
+        proc.terminate()
 
     sys.exit(t.failed)
 
