@@ -124,6 +124,47 @@ trait; the `mongocrypt`/`ring`/`aws-lc` audit tail and most of the cargo-feature
 evaporate. A consumer that wants raw in-process drivers can still supply a `Resource` impl that
 calls them directly (see step 2).
 
+## Why five crates (the split is forced, not chosen)
+
+The workspace ends up as **five functional crates** — `fabric-wire`, `fabric-backends`,
+`runlet-core`, `runlet`, `fabricd` (plus `runlet-bench`, a pre-existing benchmark crate that is
+not part of this split). The shape is not five independent decisions; it falls out of **one hard
+constraint** plus the fact that there are two binaries:
+
+> **The box must link no vendor driver, and the driver bag must link no QuickJS.**
+
+That is the entire goal of this work — shrink the sandbox's native attack surface and its
+supply-chain audit tail (`mongocrypt`/`ring`/`aws-lc`). Trace what the constraint forces:
+
+1. **`runlet` (box bin)** and **`fabricd` (sidecar bin)** are two separate *processes* — the box
+   runs untrusted JS, the sidecar holds credentials. Two binaries ⇒ two crates.
+2. **`runlet-core`** — the sandbox library (QuickJS engine, pool, capabilities). The box binary is
+   a thin HTTP shell over it. Drivers must leave here or the box links them.
+3. **`fabric-backends`** — the driver bag (every vendor crate). This is what `fabricd` links and the
+   box must not.
+4. **`fabric-wire`** — the non-obvious one, and the reason it is five and not four. The box and the
+   daemon **share** code: the wire protocol, the `Egress` trait, the error taxonomy, the circuit
+   breaker, the metric collector. That shared code cannot live in `runlet-core` (then
+   `fabric-backends` would depend on it and re-pull QuickJS into `fabricd`) and cannot live in
+   `fabric-backends` (then `runlet-core` would depend on it and re-pull the drivers into the box).
+   It must be a **third, neutral leaf** that depends on neither.
+
+So: two binaries + the sandbox lib + the driver bag + the shared leaf neither side can own = five.
+Drop `fabric-wire` and the dependency graph collapses the very isolation the split exists to get.
+
+The dependency rule that enforces it (`runlet` never depends on `fabric-backends`; `fabric-backends`
+never depends on `runlet-core`):
+
+```
+fabric-wire            (leaf: no drivers, no QuickJS)
+  ├── runlet-core      (QuickJS, no drivers)      ──>  runlet   (box: no drivers, no creds)
+  └── fabric-backends  (drivers, no QuickJS)       ──>  fabricd  (sidecar: drivers + creds)
+```
+
+`fabric-wire` is the only crate both arms touch, and it is deliberately tiny. The guarantee is
+checkable: `cargo tree -p runlet` shows no vendor driver, and `cargo tree -p fabricd` shows no
+QuickJS/`rquickjs`.
+
 ## Where resilience lands
 
 - **Box keeps:** the wall-clock deadline on the egress (a hung `fabricd` cannot pin a
