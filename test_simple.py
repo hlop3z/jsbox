@@ -248,9 +248,14 @@ def test_http_api(t: Runner):
     t.test("available with wildcard",
            h("return json(typeof api, null);", config=wildcard),
            data_eq("object"))
-    t.test("get with wildcard",
-           h(f"var r = api.get('{url}/get', {{foo:'bar'}}); return json({{status:r.status, ok:r.data!==null}}, null);", config=wildcard),
-           lambda r: r["data"]["status"] == 200 and r["data"]["ok"] is True)
+    # A `*` wildcard host is intentionally INERT in SSRF-relaxed debug mode. The box runs with
+    # debug:true so these api tests can reach the private-IP httpbin; under that relaxation `*`
+    # would collapse the host allowlist down to the IP filter alone, so it is never honored
+    # (host.rs: `allow_wildcard_hosts && !allow_private`). The request is blocked in-band → the
+    # private host is unreachable via `*` (status 0), even though a specific-host config reaches it.
+    t.test("wildcard host inert under debug (private-IP relax) -> blocked",
+           h(f"var r = api.get('{url}/get', {{foo:'bar'}}); return json({{status:r.status}}, null);", config=wildcard),
+           lambda r: r["data"]["status"] == 0)
     t.test("get with specific host",
            h(f"var r = api.get('{url}/get'); return json(r.status, null);", config=httpbin),
            data_eq(200))
