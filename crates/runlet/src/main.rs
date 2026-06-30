@@ -127,8 +127,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // The egress sidecar transport. Driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/
     // `auth`) route to `fabricd` — over a local UDS or a remote QUIC link — which holds the drivers
     // + credentials; the box links no driver. Built before the engine config moves into the pool.
-    let transport =
-        SidecarTransport::from_config(config.fabricd_socket.as_deref(), config.fabricd_quic.as_ref())?;
+    let transport = SidecarTransport::from_config(
+        config.fabricd_socket.as_deref(),
+        config.fabricd_quic.as_ref(),
+    )?;
     match transport.label() {
         "none" => info!("no fabricd egress sidecar: driver-backed capabilities are unavailable"),
         label => info!(transport = label, "fabricd egress sidecar configured"),

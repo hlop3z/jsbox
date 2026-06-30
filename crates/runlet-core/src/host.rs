@@ -309,11 +309,7 @@ impl LogicHost {
     /// the consumer's wired [`Egress`] (a `fabricd` sidecar) — so it no longer takes a tokio
     /// `Handle` or a `db` circuit breaker (see `docs/design/resource-egress.md` step 5).
     #[must_use]
-    pub const fn new(
-        pool: JsPool,
-        registry: Arc<ScriptRegistry>,
-        settings: HostSettings,
-    ) -> Self {
+    pub const fn new(pool: JsPool, registry: Arc<ScriptRegistry>, settings: HostSettings) -> Self {
         Self {
             pool,
             limits: settings.limits,

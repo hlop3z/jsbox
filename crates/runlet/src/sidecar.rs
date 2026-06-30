@@ -328,7 +328,9 @@ async fn handshake(mut conn: SessionConn, init: &WireInit) -> Result<SessionConn
         }
         Ok(Some(
             WireResponse::Reply(_) | WireResponse::Metrics(_) | WireResponse::ProtocolError(_),
-        )) => Err(SessionError::Protocol("unexpected response to Init".to_owned())),
+        )) => Err(SessionError::Protocol(
+            "unexpected response to Init".to_owned(),
+        )),
         Ok(None) => Err(SessionError::Unavailable(
             "fabricd closed the connection during handshake".to_owned(),
         )),

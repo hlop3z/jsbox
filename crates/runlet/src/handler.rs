@@ -475,12 +475,7 @@ pub(crate) async fn execute(
     // operator config. An unknown name (400), or an unreachable/absent sidecar (503), is rejected
     // here — before admission — exactly where the old in-box resolution used to reject.
     let session = if config.io.any() {
-        match connect_session(
-            &state.transport,
-            &config.io.wire_init(engine_cfg.timeout()),
-        )
-        .await
-        {
+        match connect_session(&state.transport, &config.io.wire_init(engine_cfg.timeout())).await {
             Ok(conn) => Some(conn),
             Err(err) => {
                 state.metrics.record_rejection();
@@ -520,45 +515,42 @@ pub(crate) async fn execute(
     // never shares an entry (no cross-tenant dedup / compile-timing leak). Cloned because the
     // closure is `move` and `partition` is still needed for `meta` after the await.
     let cache_ns = partition.clone();
-    let result = task::spawn_blocking(
-        move || -> (Result<Outcome, EngineError>, BackendMetrics) {
-            let adapter = session
-                .map(|conn| Arc::new(SidecarEgress::new(conn, handle.clone(), timeout)));
-            let egress: Option<Arc<dyn Egress>> = adapter.as_ref().map(|metered| {
-                // Upcast `Arc<SidecarEgress>` → `Arc<dyn Egress>`; the turbofish pins the source
-                // type so the clone resolves before the coercion (the original `adapter` stays for
-                // draining).
-                let dynamic: Arc<dyn Egress> = Arc::<SidecarEgress>::clone(metered);
-                dynamic
-            });
-            // `Invocation` is `#[non_exhaustive]`; build via the constructor + builder setters. The
-            // HTTP front always runs the full-capability profile (the default) with no read-hook,
-            // so only `caps`, the egress port, and the cache namespace differ from the defaults.
-            let caps = CapabilitySet {
-                allowed_hosts: &config.allowed_hosts,
-                db: gates.db,
-                mongo: gates.mongo,
-                mail: gates.mail,
-                s3: config.s3.as_ref(),
-                redis: gates.redis,
-                amq: gates.amq,
-                auth: gates.auth,
-                sys: config.sys.as_ref(),
-            };
-            let mut invocation = Invocation::inline(source.as_str(), &context_json).caps(caps);
-            if let Some(port) = egress {
-                invocation = invocation.egress(port);
-            }
-            if let Some(namespace) = cache_ns.as_deref() {
-                invocation = invocation.cache_namespace(namespace);
-            }
-            let outcome = host.run(invocation);
-            let metrics = adapter.map_or_else(BackendMetrics::default, |metered| {
-                metered.drain_metrics()
-            });
-            (outcome, metrics)
-        },
-    )
+    let result = task::spawn_blocking(move || -> (Result<Outcome, EngineError>, BackendMetrics) {
+        let adapter =
+            session.map(|conn| Arc::new(SidecarEgress::new(conn, handle.clone(), timeout)));
+        let egress: Option<Arc<dyn Egress>> = adapter.as_ref().map(|metered| {
+            // Upcast `Arc<SidecarEgress>` → `Arc<dyn Egress>`; the turbofish pins the source
+            // type so the clone resolves before the coercion (the original `adapter` stays for
+            // draining).
+            let dynamic: Arc<dyn Egress> = Arc::<SidecarEgress>::clone(metered);
+            dynamic
+        });
+        // `Invocation` is `#[non_exhaustive]`; build via the constructor + builder setters. The
+        // HTTP front always runs the full-capability profile (the default) with no read-hook,
+        // so only `caps`, the egress port, and the cache namespace differ from the defaults.
+        let caps = CapabilitySet {
+            allowed_hosts: &config.allowed_hosts,
+            db: gates.db,
+            mongo: gates.mongo,
+            mail: gates.mail,
+            s3: config.s3.as_ref(),
+            redis: gates.redis,
+            amq: gates.amq,
+            auth: gates.auth,
+            sys: config.sys.as_ref(),
+        };
+        let mut invocation = Invocation::inline(source.as_str(), &context_json).caps(caps);
+        if let Some(port) = egress {
+            invocation = invocation.egress(port);
+        }
+        if let Some(namespace) = cache_ns.as_deref() {
+            invocation = invocation.cache_namespace(namespace);
+        }
+        let outcome = host.run(invocation);
+        let metrics =
+            adapter.map_or_else(BackendMetrics::default, |metered| metered.drain_metrics());
+        (outcome, metrics)
+    })
     .await;
 
     // Execution finished — free the bulkhead + per-partition permits for the next request.
