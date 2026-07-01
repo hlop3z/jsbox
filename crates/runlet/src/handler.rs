@@ -8,15 +8,21 @@ use axum::Json;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task;
-use tracing::warn;
+use tracing::field::Empty;
+use tracing::{Instrument as _, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use uuid::Uuid;
+
+use opentelemetry::global;
+use opentelemetry::propagation::Extractor;
+use opentelemetry::trace::{Status, TraceContextExt as _};
 
 use fabric_wire::wire::WireInit;
 use fabric_wire::{
@@ -425,26 +431,130 @@ fn session_error_response(err: SessionError, meta: Meta) -> AxumResponse {
     }
 }
 
+/// Adapts an axum [`HeaderMap`] to the `OTel` [`Extractor`] interface so the W3C
+/// `traceparent`/`tracestate` propagator can read the incoming trace context.
+struct HeaderExtractor<'a>(&'a HeaderMap);
+
+impl Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(HeaderName::as_str).collect()
+    }
+}
+
+/// Builds the `/execute` request span. Continues the edge trace when a valid W3C `traceparent`
+/// is present (parent-based sampling honors its decision), else starts a fresh root. Identity
+/// attributes and the terminal `outcome` are declared empty and filled later via `Span::current()`.
+fn build_request_span(headers: &HeaderMap) -> tracing::Span {
+    let span = tracing::info_span!(
+        "execute",
+        otel.kind = "server",
+        tenant = Empty,
+        user = Empty,
+        plan = Empty,
+        outcome = Empty,
+    );
+    let parent = global::get_text_map_propagator(|prop| prop.extract(&HeaderExtractor(headers)));
+    span.set_parent(parent);
+    span
+}
+
+/// The active `OTel` trace id as a string. Valid (propagated or box-rooted) when tracing is
+/// enabled; a fresh UUID when it is disabled (no `OTel` layer ⇒ no valid span context).
+fn current_trace_id() -> String {
+    let context = tracing::Span::current().context();
+    let span_context = context.span().span_context().clone();
+    if span_context.is_valid() {
+        span_context.trace_id().to_string()
+    } else {
+        Uuid::new_v4().to_string()
+    }
+}
+
+/// Records the trusted identity (tenant/user/plan) as attributes on the current request span.
+/// No-op outside trusted mode (identity `None`). These are span attributes only — never metric
+/// labels (design D4: identity must not become a metric dimension).
+fn record_identity_attrs(identity: Option<&TrustedIdentity>) {
+    let Some(id) = identity else { return };
+    let span = tracing::Span::current();
+    // `record` returns `&Span` for chaining; discard it (a `Copy` reference, so `let _` not `drop`).
+    if let Some(tenant) = id.tenant.as_deref() {
+        let _ = span.record("tenant", tenant);
+    }
+    if let Some(user) = id.user.as_deref() {
+        let _ = span.record("user", user);
+    }
+    if let Some(plan) = id.plan.as_deref() {
+        let _ = span.record("plan", plan);
+    }
+}
+
+/// The span `outcome` label for an engine error, mirroring the metric outcome buckets in
+/// `Metrics::record_engine_error` so span and metric agree.
+const fn engine_error_outcome(err: &EngineError) -> &'static str {
+    match *err {
+        EngineError::Syntax(_)
+        | EngineError::ScriptNotFound(_)
+        | EngineError::ModuleNotFound(_)
+        | EngineError::HandlerNotDefined
+        | EngineError::Script { .. } => "script_error",
+        EngineError::Capability(_) => "capability_error",
+        EngineError::Timeout { .. } => "timeout",
+        EngineError::MemoryLimit => "memory_limit",
+        EngineError::Malformed(_) | EngineError::OutputTooLarge { .. } => "malformed_response",
+        EngineError::Internal(_) | EngineError::ShuttingDown => "internal_error",
+    }
+}
+
+/// Records the terminal `outcome` on the current request span, marking the span as errored for
+/// any non-success outcome (so trace backends surface it).
+fn record_span_outcome(outcome: &str) {
+    let span = tracing::Span::current();
+    let _ = span.record("outcome", outcome);
+    if outcome != "success" {
+        span.set_status(Status::error(outcome.to_owned()));
+    }
+}
+
 /// Executes a JS `handler(context)` and returns `{data, error, meta}` JSON.
 ///
 /// Takes `Result<Json<…>, JsonRejection>` rather than `Json<…>` so a malformed or
 /// type-confused body is handled here as a structured `{data, error, meta}` envelope,
 /// instead of axum short-circuiting with its default plain-text rejection.
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear request pipeline: auth → open egress session → admit → execute → respond"
-)]
 pub(crate) async fn execute(
     State(state): State<AppState>,
     headers: HeaderMap,
     payload: Result<Json<ExecRequest>, JsonRejection>,
-) -> impl IntoResponse {
+) -> AxumResponse {
+    // Wrap the whole request in a span that continues the edge trace (or starts a fresh root);
+    // identity attributes and the terminal outcome are recorded on it from within via
+    // `Span::current()`, so no threading is needed through the pipeline.
+    let span = build_request_span(&headers);
+    run_execute(state, headers, payload).instrument(span).await
+}
+
+/// The `/execute` request pipeline. Runs inside the request span built by [`execute`], so
+/// `tracing::Span::current()` here (and in [`build_response`]) is that span.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear request pipeline: auth → open egress session → admit → execute → respond"
+)]
+async fn run_execute(
+    state: AppState,
+    headers: HeaderMap,
+    payload: Result<Json<ExecRequest>, JsonRejection>,
+) -> AxumResponse {
     // Edge service credential (defense in depth) — reject before any body work.
     if let Some(rejected) = enforce_auth(&state, &headers) {
         return rejected;
     }
 
-    let trace_id = Uuid::new_v4().to_string();
+    // The active OTel trace id: propagated from the edge when a `traceparent` was present, the
+    // box-started root id when tracing is enabled, or a fresh UUID when tracing is off.
+    let trace_id = current_trace_id();
 
     // Trusted-identity ingress (trusted-header mode only): derive identity solely from the
     // configured trusted headers and reject anonymous / suspended / tenant-less callers *before*
@@ -456,6 +566,9 @@ pub(crate) async fn execute(
             return *rejected;
         }
     };
+    // Attribute this request to the trusted principal on the span (trusted mode only) — as span
+    // attributes, never metric labels (the cardinality invariant, design D4).
+    record_identity_attrs(identity.as_ref());
     // The trusted tenant id — sourced only from the extractor (never the script). `None` in
     // single-tenant/loopback mode. Guaranteed `Some` in trusted mode (tenant-less was rejected).
     let tenant = identity.as_ref().and_then(|id| id.tenant.clone());
@@ -674,21 +787,25 @@ fn build_response(
             match exec.result {
                 ExecOutcome::Success(js_json) => {
                     metrics.record_success();
+                    record_span_outcome("success");
                     success_response(&js_json, meta, error_debug)
                 }
                 ExecOutcome::Error(engine_err) => {
                     metrics.record_engine_error(&engine_err);
+                    record_span_outcome(engine_error_outcome(&engine_err));
                     engine_error_response(engine_err, meta, error_debug)
                 }
             }
         }
         Ok((Err(engine_err), _backend)) => {
             metrics.record_engine_error(&engine_err);
+            record_span_outcome(engine_error_outcome(&engine_err));
             engine_error_response(engine_err, base_meta, error_debug)
         }
         Err(join_err) => {
             let engine_err = EngineError::Internal(format!("task panicked: {join_err}"));
             metrics.record_engine_error(&engine_err);
+            record_span_outcome(engine_error_outcome(&engine_err));
             engine_error_response(engine_err, base_meta, error_debug)
         }
     }

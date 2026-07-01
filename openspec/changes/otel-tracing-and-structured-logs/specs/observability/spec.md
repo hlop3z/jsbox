@@ -1,50 +1,4 @@
-# observability Specification
-
-## Purpose
-
-Operational visibility into the running service across three signals with a hybrid transport: a
-liveness endpoint and a dependency-free Prometheus metrics endpoint (aggregate counters + latency
-histograms, **PULL**, bounded labels only — no identity dimension), distributed tracing (a span per
-request, **OTLP PUSH**, identity as span attributes), and structured JSON logs to stdout — so SLOs
-and degraded downstreams are alertable and a single request is followable across hops. Every
-response carries a correlation `trace_id`. Alert guidance: `docs/deployment.md`.
-
-## Requirements
-
-### Requirement: Liveness endpoint
-
-The system SHALL expose `GET /health` returning HTTP 200 with body `ok`, with no backend
-dependencies (it reflects process liveness, not downstream health).
-
-#### Scenario: Health check
-
-- **WHEN** a client requests `GET /health`
-- **THEN** the response is HTTP 200 with body `ok`
-
-### Requirement: Prometheus metrics endpoint
-
-The system SHALL expose `GET /metrics` as dependency-free Prometheus text exposition reporting
-process-wide counters and live gauges. All emitted series use the `runlet_` name prefix.
-
-#### Scenario: Execution outcome counters
-
-- **WHEN** executions complete
-- **THEN** `runlet_executions_total{outcome}` increments per terminal outcome (`success`, `script_error`, `capability_error`, `timeout`, `memory_limit`, `malformed_response`, `internal_error`)
-
-#### Scenario: Shed-load and rejection counters
-
-- **WHEN** requests are rejected or shed
-- **THEN** `runlet_rejections_total` and `runlet_overload_total{scope="global"|"partition"}` increment accordingly
-
-#### Scenario: Circuit-breaker and bulkhead signals
-
-- **WHEN** the metrics are scraped
-- **THEN** `runlet_db_breaker_trips_total` reports cumulative breaker opens and `runlet_bulkhead_permits_available` / `runlet_bulkhead_permits_total` report live and configured capacity
-
-#### Scenario: Latency histograms
-
-- **WHEN** executions run
-- **THEN** `runlet_execution_duration_seconds` (overall) and `runlet_capability_op_duration_seconds{capability}` (per downstream) are exposed as Prometheus histograms
+## ADDED Requirements
 
 ### Requirement: Distributed tracing
 
@@ -95,6 +49,8 @@ redacted.
 
 - **WHEN** the OTLP collector is unreachable
 - **THEN** structured logs are still written to stdout
+
+## MODIFIED Requirements
 
 ### Requirement: Correlation id on every response
 

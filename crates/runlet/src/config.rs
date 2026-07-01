@@ -87,6 +87,37 @@ pub(crate) struct Config {
     /// box then blindly trusts `x-*`. See `docs/design/multitenant-trust.md`.
     #[serde(default)]
     pub(crate) trusted: TrustedConfig,
+    /// Distributed-tracing + structured-logging config (the `telemetry` block). Off by default:
+    /// with no `otlp_endpoint` the box emits structured JSON logs only (no OTLP export). See
+    /// `telemetry.rs` and `docs/design/nexus-upstream-requirements.md` (N6).
+    #[serde(default)]
+    pub(crate) telemetry: TelemetryConfig,
+}
+
+/// Distributed-tracing config (the `telemetry` block). Metrics stay Prometheus PULL; this block
+/// governs only trace export + the log/service name. Tracing is enabled iff `otlp_endpoint` is set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub(crate) struct TelemetryConfig {
+    /// OTLP/gRPC collector endpoint (e.g. `http://localhost:4317`). `None` (default) ⇒ tracing
+    /// disabled; the box still emits structured JSON logs to stdout. Plaintext by default (a
+    /// local/in-pod collector terminates TLS to the backend, not the box).
+    pub(crate) otlp_endpoint: Option<String>,
+    /// Sampling ratio in `[0.0, 1.0]` for box-started root spans (a parent `traceparent` decision
+    /// is always honored). Default `1.0` — sample every self-rooted trace.
+    pub(crate) sample_ratio: f64,
+    /// `service.name` resource attribute reported to the collector. Default `runlet`.
+    pub(crate) service_name: String,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+            sample_ratio: 1.0,
+            service_name: "runlet".to_owned(),
+        }
+    }
 }
 
 /// Trusted-identity mode configuration (the `trusted` block).
@@ -346,6 +377,39 @@ mod tests {
         assert!(
             cfg.check_exposure().is_ok(),
             "allow_unauthenticated unlocks an exposed bind"
+        );
+    }
+
+    /// Telemetry defaults to disabled (no endpoint), full sampling, service name `runlet`.
+    #[test]
+    fn telemetry_defaults_disabled() {
+        let cfg = Config::default();
+        assert!(
+            cfg.telemetry.otlp_endpoint.is_none(),
+            "no endpoint by default ⇒ tracing off, logs only"
+        );
+        assert!(
+            (cfg.telemetry.sample_ratio - 1.0).abs() < f64::EPSILON,
+            "default sample ratio is 1.0"
+        );
+        assert_eq!(cfg.telemetry.service_name, "runlet");
+    }
+
+    /// A `telemetry` block parses its endpoint / ratio / service name; omitted fields default.
+    #[test]
+    fn telemetry_block_parses() {
+        let json = r#"{"telemetry":{"otlp_endpoint":"http://collector:4317","sample_ratio":0.1}}"#;
+        let parsed = serde_json::from_str::<Config>(json);
+        assert!(parsed.is_ok(), "telemetry block should parse");
+        let cfg = parsed.unwrap_or_default();
+        assert_eq!(
+            cfg.telemetry.otlp_endpoint.as_deref(),
+            Some("http://collector:4317")
+        );
+        assert!((cfg.telemetry.sample_ratio - 0.1).abs() < f64::EPSILON);
+        assert_eq!(
+            cfg.telemetry.service_name, "runlet",
+            "omitted service_name falls back to the default"
         );
     }
 

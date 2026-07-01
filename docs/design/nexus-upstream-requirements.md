@@ -39,3 +39,27 @@ home org (`resourceowner`).
   the edge up first.
 
 Related: `docs/design/multitenant-trust.md` (decision D3; the acting-org gate).
+
+## N6 — the edge must propagate a W3C `traceparent` so edge→box→`fabricd` is one trace
+
+`runlet` emits an OpenTelemetry span per `/execute` (tenant/user/plan as span **attributes**, never
+metric labels) and exports it OTLP to a collector. For a request's trace to span the whole path,
+the nexus edge must start the trace and inject a standard **W3C `traceparent`** (and optionally
+`tracestate`) header, which the box reads and **continues** (parent-based sampling honors the
+edge's sample decision).
+
+- **Why:** without a propagated `traceparent`, each box starts its own orphan root span — traces
+  still work but cannot be tied back to the edge request or correlated across hops. With it, one
+  trace id threads edge → box → (later) `fabricd`.
+- **Contract:** the edge SHALL inject `traceparent` per the W3C Trace Context spec on requests it
+  forwards to the box; it makes the head sampling decision. The box does no tail sampling (that is
+  the collector's job).
+- **Graceful degradation (no hard dependency):** if the edge does not emit `traceparent`, the box
+  starts its own root span and applies its configured sample ratio — so this is an *enhancement*,
+  not a release gate. `meta.trace_id` is the propagated id when present, else the box-rooted id.
+- **Bring-up ordering:** stand up the collector and set `telemetry.otlp_endpoint` on the box, then
+  enable edge propagation — the box tolerates any order (fail-open, D6).
+- **Status:** box side implemented (continues `traceparent`, fail-open); nexus side open — track as
+  an observability enhancement, not a gate.
+
+Related: `docs/design/multitenant-trust.md`; the `observability` spec (distributed tracing).

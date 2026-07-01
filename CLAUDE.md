@@ -109,7 +109,13 @@ context and returns `{data, error, meta}`. The single endpoint is the whole prod
   daemon cert by fingerprint and presents an auth token (`BoxAuth`: static secret or a re-read k8s
   SA-token file). No sidecar configured + a driver request ⇒ `503 EGRESS_UNAVAILABLE`.
   Deterministic/`http`/`s3` requests need no sidecar. Prometheus metric names use the `runlet_*`
-  prefix and the internal capability-error wire tag is `__runlet`. Optional **trusted-identity mode**
+  prefix and the internal capability-error wire tag is `__runlet`. **Observability is three signals,
+  hybrid transport** (`telemetry.rs`, opt-in `config.telemetry`): metrics stay Prometheus **PULL**
+  (`/metrics`), logs are structured **JSON to stdout**, and each `/execute` is an OpenTelemetry span
+  **pushed** OTLP/gRPC to a collector (plaintext to a local collector ⇒ no second crypto stack;
+  `cargo tree -i ring` still empty). Identity (tenant/user/plan) rides spans/logs as **attributes,
+  never metric labels** (cardinality). Tracing continues a W3C `traceparent` from the edge (N6) or
+  starts its own root; export is non-blocking + fail-open. Optional **trusted-identity mode**
   (`config.trusted`, opt-in): behind the nexus edge the box derives tenant/user identity from
   configured trusted headers (`identity.rs`), rejects anonymous/suspended callers, keys Tier 5
   fairness + the bytecode-cache namespace off the trusted tenant id (dropping the caller-asserted

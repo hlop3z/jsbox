@@ -46,4 +46,4 @@
   metric tests). Confirm no new dependencies and `cargo tree -i ring` unchanged.
   (Also fixed a pre-existing `dropping_copy_types` warning in `handler.rs` quota test:
   `drop(plans.insert(..))` → `let _ = plans.insert(..)`, surfaced by the clean-build gate.)
-- [ ] 6.3 Run `/opsx:sync` to fold the `observability` delta into the main spec, then archive.
+- [x] 6.3 Run `/opsx:sync` to fold the `observability` delta into the main spec, then archive.

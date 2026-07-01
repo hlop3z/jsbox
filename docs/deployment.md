@@ -177,6 +177,33 @@ Scrape `GET /metrics` (Prometheus text, no client library). The series and sugge
 Every response also carries `meta.trace_id`, logged server-side with the raw cause — grep one
 ID across the mesh for support.
 
+**Three signals, hybrid transport.** Metrics stay **Prometheus PULL** (`/metrics`, above) — the
+low-cardinality, always-scrapable pillar. Logs are **structured JSON to stdout** (the collector
+tails them, so a collector outage never loses logs). Traces **PUSH via OTLP** to a collector.
+Identity (tenant/user/plan) rides **traces and logs** as attributes — **never** metric labels (the
+cardinality rule: identity would explode Prometheus series at multi-tenant scale).
+
+**Enable tracing** with a `telemetry` config block:
+
+```json
+"telemetry": {
+  "otlp_endpoint": "http://otel-collector:4317",
+  "sample_ratio": 0.1,
+  "service_name": "runlet"
+}
+```
+
+- `otlp_endpoint` — OTLP/gRPC collector address. **Omit to disable tracing** (logs still emit).
+  Plaintext by default (a local/in-pod collector terminates TLS to the backend, not the box) — so
+  no second crypto stack is linked. Point it at a sidecar/daemonset collector.
+- `sample_ratio` — fraction of **box-started** root traces to sample (`0.0`–`1.0`). A propagated
+  edge `traceparent` decision is always honored; the collector does tail-sampling for errors/slow.
+- Export is non-blocking (batch processor, drop-on-full) and fail-open: an unreachable collector
+  never fails startup or a request. On graceful shutdown buffered spans are flushed.
+- **Edge propagation (N6):** for one trace across edge → box → `fabricd`, the nexus edge must inject
+  a W3C `traceparent`; the box continues it. Until then, box-rooted traces still work. See
+  `docs/design/nexus-upstream-requirements.md` (N6).
+
 ## 9. Supply chain
 
 `task supply-chain` runs cargo-audit (advisories) + cargo-deny (licenses/bans/sources) +

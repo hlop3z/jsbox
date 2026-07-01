@@ -6,6 +6,7 @@ mod handler;
 mod identity;
 mod quota;
 mod sidecar;
+mod telemetry;
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -20,7 +21,6 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::Semaphore;
 use tracing::info;
-use tracing_subscriber::fmt::init as init_tracing;
 
 use runlet_core::host::{HostSettings, LogicHost};
 use runlet_core::metrics::Metrics;
@@ -51,7 +51,18 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
               splitting it would scatter the one-shot setup state across helpers"
 )]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    init_tracing();
+    // Load config first so telemetry init can read its `telemetry` block. A load failure returns
+    // before any subscriber is installed; the error propagates from `main` and is printed.
+    let config_path = PathBuf::from("config.json");
+    let config = Config::load(&config_path)?;
+
+    // Structured JSON logs to stdout (always) + optional OTLP tracing (when `otlp_endpoint` is
+    // set). Held for the process lifetime; flushed on graceful shutdown so buffered spans export.
+    let telemetry_guard = telemetry::init(&telemetry::TelemetrySettings {
+        otlp_endpoint: config.telemetry.otlp_endpoint.clone(),
+        sample_ratio: config.telemetry.sample_ratio,
+        service_name: config.telemetry.service_name.clone(),
+    });
 
     // Install `aws-lc-rs` as the single process-wide rustls provider — reused by every TLS
     // path (`db` SSL, `redis` rediss://, `amq` amqps://) so the binary links one crypto
@@ -59,9 +70,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if aws_lc_rs::default_provider().install_default().is_err() {
         tracing::warn!("rustls crypto provider was already installed");
     }
-
-    let config_path = PathBuf::from("config.json");
-    let config = Config::load(&config_path)?;
 
     // Fail closed: refuse an exposed bind with no `/execute` auth gate (see config.rs).
     config.check_exposure()?;
@@ -216,6 +224,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // axum has drained in-flight requests (so every `host.run` has returned); reject any
     // stragglers and dispose the warm runtime pool before exit.
     host_lifecycle.shutdown();
+
+    // Flush + shut down the tracer provider so buffered spans are exported before exit (no-op
+    // when tracing is disabled).
+    telemetry_guard.shutdown();
 
     info!("server shut down gracefully");
     Ok(())

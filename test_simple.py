@@ -1545,6 +1545,95 @@ def test_trusted_acting_scope(t: Runner):
             proc.kill()
 
 
+def _start_telemetry_box(port: int = 3011):
+    """Start a dedicated `runlet` with tracing enabled, pointed at an OTLP endpoint nothing is
+    listening on. Exercises three things at once: W3C `traceparent` propagation into
+    `meta.trace_id`, fail-open export (the request must still succeed with the collector down), and
+    structured JSON logs on stdout. Returns `(proc, url, log_path)` or `(None, None, None)`."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+    run_dir = os.path.join(repo, ".test-run", "telemetry")
+    os.makedirs(run_dir, exist_ok=True)
+    cfg = {
+        "server": {"host": "127.0.0.1", "port": port},
+        # Nothing listens on :4317 — the tonic channel is lazy, so export just fails in the
+        # background (drop-on-full) while requests proceed (fail-open, design D6).
+        "telemetry": {
+            "otlp_endpoint": "http://127.0.0.1:4317",
+            "sample_ratio": 1.0,
+            "service_name": "runlet-test",
+        },
+    }
+    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh)
+    try:
+        subprocess.run(["cargo", "build", "-p", "runlet"], cwd=repo, check=True)
+    except Exception:
+        return None, None, None
+    binpath = os.path.join(repo, "target", "debug", "runlet")
+    log_path = os.path.join(run_dir, "stdout.log")
+    logf = open(log_path, "w", encoding="utf-8")  # noqa: SIM115 (held for the child's lifetime)
+    proc = subprocess.Popen(
+        [binpath], cwd=run_dir, stdout=logf, stderr=subprocess.STDOUT)
+    url = f"http://127.0.0.1:{port}/execute"
+    probe = h("return json(1, null);")
+    for _ in range(40):
+        st, _r = _post_status(url, probe)
+        if st is not None:
+            return proc, url, log_path
+        time.sleep(0.5)
+    proc.terminate()
+    return None, None, None
+
+
+def test_telemetry_tracing(t: Runner):
+    """OpenTelemetry tracing + structured logs: a propagated W3C `traceparent` becomes
+    `meta.trace_id`; without one the box starts its own 32-hex root id; the request succeeds even
+    though the collector is unreachable (fail-open); and stdout is structured JSON."""
+    t.section("OpenTelemetry tracing + structured logs")
+    proc, url, log_path = _start_telemetry_box()
+    if proc is None:
+        print("  \033[33mSKIP\033[0m telemetry box failed to build/start — asserts skipped\n")
+        return
+    try:
+        script = h("return json(1, null);")
+        is_hex32 = lambda s: len(s) == 32 and all(c in "0123456789abcdef" for c in s)
+
+        # 1. Propagation: the box continues the edge trace, so meta.trace_id == the traceparent id.
+        tp_trace = "0af7651916cd43dd8448eb211c80319c"
+        st, r = _post_status(url, script, {"traceparent": f"00-{tp_trace}-b7ad6b7169203331-01"})
+        tid = (r or {}).get("meta", {}).get("trace_id", "")
+        t.check("traceparent continued into meta.trace_id",
+                st == 200 and tid == tp_trace)
+
+        # 2. No traceparent: a fresh box-rooted 32-hex trace id, and the request still succeeds
+        #    (fail-open — the OTLP collector is down).
+        st2, r2 = _post_status(url, script)
+        tid2 = (r2 or {}).get("meta", {}).get("trace_id", "")
+        t.check("box starts its own trace when no traceparent (fail-open success)",
+                st2 == 200 and is_hex32(tid2) and tid2 != tp_trace)
+
+        # 3. Structured logging: stdout carries at least one valid JSON log object.
+        time.sleep(0.5)
+        json_lines = 0
+        with open(log_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    json.loads(line)
+                    json_lines += 1
+                except ValueError:
+                    pass
+        t.check("server emits structured JSON logs to stdout", json_lines > 0)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+
+
 def main():
     procs: list = []
 
@@ -1622,8 +1711,9 @@ def main():
     # pointed at an already-running / remote server (JSBOX_URL), which we don't reconfigure.
     if procs:
         test_trusted_acting_scope(t)
+        test_telemetry_tracing(t)
     else:
-        print("\n  \033[33mSKIP\033[0m trusted-mode N5 tests (external server; harness didn't start it)\n")
+        print("\n  \033[33mSKIP\033[0m trusted-mode N5 + telemetry tests (external server; harness didn't start it)\n")
 
     t.summary()
 

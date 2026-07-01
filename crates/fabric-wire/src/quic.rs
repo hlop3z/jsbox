@@ -26,6 +26,7 @@ use rustls::DigitallySignedStruct;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::aws_lc_rs;
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DistinguishedName, Error as TlsError, SignatureScheme};
 use sha2::{Digest as _, Sha256};
@@ -78,14 +79,15 @@ impl ServerTls {
     ///
     /// Returns an error if the PEM can't be parsed or contains no certificate / no private key.
     pub fn from_pem(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Self> {
-        let mut cert_reader = cert_pem;
-        let chain = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+        // PEM parsing via `rustls_pki_types::pem::PemObject` (re-exported by `rustls`), the
+        // maintained successor to the now-archived `rustls-pemfile` crate.
+        let chain = CertificateDer::pem_slice_iter(cert_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io::Error::other)?;
         if chain.is_empty() {
             return Err(io::Error::other("no certificate found in PEM"));
         }
-        let mut key_reader = key_pem;
-        let key = rustls_pemfile::private_key(&mut key_reader)?
-            .ok_or_else(|| io::Error::other("no private key found in PEM"))?;
+        let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(io::Error::other)?;
         Ok(Self { chain, key })
     }
 
