@@ -17,7 +17,14 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Release gate: reuse the full CI check (fmt + clippy + unit tests +
+  # supply-chain). The image build below cannot run unless this passes, so a
+  # broken or vulnerable build can never be published.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
   release:
+    needs: verify
     runs-on: ubuntu-latest
 
     permissions:

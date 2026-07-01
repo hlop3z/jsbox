@@ -1,0 +1,79 @@
+name: CI
+
+# Deterministic gate: formatting, the strict clippy gauntlet, unit tests, and
+# supply-chain. Runs on every PR/push AND is reused as the release gate
+# (`workflow_call`) so an image can never ship without passing this.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # NB: the workspace lint gauntlet (`[workspace.lints]`) is already deny-level,
+  # so `cargo clippy` fails on any gauntlet violation. We deliberately do NOT add
+  # `RUSTFLAGS: -D warnings` here so CI matches the proven-green local gate
+  # exactly; tighten to warnings-as-errors once a full-feature build is confirmed
+  # rustc-warning-clean in this environment.
+
+jobs:
+  gate:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin to the same toolchain the release image builds with (Dockerfile:
+      # rust:1.92-alpine, edition 2024). Keep these in lockstep.
+      - name: Install Rust 1.92
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92"
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      # Mirror the local gate exactly (`task clippy` == plain `cargo clippy`,
+      # NOT --all-targets: the gate deliberately does not lint #[cfg(test)] code).
+      - name: Clippy (gate)
+        run: cargo clippy --workspace
+
+      - name: Unit tests
+        run: cargo test --workspace
+
+  supply-chain:
+    name: audit + deny + vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.92
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92"
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Prebuilt binaries — far faster than `cargo install`.
+      - name: Install supply-chain tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny,cargo-vet
+
+      - name: cargo audit
+        run: cargo audit
+
+      - name: cargo deny
+        run: cargo deny check
+
+      # Online run (not --locked): fetches the imported third-party audit sets.
+      - name: cargo vet
+        run: cargo vet

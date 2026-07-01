@@ -1,0 +1,57 @@
+name: Integration
+
+# The live-backend suite (test_simple.py). Brings up the deterministic backends
+# via docker compose; the Python harness starts its own server (cargo run) and
+# self-skips any backend it can't probe. The auth providers (keycloak/zitadel)
+# are intentionally NOT started here (slow boot + PAT bootstrap) — those paths
+# are covered locally. Kept separate from the release gate until proven stable;
+# promote it into ci.yml's `workflow_call` set once it is reliably green.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integration:
+    name: live-backend suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.92
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Start backends
+        run: >
+          docker compose up -d --wait
+          postgres pgbouncer cockroach cockroach-init httpbin redis rabbitmq mongo nats
+
+      # Warm the build so the harness's `cargo run` starts promptly.
+      - name: Pre-build server
+        run: cargo build -p runlet
+
+      - name: Run integration suite
+        run: python test_simple.py
+
+      - name: Dump backend logs on failure
+        if: failure()
+        run: docker compose logs --tail=100
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
