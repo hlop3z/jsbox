@@ -127,10 +127,13 @@ the drivers that leave `runlet-core` land here.
 > **Status: implemented 2026-06-30** (approved same day). The one piece of the fabric vision built
 > so far: `fabric-wire::quic` (pinned-cert endpoints), the box's `runlet::sidecar` (UDS-or-QUIC
 > egress with cert pinning + client-side failover), and `fabricd`'s QUIC listener + pluggable
-> `ClientAuthenticator` (`none`/`static` shipping; k8s SA-token OIDC a wired seam) + connection/
-> stream caps. Verified end-to-end by `smoke_quic.sh` (happy path + wrong/absent-token negatives).
-> The one piece still open is the **SA-token OIDC** authenticator (needs offline JWKS verification +
-> a cluster to test). Everything below the `## Deferred` line at the end stays parked.
+> `ClientAuthenticator` (`none`/`static`/`sa-token`) + connection/stream caps. Verified end-to-end
+> by `smoke_quic.sh` (happy path + wrong/absent-token negatives). The **`sa-token`** provider (k8s
+> projected `ServiceAccount` token, verified offline against the cluster JWKS) is implemented in
+> `fabric_backends::sa_token` (`JwksVerifier`: background-refreshed JWKS cache + offline RS256 +
+> `aud`/`iss`/`exp` check) and unit-tested hermetically; the remaining open item is the **KIND
+> end-to-end** test (`smoke_satoken.sh`) that exercises it against a real projected token in-cluster.
+> Everything below the `## Deferred` line at the end stays parked.
 
 ## Why only this slice
 
@@ -203,8 +206,12 @@ providers chosen by config:
    in `WireInit`. `fabricd` **verifies it as an OIDC token** against the cluster JWKS (offline
    signature check + audience + expiry — no per-request API-server round-trip), giving **per-pod
    identity, automatic rotation, and revocation** (delete the ServiceAccount) with **no cert
-   manager and no shared secret**. Reuses `fabricd`'s existing `auth`/OIDC machinery (it already
-   links the `auth` backend for OIDC discovery + token validation).
+   manager and no shared secret**. Implemented as a new `fabric_backends::sa_token::JwksVerifier`
+   (a `background-refreshed JWKS cache so the synchronous accept path does no I/O; offline RS256 +
+   `aud`/`iss`/`exp` validation via `jsonwebtoken`), reusing the shared `reqwest` + rustls/`aws-lc-rs`
+   stack rather than the (online, introspection-oriented) `auth` capability backend. Fail-closed
+   until the first JWKS fetch; the JWKS URL is explicit or OIDC-discovered from the issuer, and the
+   client trusts an optional mounted cluster CA.
 2. **Opaque shared static token (fallback / bootstrap / non-k8s).** A 32-byte random secret in both
    configs, **constant-time** compared (`subtle`/`constant_time_eq`), with `current + previous`
    accepted for zero-downtime rotation. Simpler, but a cluster-wide blast radius (one secret for

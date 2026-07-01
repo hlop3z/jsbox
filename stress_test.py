@@ -37,8 +37,14 @@ CONCURRENCY = int(os.environ.get("STRESS_CONCURRENCY", "40"))
 DURATION = float(os.environ.get("STRESS_DURATION", "8"))
 SLEEP_S = float(os.environ.get("STRESS_SLEEP", "2"))
 
-DB_CONFIG = {"host": PGB_HOST, "port": PGB_PORT, "user": "test",
-             "password": "test", "database": "testdb", "statement_timeout_ms": 0}
+DB_CONFIG = {
+    "host": PGB_HOST,
+    "port": PGB_PORT,
+    "user": "test",
+    "password": "test",
+    "database": "testdb",
+    "statement_timeout_ms": 0,
+}
 
 # The load: a slow DB query (simulates a degraded database / saturated pool). Each
 # request holds a connection for SLEEP_S server-side.
@@ -61,11 +67,13 @@ VICTIM_BODY = {
 
 # -- HTTP ---------------------------------------------------------------------
 
+
 def _post_timed(body: dict, timeout: float = 30.0):
     """POST /execute, returning (latency_s, http_status, error_code|None)."""
     data = json.dumps(body).encode()
-    req = urllib.request.Request(f"{BASE_URL}/execute", data=data,
-                                 headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        f"{BASE_URL}/execute", data=data, headers={"Content-Type": "application/json"}
+    )
     start = time.time()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -87,6 +95,7 @@ def _code(body_json: dict):
 
 # -- Server lifecycle ---------------------------------------------------------
 
+
 def _wait_for_server(up: bool, tries: int = 40) -> bool:
     for _ in range(tries):
         _, status, _ = _post_timed(TRIVIAL_BODY, timeout=2)
@@ -101,13 +110,17 @@ def start_server(engine_overrides: dict) -> subprocess.Popen:
     repo = os.path.dirname(os.path.abspath(__file__))
     run_dir = os.path.join(repo, ".stress-run")
     os.makedirs(run_dir, exist_ok=True)
-    config = {"debug": True, "server": {"host": "127.0.0.1", "port": 3000},
-              "engine": engine_overrides}
+    config = {
+        "debug": True,
+        "server": {"host": "127.0.0.1", "port": 3000},
+        "engine": engine_overrides,
+    }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
         json.dump(config, fh)
     cmd = [JSBOX_BIN] if JSBOX_BIN else ["cargo", "run", "--quiet"]
-    proc = subprocess.Popen(cmd, cwd=run_dir,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(
+        cmd, cwd=run_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
     if not _wait_for_server(up=True):
         proc.terminate()
         raise RuntimeError("server failed to start")
@@ -125,6 +138,7 @@ def stop_server(proc: subprocess.Popen):
 
 # -- Load + stats -------------------------------------------------------------
 
+
 def percentile(sorted_vals, pct: float) -> float:
     if not sorted_vals:
         return 0.0
@@ -134,7 +148,8 @@ def percentile(sorted_vals, pct: float) -> float:
 
 def run_load(concurrency: int, duration: float) -> dict:
     """Fire `concurrency` workers looping the slow query for `duration` seconds, while a
-    single victim thread interleaves a normal fast query to measure noisy-neighbor impact."""
+    single victim thread interleaves a normal fast query to measure noisy-neighbor impact.
+    """
     deadline = time.time() + duration
     results = []  # (latency, status, code) — the slow-query flood
 
@@ -178,16 +193,23 @@ def _summarize(results, victim, duration: float) -> dict:
         "total": total,
         "throughput": total / duration if duration else 0,
         "useful": total - shed,
-        "p50": percentile(lats, 50), "p95": percentile(lats, 95),
-        "p99": percentile(lats, 99), "max": lats[-1] if lats else 0,
-        "shed_429": shed, "shed_pct": (100.0 * shed / total) if total else 0,
+        "p50": percentile(lats, 50),
+        "p95": percentile(lats, 95),
+        "p99": percentile(lats, 99),
+        "max": lats[-1] if lats else 0,
+        "shed_429": shed,
+        "shed_pct": (100.0 * shed / total) if total else 0,
         "codes": codes,
-        "vic_n": len(victim), "vic_ok": vic_ok, "vic_shed": vic_shed,
-        "vic_p50": percentile(vic_lats, 50), "vic_p99": percentile(vic_lats, 99),
+        "vic_n": len(victim),
+        "vic_ok": vic_ok,
+        "vic_shed": vic_shed,
+        "vic_p50": percentile(vic_lats, 50),
+        "vic_p99": percentile(vic_lats, 99),
     }
 
 
 # -- Report -------------------------------------------------------------------
+
 
 def _row(label, a, b, fmt):
     print(f"  {label:<22} {fmt(a):>14} {fmt(b):>14}")
@@ -198,7 +220,9 @@ def report(a: dict, b: dict):
     num = lambda v: f"{v:.0f}"
     pct = lambda v: f"{v:.0f}%"
     print("\n" + "=" * 54)
-    print(f"  A/B stress — {CONCURRENCY} concurrent, {DURATION:.0f}s, pg_sleep({SLEEP_S:.0f}) via PgBouncer")
+    print(
+        f"  A/B stress — {CONCURRENCY} concurrent, {DURATION:.0f}s, pg_sleep({SLEEP_S:.0f}) via PgBouncer"
+    )
     print("=" * 54)
     print(f"  {'metric':<22} {'A baseline':>14} {'B resilient':>14}")
     print("  " + "-" * 50)
@@ -218,20 +242,33 @@ def report(a: dict, b: dict):
     print(f"    B: {b['codes']}")
     print("\n  verdict:")
     if a["p99"] > 0:
-        print(f"    Tail latency  A p99 {a['p99']:.2f}s  ->  B p99 {b['p99']:.2f}s "
-              f"({a['p99'] / max(b['p99'], 1e-3):.0f}x lower under overload)")
+        print(
+            f"    Tail latency  A p99 {a['p99']:.2f}s  ->  B p99 {b['p99']:.2f}s "
+            f"({a['p99'] / max(b['p99'], 1e-3):.0f}x lower under overload)"
+        )
     if b["shed_429"] > 0 and a["shed_429"] == 0:
-        print(f"    Tier 1 ✓  B fails fast — sheds {b['shed_pct']:.0f}% as 429s; A queues (none shed)")
-    print(f"    Noisy neighbor  victim (partition 'good')  A succeeded {a['vic_ok']}  vs  B succeeded {b['vic_ok']}")
+        print(
+            f"    Tier 1 ✓  B fails fast — sheds {b['shed_pct']:.0f}% as 429s; A queues (none shed)"
+        )
+    print(
+        f"    Noisy neighbor  victim (partition 'good')  A succeeded {a['vic_ok']}  vs  B succeeded {b['vic_ok']}"
+    )
     if b["vic_ok"] > 0:
-        print(f"    Tier 5 ✓  the good partition keeps its share — {b['vic_ok']} victim requests got")
-        print(f"              through under the flood (A: {a['vic_ok']}, dragged to p99 {a['vic_p99']:.2f}s).")
+        print(
+            f"    Tier 5 ✓  the good partition keeps its share — {b['vic_ok']} victim requests got"
+        )
+        print(
+            f"              through under the flood (A: {a['vic_ok']}, dragged to p99 {a['vic_p99']:.2f}s)."
+        )
     elif b["vic_shed"] > 0:
-        print("    Tier 5 gap: the good partition was shed too — is max_concurrent_per_partition set?")
+        print(
+            "    Tier 5 gap: the good partition was shed too — is max_concurrent_per_partition set?"
+        )
     print()
 
 
 # -- Main ---------------------------------------------------------------------
+
 
 def experiment(label: str, engine: dict) -> dict:
     print(f"  [{label}] starting server: {engine}")
@@ -245,13 +282,23 @@ def experiment(label: str, engine: dict) -> dict:
 
 def main():
     if _post_timed(TRIVIAL_BODY, timeout=2)[1] != 0:
-        print("ERROR: a server is already on :3000 — stop it; this harness manages its own.")
+        print(
+            "ERROR: a server is already on :3000 — stop it; this harness manages its own."
+        )
         raise SystemExit(1)
     # A: bulkhead effectively off, no statement_timeout ceiling.
-    a = experiment("A baseline", {"max_concurrent_executions": 1000, "max_statement_timeout_ms": 0})
+    a = experiment(
+        "A baseline", {"max_concurrent_executions": 1000, "max_statement_timeout_ms": 0}
+    )
     # B: Tier 1 bulkhead + Tier 0 clamp.
-    b = experiment("B resilient", {"max_concurrent_executions": 8, "max_statement_timeout_ms": 1000,
-                                    "max_concurrent_per_partition": 4})
+    b = experiment(
+        "B resilient",
+        {
+            "max_concurrent_executions": 8,
+            "max_statement_timeout_ms": 1000,
+            "max_concurrent_per_partition": 4,
+        },
+    )
     report(a, b)
 
 
