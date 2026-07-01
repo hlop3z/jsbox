@@ -907,25 +907,25 @@ def test_metrics(t: Runner):
     body = _scrape()
     t.test("/metrics returns 200 Prometheus text",
            h("return json(1,null);"),
-           lambda _r: body is not None and "jsbox_executions_total" in body)
+           lambda _r: body is not None and "runlet_executions_total" in body)
     t.test("/metrics exposes bulkhead + breaker series",
            h("return json(1,null);"),
            lambda _r: body is not None
-           and "jsbox_bulkhead_permits_total" in body
-           and "jsbox_db_breaker_trips_total" in body)
+           and "runlet_bulkhead_permits_total" in body
+           and "runlet_db_breaker_trips_total" in body)
     t.test("/metrics exposes the execution latency histogram",
            h("return json(1,null);"),
            lambda _r: body is not None
-           and "jsbox_execution_duration_seconds_bucket{le=\"+Inf\"}" in body
-           and "jsbox_execution_duration_seconds_count" in body)
+           and "runlet_execution_duration_seconds_bucket{le=\"+Inf\"}" in body
+           and "runlet_execution_duration_seconds_count" in body)
     t.test("/metrics exposes the per-capability latency family",
            h("return json(1,null);"),
            lambda _r: body is not None
-           and body.count("# TYPE jsbox_capability_op_duration_seconds histogram") == 1
-           and "jsbox_capability_op_duration_seconds_count{capability=\"db\"}" in body)
+           and body.count("# TYPE runlet_capability_op_duration_seconds histogram") == 1
+           and "runlet_capability_op_duration_seconds_count{capability=\"db\"}" in body)
 
-    success_label = 'jsbox_executions_total{outcome="success"}'
-    hist_label = "jsbox_execution_duration_seconds_count"
+    success_label = 'runlet_executions_total{outcome="success"}'
+    hist_label = "runlet_execution_duration_seconds_count"
     before = _counter(body, success_label)
     before_hist = _counter(body, hist_label)
     _post(h("return json('ok', null);"))
@@ -939,7 +939,7 @@ def test_metrics(t: Runner):
            h("return json(1,null);"),
            lambda _r: before_hist is not None and after_hist is not None and after_hist > before_hist)
 
-    err_label = 'jsbox_executions_total{outcome="script_error"}'
+    err_label = 'runlet_executions_total{outcome="script_error"}'
     before_err = _counter(after_text, err_label)
     _post(h("throw new Error('boom');"))
     err_text = _scrape()
@@ -948,10 +948,10 @@ def test_metrics(t: Runner):
            h("return json(1,null);"),
            lambda _r: before_err is not None and after_err is not None and after_err > before_err)
 
-    before_rej = _counter(err_text, "jsbox_rejections_total ")
+    before_rej = _counter(err_text, "runlet_rejections_total ")
     _post({"context": {}})  # neither script nor key -> SCRIPT_XOR_KEY rejection
     rej_text = _scrape()
-    after_rej = _counter(rej_text, "jsbox_rejections_total ")
+    after_rej = _counter(rej_text, "runlet_rejections_total ")
     t.test("rejection counter advances after a bad request",
            h("return json(1,null);"),
            lambda _r: before_rej is not None and after_rej is not None and after_rej > before_rej)

@@ -4,7 +4,7 @@
     var res = JSON.parse(raw);
     if (res && res.error) {
       var err = new Error(res.error);
-      err.__jsbox = res; // { error, code, retryable, owner, source } — engine classifies off this
+      err.__runlet = res; // { error, code, retryable, owner, source } — engine classifies off this
       throw err;
     }
     return res;

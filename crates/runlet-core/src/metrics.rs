@@ -171,10 +171,10 @@ impl CapabilityLatencies {
         }
     }
 
-    /// Renders the single `jsbox_capability_op_duration_seconds` family: one `# HELP`/
+    /// Renders the single `runlet_capability_op_duration_seconds` family: one `# HELP`/
     /// `# TYPE` header then every capability's series carrying a `capability="…"` label.
     fn render(&self) -> String {
-        let name = "jsbox_capability_op_duration_seconds";
+        let name = "runlet_capability_op_duration_seconds";
         let series: Vec<String> = [
             ("db", &self.db),
             ("mongo", &self.mongo),
@@ -294,40 +294,40 @@ impl Metrics {
     ) -> String {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         format!(
-            "# HELP jsbox_executions_total Executions by terminal outcome.\n\
-             # TYPE jsbox_executions_total counter\n\
-             jsbox_executions_total{{outcome=\"success\"}} {success}\n\
-             jsbox_executions_total{{outcome=\"script_error\"}} {script_error}\n\
-             jsbox_executions_total{{outcome=\"capability_error\"}} {capability_error}\n\
-             jsbox_executions_total{{outcome=\"timeout\"}} {timeout}\n\
-             jsbox_executions_total{{outcome=\"memory_limit\"}} {memory_limit}\n\
-             jsbox_executions_total{{outcome=\"malformed_response\"}} {malformed_response}\n\
-             jsbox_executions_total{{outcome=\"internal_error\"}} {internal_error}\n\
-             # HELP jsbox_rejections_total Requests rejected before execution (bad body, routing, oversized).\n\
-             # TYPE jsbox_rejections_total counter\n\
-             jsbox_rejections_total {rejections}\n\
-             # HELP jsbox_overload_total Requests shed by a concurrency limit.\n\
-             # TYPE jsbox_overload_total counter\n\
-             jsbox_overload_total{{scope=\"global\"}} {overload_global}\n\
-             jsbox_overload_total{{scope=\"partition\"}} {overload_partition}\n\
-             # HELP jsbox_db_breaker_trips_total Cumulative db circuit-breaker open transitions.\n\
-             # TYPE jsbox_db_breaker_trips_total counter\n\
-             jsbox_db_breaker_trips_total {breaker_trips}\n\
-             # HELP jsbox_bulkhead_permits_available Free global bulkhead permits right now.\n\
-             # TYPE jsbox_bulkhead_permits_available gauge\n\
-             jsbox_bulkhead_permits_available {bulkhead_available}\n\
-             # HELP jsbox_bulkhead_permits_total Configured global bulkhead capacity.\n\
-             # TYPE jsbox_bulkhead_permits_total gauge\n\
-             jsbox_bulkhead_permits_total {bulkhead_total}\n\
+            "# HELP runlet_executions_total Executions by terminal outcome.\n\
+             # TYPE runlet_executions_total counter\n\
+             runlet_executions_total{{outcome=\"success\"}} {success}\n\
+             runlet_executions_total{{outcome=\"script_error\"}} {script_error}\n\
+             runlet_executions_total{{outcome=\"capability_error\"}} {capability_error}\n\
+             runlet_executions_total{{outcome=\"timeout\"}} {timeout}\n\
+             runlet_executions_total{{outcome=\"memory_limit\"}} {memory_limit}\n\
+             runlet_executions_total{{outcome=\"malformed_response\"}} {malformed_response}\n\
+             runlet_executions_total{{outcome=\"internal_error\"}} {internal_error}\n\
+             # HELP runlet_rejections_total Requests rejected before execution (bad body, routing, oversized).\n\
+             # TYPE runlet_rejections_total counter\n\
+             runlet_rejections_total {rejections}\n\
+             # HELP runlet_overload_total Requests shed by a concurrency limit.\n\
+             # TYPE runlet_overload_total counter\n\
+             runlet_overload_total{{scope=\"global\"}} {overload_global}\n\
+             runlet_overload_total{{scope=\"partition\"}} {overload_partition}\n\
+             # HELP runlet_db_breaker_trips_total Cumulative db circuit-breaker open transitions.\n\
+             # TYPE runlet_db_breaker_trips_total counter\n\
+             runlet_db_breaker_trips_total {breaker_trips}\n\
+             # HELP runlet_bulkhead_permits_available Free global bulkhead permits right now.\n\
+             # TYPE runlet_bulkhead_permits_available gauge\n\
+             runlet_bulkhead_permits_available {bulkhead_available}\n\
+             # HELP runlet_bulkhead_permits_total Configured global bulkhead capacity.\n\
+             # TYPE runlet_bulkhead_permits_total gauge\n\
+             runlet_bulkhead_permits_total {bulkhead_total}\n\
              {latency}{cap_latency}\
-             # HELP jsbox_bytecode_cache_entries Compiled-bytecode cache: resident entries.\n\
-             # TYPE jsbox_bytecode_cache_entries gauge\n\
-             jsbox_bytecode_cache_entries {cache_entries}\n\
-             # HELP jsbox_bytecode_cache_events_total Compiled-bytecode cache events by kind (hit/miss/stored).\n\
-             # TYPE jsbox_bytecode_cache_events_total counter\n\
-             jsbox_bytecode_cache_events_total{{event=\"hit\"}} {cache_hits}\n\
-             jsbox_bytecode_cache_events_total{{event=\"miss\"}} {cache_misses}\n\
-             jsbox_bytecode_cache_events_total{{event=\"stored\"}} {cache_stored}\n",
+             # HELP runlet_bytecode_cache_entries Compiled-bytecode cache: resident entries.\n\
+             # TYPE runlet_bytecode_cache_entries gauge\n\
+             runlet_bytecode_cache_entries {cache_entries}\n\
+             # HELP runlet_bytecode_cache_events_total Compiled-bytecode cache events by kind (hit/miss/stored).\n\
+             # TYPE runlet_bytecode_cache_events_total counter\n\
+             runlet_bytecode_cache_events_total{{event=\"hit\"}} {cache_hits}\n\
+             runlet_bytecode_cache_events_total{{event=\"miss\"}} {cache_misses}\n\
+             runlet_bytecode_cache_events_total{{event=\"stored\"}} {cache_stored}\n",
             success = load(&self.success),
             script_error = load(&self.script_error),
             capability_error = load(&self.capability_error),
@@ -339,7 +339,7 @@ impl Metrics {
             overload_global = load(&self.overload_global),
             overload_partition = load(&self.overload_partition),
             latency = self.exec_latency.render(
-                "jsbox_execution_duration_seconds",
+                "runlet_execution_duration_seconds",
                 "Execution wall-clock latency."
             ),
             cap_latency = self.cap_latency.render(),
@@ -372,11 +372,11 @@ mod tests {
         let metrics = Metrics::default();
         let text = metrics.render(6, 6, 0, NO_CACHE);
         assert!(
-            text.contains("jsbox_executions_total{outcome=\"success\"} 0"),
+            text.contains("runlet_executions_total{outcome=\"success\"} 0"),
             "success line present and zeroed"
         );
         assert!(
-            text.contains("jsbox_bulkhead_permits_total 6"),
+            text.contains("runlet_bulkhead_permits_total 6"),
             "bulkhead capacity gauge present"
         );
     }
@@ -393,12 +393,12 @@ mod tests {
         };
         let text = metrics.render(1, 1, 0, stats);
         assert!(
-            text.contains("jsbox_bytecode_cache_entries 3"),
+            text.contains("runlet_bytecode_cache_entries 3"),
             "entries gauge"
         );
-        assert!(text.contains("jsbox_bytecode_cache_events_total{event=\"hit\"} 10"));
-        assert!(text.contains("jsbox_bytecode_cache_events_total{event=\"miss\"} 4"));
-        assert!(text.contains("jsbox_bytecode_cache_events_total{event=\"stored\"} 2"));
+        assert!(text.contains("runlet_bytecode_cache_events_total{event=\"hit\"} 10"));
+        assert!(text.contains("runlet_bytecode_cache_events_total{event=\"miss\"} 4"));
+        assert!(text.contains("runlet_bytecode_cache_events_total{event=\"stored\"} 2"));
     }
 
     /// Outcome counters increment independently and surface in the exposition.
@@ -412,13 +412,13 @@ mod tests {
         metrics.record_rejection();
         metrics.record_overload_partition();
         let text = metrics.render(5, 6, 2, NO_CACHE);
-        assert!(text.contains("jsbox_executions_total{outcome=\"success\"} 2"));
-        assert!(text.contains("jsbox_executions_total{outcome=\"timeout\"} 1"));
-        assert!(text.contains("jsbox_executions_total{outcome=\"memory_limit\"} 1"));
-        assert!(text.contains("jsbox_rejections_total 1"));
-        assert!(text.contains("jsbox_overload_total{scope=\"partition\"} 1"));
-        assert!(text.contains("jsbox_db_breaker_trips_total 2"));
-        assert!(text.contains("jsbox_bulkhead_permits_available 5"));
+        assert!(text.contains("runlet_executions_total{outcome=\"success\"} 2"));
+        assert!(text.contains("runlet_executions_total{outcome=\"timeout\"} 1"));
+        assert!(text.contains("runlet_executions_total{outcome=\"memory_limit\"} 1"));
+        assert!(text.contains("runlet_rejections_total 1"));
+        assert!(text.contains("runlet_overload_total{scope=\"partition\"} 1"));
+        assert!(text.contains("runlet_db_breaker_trips_total 2"));
+        assert!(text.contains("runlet_bulkhead_permits_available 5"));
     }
 
     /// Latency observations land in the right cumulative buckets and sum/count totals.
@@ -431,19 +431,19 @@ mod tests {
         let text = metrics.render(1, 1, 0, NO_CACHE);
         // le="0.005" has counted the 3ms observation only.
         assert!(
-            text.contains("jsbox_execution_duration_seconds_bucket{le=\"0.005\"} 1"),
+            text.contains("runlet_execution_duration_seconds_bucket{le=\"0.005\"} 1"),
             "3ms in the 5ms bucket"
         );
         // le="0.1" is cumulative: the 3ms + 80ms observations.
         assert!(
-            text.contains("jsbox_execution_duration_seconds_bucket{le=\"0.1\"} 2"),
+            text.contains("runlet_execution_duration_seconds_bucket{le=\"0.1\"} 2"),
             "cumulative through 100ms"
         );
         // +Inf and count include the 50s outlier; sum = 0.003+0.08+50 = 50.083s.
-        assert!(text.contains("jsbox_execution_duration_seconds_bucket{le=\"+Inf\"} 3"));
-        assert!(text.contains("jsbox_execution_duration_seconds_count 3"));
+        assert!(text.contains("runlet_execution_duration_seconds_bucket{le=\"+Inf\"} 3"));
+        assert!(text.contains("runlet_execution_duration_seconds_count 3"));
         assert!(
-            text.contains("jsbox_execution_duration_seconds_sum 50.083000"),
+            text.contains("runlet_execution_duration_seconds_sum 50.083000"),
             "sum rendered as seconds from integer micros"
         );
     }
@@ -458,22 +458,24 @@ mod tests {
         let text = metrics.render(1, 1, 0, NO_CACHE);
         // One HELP/TYPE header for the whole family, series carry a `capability` label.
         assert_eq!(
-            text.matches("# TYPE jsbox_capability_op_duration_seconds histogram")
+            text.matches("# TYPE runlet_capability_op_duration_seconds histogram")
                 .count(),
             1,
             "exactly one TYPE line for the family"
         );
         assert!(text.contains(
-            "jsbox_capability_op_duration_seconds_bucket{capability=\"db\",le=\"0.005\"} 2"
+            "runlet_capability_op_duration_seconds_bucket{capability=\"db\",le=\"0.005\"} 2"
         ));
-        assert!(text.contains("jsbox_capability_op_duration_seconds_count{capability=\"db\"} 2"));
+        assert!(text.contains("runlet_capability_op_duration_seconds_count{capability=\"db\"} 2"));
         assert!(text.contains(
-            "jsbox_capability_op_duration_seconds_bucket{capability=\"http\",le=\"0.1\"} 0"
+            "runlet_capability_op_duration_seconds_bucket{capability=\"http\",le=\"0.1\"} 0"
         ));
         assert!(text.contains(
-            "jsbox_capability_op_duration_seconds_bucket{capability=\"http\",le=\"0.25\"} 1"
+            "runlet_capability_op_duration_seconds_bucket{capability=\"http\",le=\"0.25\"} 1"
         ));
         // Untouched capabilities still emit a (zeroed) series.
-        assert!(text.contains("jsbox_capability_op_duration_seconds_count{capability=\"auth\"} 0"));
+        assert!(
+            text.contains("runlet_capability_op_duration_seconds_count{capability=\"auth\"} 0")
+        );
     }
 }

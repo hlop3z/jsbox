@@ -36,7 +36,7 @@ capability pattern is *already* a string-in/string-out FFI with a wire-ready err
 - The native function (`db.rs`'s `__db`, `mail.rs`'s `__mail`, …) takes
   `(action: String, payload: String, …) -> String`. JSON in, JSON out. No rich type crosses
   the QuickJS boundary today.
-- The **error path is already a wire format**: a capability throws a `__jsbox`-tagged JSON
+- The **error path is already a wire format**: a capability throws a `__runlet`-tagged JSON
   object (`{code, retryable, source, owner, details}`) that
   [`engine.rs::read_capability_tag`](../../crates/runlet-core/src/engine.rs) parses back into a
   typed `CapabilityErr`. That tag is a protocol that currently travels zero distance.
@@ -46,7 +46,7 @@ capability pattern is *already* a string-in/string-out FFI with a wire-ready err
 
 So the only thing that changes is *what is inside the closure*: `dispatch(&call, …)` →
 `tokio_postgres` becomes `resource.call("db", action, payload, binding)` → sidecar. The JS
-wrapper (`db.js`), the metrics collector, `check_op_limit`/`record`, and the `__jsbox`
+wrapper (`db.js`), the metrics collector, `check_op_limit`/`record`, and the `__runlet`
 envelope are all unchanged.
 
 ## The seam: a `Resource` egress port (mirror of `ReadHook`)
@@ -222,7 +222,7 @@ QuickJS/`rquickjs`.
    unchanged) + unit-tested glue, not yet live-smoked (need SMTP/broker/IdP infra).
 4. **Driver crates leave `runlet-core`.**
    - ✅ **4a — done.** Extracted two crates: **`fabric-wire`** (the shared leaf: the `Egress`
-     trait + `EgressError`, the `ErrorOwner`/`Fault`/`DynamicFault` taxonomy + `__jsbox` wire
+     trait + `EgressError`, the `ErrorOwner`/`Fault`/`DynamicFault` taxonomy + `__runlet` wire
      envelope, the `CircuitBreaker`, and the metric `Collector`) and **`fabric-backends`** (the six
      `*Backend`s + their `*Config`/`*Metric`/`*Error`/`*Deps` + the in-process `BackendSet`, the
      renamed `InProcessEgress`). All vendor drivers (`tokio-postgres`/`mongodb`/`lettre`/`redis`/
@@ -237,7 +237,7 @@ QuickJS/`rquickjs`.
      `BackendSet` over a Unix-domain socket. Wire protocol in `fabric_backends::wire`
      (length-prefixed JSON frames): one connection = one box-request session — `Init`
      (resolved configs + deadline) → `Call`(kind, action, payload)\* → `Drain`(metrics); the
-     `__jsbox` error JSON *is* the wire error (`WireResponse::Reply(Result<String, EgressError>)`),
+     `__runlet` error JSON *is* the wire error (`WireResponse::Reply(Result<String, EgressError>)`),
      and the metrics ride back in the `Drain` response so the box's `meta.<cap>_requests` is
      unchanged. The daemon dispatches each call on `spawn_blocking` (the backends `block_on`
      internally, forbidden on a runtime worker) and drops the `BackendSet` on EOF (tearing down

@@ -9,7 +9,7 @@
 //!   capability — `db`/`mail`/`s3`/`http`).
 //! - **transport** — [`capability_fault_json`] builds the FFI JSON a *throwing*
 //!   capability returns on failure; the JS wrapper forwards it wholesale as its
-//!   `__jsbox` tag. [`api_inband_error_json`] is the non-throwing `api` twin (§13).
+//!   `__runlet` tag. [`api_inband_error_json`] is the non-throwing `api` twin (§13).
 //! - **assemble** — [`ErrorEnvelope`] is the response object the handler serializes
 //!   into `{ data, error, meta }`.
 //!
@@ -19,7 +19,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-// The error-taxonomy primitives + the `__jsbox` wire envelope moved to `fabric-wire` (the shared
+// The error-taxonomy primitives + the `__runlet` wire envelope moved to `fabric-wire` (the shared
 // egress contract). Re-export so `crate::errors::{ErrorOwner, Fault}` stays public (consumers +
 // the in-engine capabilities) and `DynamicFault`/`dynamic_fault_json` stay crate-internal (the
 // engine's egress seam).
@@ -70,7 +70,7 @@ pub enum ErrorSource {
 }
 
 impl ErrorSource {
-    /// Parses a lowercase tag string back into a source (engine reads the `__jsbox`
+    /// Parses a lowercase tag string back into a source (engine reads the `__runlet`
     /// tag). `None` for an unknown value → the throw is treated as a script error.
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
@@ -93,7 +93,7 @@ impl ErrorSource {
 /// FFI failure payload a *throwing* capability returns across the `QuickJS` boundary.
 ///
 /// Serializes to `{ error, code, retryable, owner, source, details? }`. The JS wrapper
-/// throws `new Error(error)` and tags it (`e.__jsbox = res`) so the engine classifies
+/// throws `new Error(error)` and tags it (`e.__runlet = res`) so the engine classifies
 /// the throw structurally (docs/99-errors.md).
 #[cfg(feature = "_throws")]
 #[derive(Debug, Serialize)]

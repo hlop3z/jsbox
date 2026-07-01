@@ -70,7 +70,7 @@ context and returns `{data, error, meta}`. The single endpoint is the whole prod
 
 - **`fabric-wire`** (`crates/fabric-wire/`) — the shared, driver-free, QuickJS-free egress
   contract, depended on by every other crate: the `Egress` trait + `EgressError`, the error
-  taxonomy (`ErrorOwner`/`Fault`/`DynamicFault` + the `__jsbox` wire envelope), the per-target
+  taxonomy (`ErrorOwner`/`Fault`/`DynamicFault` + the `__runlet` wire envelope), the per-target
   `CircuitBreaker`, the metric `Collector`, **and** the box↔`fabricd` wire protocol (`wire.rs`:
   `WireInit`/`WireCall`/`WireRequest`/`WireResponse` + length-prefixed framing, the `*Metric`
   types, `BackendMetrics`, `MeteredEgress` — `WireInit` also carries the **trusted tenant id** so
@@ -108,8 +108,8 @@ context and returns `{data, error, meta}`. The single endpoint is the whole prod
   forwards the logical names; `fabricd` resolves the credentials. On the QUIC path the box pins the
   daemon cert by fingerprint and presents an auth token (`BoxAuth`: static secret or a re-read k8s
   SA-token file). No sidecar configured + a driver request ⇒ `503 EGRESS_UNAVAILABLE`.
-  Deterministic/`http`/`s3` requests need no sidecar. The `jsbox_*` Prometheus metric names and
-  internal `__jsbox` error tag are kept for compatibility. Optional **trusted-identity mode**
+  Deterministic/`http`/`s3` requests need no sidecar. Prometheus metric names use the `runlet_*`
+  prefix and the internal capability-error wire tag is `__runlet`. Optional **trusted-identity mode**
   (`config.trusted`, opt-in): behind the nexus edge the box derives tenant/user identity from
   configured trusted headers (`identity.rs`), rejects anonymous/suspended callers, keys Tier 5
   fairness + the bytecode-cache namespace off the trusted tenant id (dropping the caller-asserted

@@ -642,7 +642,7 @@ pub(crate) async fn execute(
 pub(crate) async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let available = state.limiter.available_permits();
     // The db circuit breaker moved to `fabricd` (it owns the driver connections now); the box
-    // reports zero trips, keeping the `jsbox_db_breaker_trips_total` series for scrape compatibility.
+    // reports zero trips, keeping the `runlet_db_breaker_trips_total` series present when the breaker is off.
     let trips = 0_u64;
     let cache = state.host.bytecode_cache_stats();
     let body = state
@@ -1452,7 +1452,7 @@ mod trusted_pipeline_tests {
     #[tokio::test]
     async fn over_quota_is_rejected() {
         let mut plans = HashMap::new();
-        drop(plans.insert("denied".to_owned(), PlanLimit { max_concurrent: 0 }));
+        let _ = plans.insert("denied".to_owned(), PlanLimit { max_concurrent: 0 });
         let app = state(HashMap::new(), Some(TenantQuota::new(plans)));
         let hdrs = headers(&[
             ("x-tenant-id", "ws_a"),

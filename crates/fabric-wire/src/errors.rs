@@ -3,7 +3,7 @@
 //! [`ErrorOwner`] and [`Fault`] are the classification vocabulary every capability uses to
 //! turn a typed driver error into a stable `code` + retry hint + responsible owner, above the
 //! "stringify cliff". [`DynamicFault`] / [`dynamic_fault_json`] render that classification into
-//! the `__jsbox` tagged-error JSON the engine reads back ([`crate::egress::EgressError`] builds
+//! the `__runlet` tagged-error JSON the engine reads back ([`crate::egress::EgressError`] builds
 //! it via `to_tag_json`).
 //!
 //! The response-envelope side of the taxonomy (`ErrorSource`, `ErrorCategory`, `ErrorEnvelope`,
@@ -65,7 +65,7 @@ impl Fault {
     }
 }
 
-/// Serializable `__jsbox` tag built from dynamic (caller-owned) string fields.
+/// Serializable `__runlet` tag built from dynamic (caller-owned) string fields.
 ///
 /// For the [`crate::egress::Egress`] port. Borrows `&str`/`&Value` and is not feature-gated (the
 /// egress seam is core). Serializes to `{ error, code, retryable, owner, source, details? }` — the
@@ -90,7 +90,7 @@ pub struct DynamicFault<'a> {
 /// Last-resort JSON if a [`DynamicFault`] ever fails to serialize.
 const FALLBACK_DYNAMIC_FAULT_JSON: &str = r#"{"error":"internal error","code":"INTERNAL","retryable":true,"owner":"operator","source":"engine"}"#;
 
-/// Builds the `__jsbox` tag JSON for a [`crate::egress::Egress`] port failure.
+/// Builds the `__runlet` tag JSON for a [`crate::egress::Egress`] port failure.
 ///
 /// A egress's `source`/`code`/`owner` are supplied dynamically (by the sidecar / adapter)
 /// rather than from a static per-capability [`Fault`]. Produces the

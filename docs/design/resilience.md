@@ -56,7 +56,7 @@ Tier 0 has two parts:
 
 The per-request `config.db` is set by the _trusted_ caller of `/execute`, not by the
 sandboxed script (a script cannot set `statement_timeout`). The clamp is defense in depth: it
-lets the operator _running jsbox_ guarantee a ceiling no caller can exceed, which matters as
+lets the operator _running runlet_ guarantee a ceiling no caller can exceed, which matters as
 the platform moves toward customer-authored scripts and multi-tenancy.
 
 ### Tier 1 — bulkhead
@@ -189,19 +189,19 @@ opt-in path, not the default.
 The resilience tiers are only operable if they can be _seen_ firing. jsbox exposes a
 dependency-free Prometheus text endpoint (`src/metrics.rs`, no client library) with
 process-wide atomic counters incremented on each request's terminal outcome, plus live gauges
-read at scrape time: `jsbox_executions_total{outcome}` (success / script_error /
+read at scrape time: `runlet_executions_total{outcome}` (success / script_error /
 capability_error / timeout / memory_limit / malformed_response / internal_error),
-`jsbox_rejections_total`, `jsbox_overload_total{scope}` (global bulkhead vs partition cap),
-`jsbox_db_breaker_trips_total`, and `jsbox_bulkhead_permits_available` / `_total`. Shed load
+`runlet_rejections_total`, `runlet_overload_total{scope}` (global bulkhead vs partition cap),
+`runlet_db_breaker_trips_total`, and `runlet_bulkhead_permits_available` / `_total`. Shed load
 (Tier 1/5), breaker trips (Tier 3), and bulkhead headroom are all alertable without log
 parsing. Execution wall-clock latency is exposed as a Prometheus histogram
-(`jsbox_execution_duration_seconds`, fixed buckets from 1 ms to 10 s) covering every
+(`runlet_execution_duration_seconds`, fixed buckets from 1 ms to 10 s) covering every
 execution that ran, so SLO latency objectives (p50/p95/p99 via `histogram_quantile`) are
 computed at the dashboard, not pre-baked. The buckets are integer-microsecond comparisons on
 the hot path (no float), and the implicit `+Inf` bucket plus `_sum`/`_count` follow the
 standard exposition. Per-capability op latency is exposed the same way as a single labeled
 family
-`jsbox_capability_op_duration_seconds{capability="db"|"http"|"mail"|"s3"|"redis"|"amq"|"auth"}`
+`runlet_capability_op_duration_seconds{capability="db"|"http"|"mail"|"s3"|"redis"|"amq"|"auth"}`
 (fed from the per-op `duration_us` already drained into `meta`), so a slow _downstream_ is
 attributable — not just a slow total execution.
 

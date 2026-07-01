@@ -5,7 +5,7 @@
 //!
 //! - [`Egress`] / [`EgressError`] — the callable I/O port and its tagged-error result.
 //! - [`ErrorOwner`] / [`Fault`] / [`DynamicFault`] / [`dynamic_fault_json`] — the error-taxonomy
-//!   primitives and the `__jsbox` wire envelope.
+//!   primitives and the `__runlet` wire envelope.
 //! - [`CircuitBreaker`] / [`BreakerConfig`] — the per-target resilience breaker.
 //! - [`Collector`] and friends — the per-execution metric buffer.
 //!

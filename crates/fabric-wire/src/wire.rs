@@ -271,7 +271,7 @@ pub enum WireResponse {
         message: String,
     },
     /// The result of a [`WireRequest::Call`] — the backend JSON, or the classified egress error
-    /// (which the engine renders into the `__jsbox` tag exactly as for an in-process call).
+    /// (which the engine renders into the `__runlet` tag exactly as for an in-process call).
     Reply(Result<String, EgressError>),
     /// The drained per-capability metrics, answering [`WireRequest::Drain`].
     Metrics(Box<BackendMetrics>),

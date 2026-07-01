@@ -3,7 +3,7 @@
 //! A consumer wires one `Egress` implementation and the engine exposes a single
 //! `io.call(name, action, payload)` global. The core stays domain-agnostic — it forwards
 //! `(name, action, payload_json)` and surfaces the string result, or maps a [`EgressError`]
-//! into the same `__jsbox` tagged-error JSON a built-in capability throws, so the engine's
+//! into the same `__runlet` tagged-error JSON a built-in capability throws, so the engine's
 //! error-classification path consumes it unchanged.
 //!
 //! This is the seam that lets driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/
@@ -33,12 +33,12 @@ pub trait Egress: Send + Sync {
     /// # Errors
     ///
     /// Returns a [`EgressError`] when the backend call fails; the engine renders it into the
-    /// `__jsbox` tagged error the JS wrapper throws (surfaced to the script as a thrown
+    /// `__runlet` tagged error the JS wrapper throws (surfaced to the script as a thrown
     /// capability error).
     fn call(&self, name: &str, action: &str, payload_json: &str) -> Result<String, EgressError>;
 }
 
-/// A failed [`Egress::call`], carrying the fields of the `__jsbox` error tag.
+/// A failed [`Egress::call`], carrying the fields of the `__runlet` error tag.
 ///
 /// `source` should be a known capability tag (`"db"`, `"mongo"`, …) so the engine classifies
 /// the throw as a capability error; an unrecognized source degrades to a script error.
@@ -95,7 +95,7 @@ impl EgressError {
         self
     }
 
-    /// Renders this error as the `__jsbox` tagged-error JSON the JS wrapper throws.
+    /// Renders this error as the `__runlet` tagged-error JSON the JS wrapper throws.
     #[must_use]
     pub fn to_tag_json(&self) -> String {
         errors::dynamic_fault_json(&DynamicFault {

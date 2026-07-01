@@ -7,7 +7,7 @@
 //!
 //! On failure the engine **classifies** the outcome into a typed [`EngineError`]
 //! (see `docs/99-errors.md`): a handler throw is inspected *structurally* via
-//! `ctx.catch()` — a `__jsbox` tag ⇒ a capability error, otherwise a script error —
+//! `ctx.catch()` — a `__runlet` tag ⇒ a capability error, otherwise a script error —
 //! and the timeout signal (which JS cannot see) is folded in here. Out-of-memory is
 //! caught earlier, when an oversized context fails to parse.
 
@@ -267,7 +267,7 @@ pub enum EngineError {
     Capability(Box<CapabilityErr>),
 }
 
-/// A capability error read off a thrown JS error's `__jsbox` tag (or built for an
+/// A capability error read off a thrown JS error's `__runlet` tag (or built for an
 /// inject-time connection failure). Fields are private — only `into_envelope` reads them.
 #[derive(Debug)]
 pub struct CapabilityErr {
@@ -287,7 +287,7 @@ pub struct CapabilityErr {
     details: Option<Value>,
 }
 
-/// The `__jsbox` tag deserialized from a thrown capability error (read in one
+/// The `__runlet` tag deserialized from a thrown capability error (read in one
 /// `json_stringify` + parse rather than field-by-field).
 #[derive(Debug, Deserialize)]
 struct CapabilityTag {
@@ -638,7 +638,7 @@ fn inject_read(qctx: &Ctx<'_>, hook: Arc<ReadHook>) -> Result<(), rquickjs::Erro
 /// Injects the consumer-supplied `io.call(name, action, payload)` egress global.
 ///
 /// The native `__io` forwards `(name, action, payload_json)` to the [`Egress`] hook and
-/// returns either the JSON result verbatim or a `__jsbox` tagged error; the JS wrapper
+/// returns either the JSON result verbatim or a `__runlet` tagged error; the JS wrapper
 /// (`js/io.js`) throws on the latter so the engine classifies it as a capability error
 /// exactly like a built-in capability. Calls are capped at `max_ops` per execution (a shared
 /// counter, mirroring `emit`), so the egress can't be used to bypass the op budget.
@@ -841,7 +841,7 @@ fn classify_eval_error(qctx: &Ctx<'_>) -> EngineError {
     EngineError::Syntax(message)
 }
 
-/// Classifies a handler throw structurally (timeout flag → `__jsbox` tag → script),
+/// Classifies a handler throw structurally (timeout flag → `__runlet` tag → script),
 /// without parsing message text. Out-of-memory is handled earlier, at context parse
 /// (see [`call_handler`]) — a handler that over-allocates instead surfaces as a script
 /// error, which correctly attributes it to the developer's code.
@@ -869,7 +869,7 @@ fn classify_throw(qctx: &Ctx<'_>, timed_out: &AtomicBool, timeout: Duration) -> 
     EngineError::Script { message, stack }
 }
 
-/// Reads a capability's `__jsbox` tag, if present and well-formed.
+/// Reads a capability's `__runlet` tag, if present and well-formed.
 ///
 /// Stringifies the tag object once and deserializes it (cleaner than field-by-field,
 /// and `details` comes back as a `serde_json::Value` for free). Returns `None` if the
@@ -879,7 +879,7 @@ fn read_capability_tag<'js>(
     obj: &Object<'js>,
     stack: Option<String>,
 ) -> Option<CapabilityErr> {
-    let tag_val = obj.get::<_, JsValue<'js>>("__jsbox").ok()?;
+    let tag_val = obj.get::<_, JsValue<'js>>("__runlet").ok()?;
     if tag_val.is_undefined() || tag_val.is_null() {
         return None;
     }
@@ -1312,7 +1312,7 @@ mod egress_tests {
         );
     }
 
-    /// A `EgressError` round-trips through the `__jsbox` tag and classifies as a capability
+    /// A `EgressError` round-trips through the `__runlet` tag and classifies as a capability
     /// error (not a generic script error), preserving the `db` source.
     #[test]
     fn resource_error_classifies_as_capability() {

@@ -17,7 +17,7 @@ categories.workspace = true
 # (`inject_wrapper` + `js/*.js`) and the engine seam. See docs/design/resource-egress.md.
 [dependencies]
 # The shared egress-port contract: the `Egress` trait, the error taxonomy (`ErrorOwner`/`Fault`/
-# the `__jsbox` tag), the circuit breaker, and the metric collector — re-exported from `egress`/
+# the `__runlet` tag), the circuit breaker, and the metric collector — re-exported from `egress`/
 # `errors`/`breaker`/`sandbox` so the engine seam and the in-engine capabilities use them.
 fabric-wire = { path = "../fabric-wire" }
 crossbeam-queue.workspace = true
@@ -57,7 +57,7 @@ full = ["http", "db", "mongo", "mail", "s3", "redis", "amq", "auth"]
 # engine's `inject_apis` (which injects the JS wrappers + the in-engine `http`/`s3` collectors);
 # `_throws` is enabled only by `s3` (the lone in-engine *throwing* capability) and gates the
 # `capability_fault_json` tag machinery. The driver-backed capabilities map their errors to the
-# `__jsbox` tag via the egress port's always-on `dynamic_fault_json`, not that machinery.
+# `__runlet` tag via the egress port's always-on `dynamic_fault_json`, not that machinery.
 _io = []
 _throws = []
 http = ["dep:reqwest", "_io"]

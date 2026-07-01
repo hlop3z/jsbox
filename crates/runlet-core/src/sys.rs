@@ -8,7 +8,7 @@
 //! FFI: every op crosses the boundary as `__sys(domain, op, payload_json)` and
 //! returns `{"v": <result>}` on success or `{"error": <message>}` on failure
 //! (mirroring `decimal.rs`). Errors throw a plain JS `Error` in the wrapper, so
-//! they classify as developer/script errors — no `__jsbox` capability tag is
+//! they classify as developer/script errors — no `__runlet` capability tag is
 //! needed (these helpers do no I/O).
 //!
 //! ## Secrets are use-not-extract — the hard multi-tenant guarantee

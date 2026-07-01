@@ -152,8 +152,8 @@ they keep a handler from turning the relay into an open spam cannon.
   dependencies, so it reflects "the process is up," not backend health (by design — backend
   health is per-request and surfaced as retryable capability errors).
 - **Autoscaling.** Scale on CPU, or on the bulkhead headroom gauge
-  `jsbox_bulkhead_permits_available` (scale up as it trends toward zero). A rising
-  `jsbox_overload_total` rate means you're shedding — add replicas or raise the bulkhead.
+  `runlet_bulkhead_permits_available` (scale up as it trends toward zero). A rising
+  `runlet_overload_total` rate means you're shedding — add replicas or raise the bulkhead.
 - **Image.** The release image is multi-stage → distroless/static, ~18 MB. It runs fine as
   non-root with a read-only root filesystem: the script/module registries load **once at
   startup** and nothing is written at runtime. Mount `scripts_dir` / `modules_dir` read-only
@@ -167,12 +167,12 @@ Scrape `GET /metrics` (Prometheus text, no client library). The series and sugge
 
 | Metric                                             | Alert on                                                                             |
 | -------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `jsbox_executions_total{outcome}`                  | A rising `internal_error` / `timeout` / `capability_error` rate.                     |
-| `jsbox_overload_total{scope}`                      | Sustained `global` shedding (under-provisioned) or `partition` shedding (a hot key). |
-| `jsbox_db_breaker_trips_total`                     | Any increase = a database is flapping/down.                                          |
-| `jsbox_bulkhead_permits_available` / `_total`      | Available trending toward 0 = at capacity (scale).                                   |
-| `jsbox_execution_duration_seconds`                 | SLO latency objectives via `histogram_quantile` (p95/p99).                           |
-| `jsbox_capability_op_duration_seconds{capability}` | Which downstream (db/api/…) is slow, not just total.                                 |
+| `runlet_executions_total{outcome}`                  | A rising `internal_error` / `timeout` / `capability_error` rate.                     |
+| `runlet_overload_total{scope}`                      | Sustained `global` shedding (under-provisioned) or `partition` shedding (a hot key). |
+| `runlet_db_breaker_trips_total`                     | Any increase = a database is flapping/down.                                          |
+| `runlet_bulkhead_permits_available` / `_total`      | Available trending toward 0 = at capacity (scale).                                   |
+| `runlet_execution_duration_seconds`                 | SLO latency objectives via `histogram_quantile` (p95/p99).                           |
+| `runlet_capability_op_duration_seconds{capability}` | Which downstream (db/api/…) is slow, not just total.                                 |
 
 Every response also carries `meta.trace_id`, logged server-side with the raw cause — grep one
 ID across the mesh for support.
