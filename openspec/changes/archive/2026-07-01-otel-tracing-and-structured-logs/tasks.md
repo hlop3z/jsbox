@@ -55,5 +55,5 @@
 - [x] 6.2 Run the full gate in Docker: `cargo fmt --check`, `cargo clippy` (clean), `cargo test`,
   supply-chain (`cargo audit`/`deny`/`vet`); confirm `cargo tree -i ring` unchanged and no second
   crypto stack linked.
-- [ ] 6.3 Run `/opsx:sync` to fold the `observability` delta (tracing + structured logging +
+- [x] 6.3 Run `/opsx:sync` to fold the `observability` delta (tracing + structured logging +
   refined correlation-id) into the main spec, then archive.
