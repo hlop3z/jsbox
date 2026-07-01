@@ -73,14 +73,19 @@ context and returns `{data, error, meta}`. The single endpoint is the whole prod
   taxonomy (`ErrorOwner`/`Fault`/`DynamicFault` + the `__jsbox` wire envelope), the per-target
   `CircuitBreaker`, the metric `Collector`, **and** the box↔`fabricd` wire protocol (`wire.rs`:
   `WireInit`/`WireCall`/`WireRequest`/`WireResponse` + length-prefixed framing, the `*Metric`
-  types, `BackendMetrics`, `MeteredEgress`) plus the **QUIC remote transport** (`quic.rs`:
+  types, `BackendMetrics`, `MeteredEgress` — `WireInit` also carries the **trusted tenant id** so
+  `fabricd` can scope resolution) plus the one shared constant-time compare (`ct.rs`: `ct_eq`, on
+  `subtle`, used by both the box's edge-credential check and `fabricd`'s static-token check) plus
+  the **QUIC remote transport** (`quic.rs`:
   pinned-self-signed-cert server/client `quinn` endpoint builders + `ServerTls`, on the shared
   `aws-lc-rs` provider) that the same framing rides for a network `fabricd`.
 - **`fabric-backends`** (`crates/fabric-backends/`) — the driver-backed egress backends
   (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`), each a JS-free `*Backend` (string-in/string-out
   dispatch + metrics + `into_resource_error`), plus `BackendSet` (wires them behind
-  `fabric_wire::Egress`), the `*Config` types, and the operator `ResourceBinding` table +
-  name→config `resolve`. Also hosts `sa_token` (`JwksVerifier`): offline k8s `ServiceAccount`-token
+  `fabric_wire::Egress`), the `*Config` types, and the operator `TenantResourceBinding` table +
+  **tenant-scoped** name→config `resolve` (each binding carries the `tenant` authorized to use it; a
+  cross-tenant name resolves as `NotFound` so existence never leaks across workspaces). Also hosts
+  `sa_token` (`JwksVerifier`): offline k8s `ServiceAccount`-token
   verification (cluster-JWKS RSA sig + `aud`/`iss`/`exp`) for `fabricd`'s QUIC `sa-token` client
   authenticator — it lives here because this crate already owns `reqwest`/`jsonwebtoken`, not because
   it is an egress backend. Holds **all** the vendor drivers. Depends on `fabric-wire` only (never
@@ -104,14 +109,23 @@ context and returns `{data, error, meta}`. The single endpoint is the whole prod
   daemon cert by fingerprint and presents an auth token (`BoxAuth`: static secret or a re-read k8s
   SA-token file). No sidecar configured + a driver request ⇒ `503 EGRESS_UNAVAILABLE`.
   Deterministic/`http`/`s3` requests need no sidecar. The `jsbox_*` Prometheus metric names and
-  internal `__jsbox` error tag are kept for compatibility.
+  internal `__jsbox` error tag are kept for compatibility. Optional **trusted-identity mode**
+  (`config.trusted`, opt-in): behind the nexus edge the box derives tenant/user identity from
+  configured trusted headers (`identity.rs`), rejects anonymous/suspended callers, keys Tier 5
+  fairness + the bytecode-cache namespace off the trusted tenant id (dropping the caller-asserted
+  `X-Partition-Key`), forwards that tenant in `WireInit`, gates member capabilities off
+  roles/entitlements (`authz.rs`), and enforces per-tenant plan-gated quota (`quota.rs`). A boot
+  guard refuses trusted mode on a non-loopback bind unless network isolation is asserted. See
+  `docs/design/multitenant-trust.md`.
 - **`fabricd`** (`crates/fabricd/`) — the egress **sidecar / broker** (bin): holds the operator
   credential table (its `resources` config) and **all** the drivers (via `fabric-backends`), and
   hosts a `BackendSet` per session behind the `fabric-wire` protocol over **either transport** —
   a local **UDS** (the zero-config default) or a remote **QUIC** listener (`quic` config: a shared,
   network-reachable cluster service). One UDS connection / one QUIC bi-stream = one box-request
-  session (`Init`(names+deadline)→`Call`\*→`Drain`(metrics)); it resolves the box's logical names to
-  configs, so credentials never reach the box. On QUIC it validates the box's `WireInit.token` before
+  session (`Init`(names+deadline+**tenant**)→`Call`\*→`Drain`(metrics)); it resolves the box's logical
+  names to configs **within the session tenant's binding set** (a name bound for another tenant
+  resolves as `NotFound`), so credentials never reach the box and never cross workspaces. On QUIC it
+  validates the box's `WireInit.token` before
   resolving anything via a pluggable `ClientAuthenticator` (`auth.rs`: `none` / `static` /
   `sa-token`), and caps concurrent connections + streams. The `sa-token` provider verifies a k8s
   projected `ServiceAccount` token **offline** against the cluster JWKS (RSA sig + `aud`/`iss`/`exp`)

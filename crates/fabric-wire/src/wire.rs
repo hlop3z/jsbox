@@ -198,6 +198,12 @@ pub struct WireInit {
     pub auth: Option<String>,
     /// Per-execution wall-clock budget in milliseconds (the per-op client-side deadline).
     pub timeout_ms: u64,
+    /// The request's **trusted** tenant id (the acting-workspace id the edge authorized), forwarded
+    /// so `fabricd` can scope name resolution to that tenant's binding set. `None` on the
+    /// single-tenant/loopback path (no trusted identity). Sourced only from the trusted-header
+    /// extractor — never from anything the executing script can influence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
     /// Opaque client-auth credential proving the box may pull credentials — a static shared
     /// secret or a k8s projected `ServiceAccount` token. `None` on the local UDS path (filesystem
     /// permissions gate it); set on the remote QUIC path, where `fabricd` validates it *before*
@@ -222,6 +228,7 @@ impl fmt::Debug for WireInit {
             .field("amq", &self.amq)
             .field("auth", &self.auth)
             .field("timeout_ms", &self.timeout_ms)
+            .field("tenant", &self.tenant)
             // The token is a secret: print only its presence, never its value.
             .field("token", &self.token.as_ref().map(|_present| "<redacted>"))
             .finish()

@@ -15,6 +15,7 @@
 //! `docs/design/resource-egress.md`.
 
 pub mod breaker;
+pub mod ct;
 pub mod egress;
 pub mod errors;
 pub mod metrics;
@@ -22,6 +23,7 @@ pub mod quic;
 pub mod wire;
 
 pub use crate::breaker::{BreakerConfig, CircuitBreaker};
+pub use crate::ct::ct_eq;
 pub use crate::egress::{Egress, EgressError};
 pub use crate::errors::{DynamicFault, ErrorOwner, Fault, dynamic_fault_json};
 pub use crate::metrics::{Collector, check_op_limit, drain, new_collector, op_count, record};

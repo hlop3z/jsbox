@@ -1,5 +1,6 @@
 //! HTTP handler for the `/execute` endpoint.
 
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -20,7 +21,7 @@ use uuid::Uuid;
 use fabric_wire::wire::WireInit;
 use fabric_wire::{
     AmqMetric, AuthMetric, BackendMetrics, DbMetric, Egress, MailMetric, MeteredEgress,
-    MongoMetric, RedisMetric,
+    MongoMetric, RedisMetric, ct_eq,
 };
 use runlet_core::config::EngineConfig;
 use runlet_core::engine::{EngineError, ExecOutcome, Gate};
@@ -34,6 +35,10 @@ use runlet_core::s3::{S3Config, S3Metric};
 use runlet_core::sandbox;
 use runlet_core::sys::SysConfig;
 
+use crate::authz::authorize_capabilities;
+use crate::config::TrustedHeaders;
+use crate::identity::TrustedIdentity;
+use crate::quota::{QuotaExceeded, QuotaGuard, TenantQuota};
 use crate::sidecar::{SessionError, SidecarEgress, SidecarTransport, connect_session};
 
 /// Shared application state for the router: the logic host, the script registry, and
@@ -67,9 +72,26 @@ pub(crate) struct AppState {
     pub(crate) metrics: Arc<Metrics>,
     /// Configured global bulkhead capacity, surfaced as the `_total` permit gauge.
     pub(crate) bulkhead_capacity: usize,
-    /// Shared-secret bearer token gating `/execute`. `None` = no in-process auth (the
-    /// operator either bound loopback or opted out via `allow_unauthenticated`).
+    /// Shared-secret bearer token gating `/execute`. In trusted-header mode this is the
+    /// edge→box **service credential** (defense in depth with the `NetworkPolicy`). `None` = no
+    /// in-process auth (loopback or `allow_unauthenticated`).
     pub(crate) access_token: Option<Arc<str>>,
+    /// Trusted-identity ("nexus edge") mode. When set, `/execute` derives identity from the
+    /// configured trusted headers, rejects anonymous/suspended, and keys fairness/cache/egress/
+    /// quota off the trusted tenant id. `None` = single-tenant behavior (caller-asserted partition).
+    pub(crate) trusted: Option<Arc<TrustedRuntime>>,
+}
+
+/// Resolved trusted-header-mode runtime state, shared into the handler. Present only when
+/// `trusted.enabled`.
+#[derive(Debug)]
+pub(crate) struct TrustedRuntime {
+    /// The configured trusted header names.
+    pub(crate) headers: TrustedHeaders,
+    /// Coarse capability→required-entitlement gate (empty = no member gating).
+    pub(crate) capability_entitlements: HashMap<String, String>,
+    /// Per-tenant plan-gated quota accountant. `None` when quota is disabled.
+    pub(crate) quota: Option<TenantQuota>,
 }
 
 /// Pre-allocated `Box<RawValue>` for `{}` — used as default context.
@@ -87,8 +109,9 @@ pub(crate) struct ExecRequest {
     script: Option<String>,
     /// Registered-script key to execute (exactly one of `script` / `key`).
     key: Option<String>,
-    /// Partition key for per-partition fairness (Tier 5). The `X-Partition-Key` header
-    /// takes precedence over this field; both are set by the trusted caller, not the script.
+    /// Caller-asserted partition key for per-partition fairness (Tier 5), single-tenant mode only.
+    /// The `X-Partition-Key` header takes precedence over this field. **Ignored in trusted-header
+    /// mode**, where the fairness key is the trusted tenant id (a caller cannot pick its bucket).
     #[serde(default)]
     partition: Option<String>,
     /// Raw context passed straight to `QuickJS` — never deserialized in Rust.
@@ -212,9 +235,10 @@ impl RequestIo {
         }
     }
 
-    /// The `fabricd` session-open message: the first named resource per kind + the per-execution
-    /// deadline. `fabricd` resolves each name against its operator config.
-    fn wire_init(&self, timeout: Duration) -> WireInit {
+    /// The `fabricd` session-open message: the first named resource per kind, the per-execution
+    /// deadline, and the request's trusted tenant id (so `fabricd` scopes resolution to that
+    /// tenant's bindings). `fabricd` resolves each name against its operator config.
+    fn wire_init(&self, timeout: Duration, tenant: Option<&str>) -> WireInit {
         WireInit {
             db: self.db.first().cloned(),
             mongo: self.mongo.first().cloned(),
@@ -223,6 +247,9 @@ impl RequestIo {
             amq: self.amq.first().cloned(),
             auth: self.auth.first().cloned(),
             timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            // The trusted tenant id, sourced only from the trusted-header extractor (never the
+            // script). `None` on the single-tenant/loopback path.
+            tenant: tenant.map(str::to_owned),
             // The token (QUIC path) is attached by `connect_session` from the transport's auth
             // provider — the box-request layer never sees it.
             token: None,
@@ -412,10 +439,26 @@ pub(crate) async fn execute(
     headers: HeaderMap,
     payload: Result<Json<ExecRequest>, JsonRejection>,
 ) -> impl IntoResponse {
-    // Auth gate (defense in depth) — reject before any body work.
+    // Edge service credential (defense in depth) — reject before any body work.
     if let Some(rejected) = enforce_auth(&state, &headers) {
         return rejected;
     }
+
+    let trace_id = Uuid::new_v4().to_string();
+
+    // Trusted-identity ingress (trusted-header mode only): derive identity solely from the
+    // configured trusted headers and reject anonymous / suspended / tenant-less callers *before*
+    // any body work — no execution or egress session begins for them.
+    let identity = match resolve_identity(&state, &headers, &trace_id) {
+        Ok(identity) => identity,
+        Err(rejected) => {
+            state.metrics.record_rejection();
+            return *rejected;
+        }
+    };
+    // The trusted tenant id — sourced only from the extractor (never the script). `None` in
+    // single-tenant/loopback mode. Guaranteed `Some` in trusted mode (tenant-less was rejected).
+    let tenant = identity.as_ref().and_then(|id| id.tenant.clone());
 
     let req = match payload {
         Ok(Json(req)) => req,
@@ -431,13 +474,22 @@ pub(crate) async fn execute(
         context,
         config,
     } = req;
-    // Partition key (Tier 5): `X-Partition-Key` header wins over the body field; caller-set.
-    let partition = header_partition(&headers).or(body_partition);
+    // Fairness + cache key (Tier 5). In trusted mode this is the trusted tenant id and any
+    // caller-asserted `X-Partition-Key` / `partition` body field is ignored; otherwise the
+    // caller-asserted source (single-tenant behavior).
+    let caller_asserted = header_partition(&headers).or(body_partition);
+    let partition = resolve_partition(identity.as_ref(), caller_asserted);
     let context_bytes = context.get().len();
+
+    // Coarse member-capability authz (trusted mode): reject a member lacking the entitlement a
+    // requested capability requires, before any session or execution.
+    if let Some(rejected) = enforce_member_authz(&state, identity.as_ref(), &config, &trace_id) {
+        state.metrics.record_rejection();
+        return *rejected;
+    }
 
     let engine_cfg = state.engine_cfg;
     let error_debug = state.error_debug;
-    let trace_id = Uuid::new_v4().to_string();
 
     // Resolve exactly one of `script` / `key` into the source to execute.
     let source = match resolve_script(script, key.as_deref(), &state.registry) {
@@ -470,12 +522,32 @@ pub(crate) async fn execute(
     let context_json: String = context.get().into();
     let gates = config.io.gates();
 
+    // Per-tenant quota (trusted mode): attribute this execution to the trusted tenant and enforce
+    // the plan's hard cap. The guard is held across the execution span (released on drop) and
+    // returns the structured over-limit result when at/above the limit.
+    let _quota_guard = match enforce_quota(&state, identity.as_ref(), || {
+        base_error_meta(
+            &trace_id,
+            script_bytes,
+            context_bytes,
+            key.as_deref(),
+            partition.as_deref(),
+        )
+    }) {
+        Ok(guard) => guard,
+        Err(rejected) => {
+            state.metrics.record_rejection();
+            return *rejected;
+        }
+    };
+
     // Open the `fabricd` egress session when any driver capability is requested. The box holds no
-    // credentials: it sends the selected logical names; `fabricd` resolves them against its own
-    // operator config. An unknown name (400), or an unreachable/absent sidecar (503), is rejected
-    // here — before admission — exactly where the old in-box resolution used to reject.
+    // credentials: it sends the selected logical names + the trusted tenant id; `fabricd` resolves
+    // them within that tenant's binding set. An unknown/out-of-tenant name (400), or an
+    // unreachable/absent sidecar (503), is rejected here — before admission.
     let session = if config.io.any() {
-        match connect_session(&state.transport, &config.io.wire_init(engine_cfg.timeout())).await {
+        let init = config.io.wire_init(engine_cfg.timeout(), tenant.as_deref());
+        match connect_session(&state.transport, &init).await {
             Ok(conn) => Some(conn),
             Err(err) => {
                 state.metrics.record_rejection();
@@ -511,9 +583,10 @@ pub(crate) async fn execute(
     let host = state.host.clone();
     let handle = Handle::current();
     let timeout = engine_cfg.timeout();
-    // Namespace the bytecode cache by partition so identical source from different tenants
-    // never shares an entry (no cross-tenant dedup / compile-timing leak). Cloned because the
-    // closure is `move` and `partition` is still needed for `meta` after the await.
+    // Namespace the bytecode cache by the fairness key — in trusted mode the trusted tenant id —
+    // so byte-identical source from different tenants never shares an entry (no cross-tenant dedup
+    // / compile-timing leak). Cloned because the closure is `move` and `partition` is still needed
+    // for `meta` after the await.
     let cache_ns = partition.clone();
     let result = task::spawn_blocking(move || -> (Result<Outcome, EngineError>, BackendMetrics) {
         let adapter =
@@ -826,6 +899,171 @@ fn header_partition(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Resolves the trusted identity in trusted-header mode and applies the hard-reject gates before
+/// any body work: an anonymous caller, a suspended principal, or (for tenant-scoped work) a missing
+/// tenant id is refused with a `403`. Returns `Ok(None)` in single-tenant mode (no trusted headers
+/// consulted), `Ok(Some(identity))` when accepted, or `Err(response)` to reject.
+fn resolve_identity(
+    state: &AppState,
+    headers: &HeaderMap,
+    trace_id: &str,
+) -> Result<Option<TrustedIdentity>, Box<AxumResponse>> {
+    let Some(trusted) = state.trusted.as_ref() else {
+        return Ok(None);
+    };
+    let identity = TrustedIdentity::from_headers(headers, &trusted.headers);
+    if identity.anonymous {
+        return Err(Box::new(identity_rejected(
+            trace_id,
+            "ANONYMOUS_FORBIDDEN",
+            "anonymous callers may not execute code",
+        )));
+    }
+    if identity.suspended {
+        return Err(Box::new(identity_rejected(
+            trace_id,
+            "SUSPENDED_FORBIDDEN",
+            "a suspended principal may not execute code",
+        )));
+    }
+    if identity.tenant.is_none() {
+        return Err(Box::new(identity_rejected(
+            trace_id,
+            "TENANT_REQUIRED",
+            "trusted-header mode requires a tenant identity",
+        )));
+    }
+    // Audit trail: bind the trusted tenant + user id to this request's trace so a support query can
+    // grep one id across the mesh (the user id is otherwise only carried for audit).
+    tracing::debug!(
+        trace_id,
+        tenant = identity.tenant.as_deref(),
+        user = identity.user.as_deref(),
+        "trusted identity accepted"
+    );
+    Ok(Some(identity))
+}
+
+/// Builds the `403` authorization-failure response for a rejected trusted identity (anonymous /
+/// suspended / tenant-less). A request-category envelope owned by the caller, never retryable.
+fn identity_rejected(trace_id: &str, code: &str, message: &str) -> AxumResponse {
+    let meta = Meta::new(trace_id.to_owned(), 0, 0, 0);
+    system_error_response(request_error(code, message.to_owned()), 403, meta)
+}
+
+/// The fairness + cache key for a request. In trusted mode it is the trusted tenant id and the
+/// caller-asserted source is ignored; otherwise it is the caller-asserted source (single-tenant).
+fn resolve_partition(
+    identity: Option<&TrustedIdentity>,
+    caller_asserted: Option<String>,
+) -> Option<String> {
+    identity.map_or(caller_asserted, |id| id.tenant.clone())
+}
+
+/// The capability kinds a request exercises — the driver kinds named in `config.io` plus the
+/// in-engine `http`/`s3` when their config is present. Used by the member-authz gate.
+fn requested_capabilities(config: &RequestConfig) -> Vec<&'static str> {
+    let io = &config.io;
+    let mut kinds = Vec::new();
+    if !io.db.is_empty() {
+        kinds.push("db");
+    }
+    if !io.mongo.is_empty() {
+        kinds.push("mongo");
+    }
+    if !io.mail.is_empty() {
+        kinds.push("mail");
+    }
+    if !io.redis.is_empty() {
+        kinds.push("redis");
+    }
+    if !io.amq.is_empty() {
+        kinds.push("amq");
+    }
+    if !io.auth.is_empty() {
+        kinds.push("auth");
+    }
+    if !config.allowed_hosts.is_empty() {
+        kinds.push("http");
+    }
+    if config.s3.is_some() {
+        kinds.push("s3");
+    }
+    kinds
+}
+
+/// Coarse member-capability authz (trusted mode): reject a member lacking the entitlement a
+/// requested capability requires. `None` = permitted (or not in trusted mode / no gate configured).
+fn enforce_member_authz(
+    state: &AppState,
+    identity: Option<&TrustedIdentity>,
+    config: &RequestConfig,
+    trace_id: &str,
+) -> Option<Box<AxumResponse>> {
+    let (Some(trusted), Some(id)) = (state.trusted.as_ref(), identity) else {
+        return None;
+    };
+    let requested = requested_capabilities(config);
+    match authorize_capabilities(&trusted.capability_entitlements, &requested, id) {
+        Ok(()) => None,
+        Err(denied) => {
+            let message = format!(
+                "capability `{}` requires entitlement `{}`",
+                denied.capability, denied.required
+            );
+            let meta = Meta::new(trace_id.to_owned(), 0, 0, 0);
+            Some(Box::new(system_error_response(
+                request_error("ENTITLEMENT_REQUIRED", message),
+                403,
+                meta,
+            )))
+        }
+    }
+}
+
+/// Per-tenant quota admission (trusted mode). On success returns the in-flight guard to hold across
+/// the execution (or `None` when quota is disabled / not in trusted mode); on over-limit returns the
+/// `429 QUOTA_EXCEEDED` response. `meta` is built lazily, only on the reject path.
+fn enforce_quota<F: FnOnce() -> Meta>(
+    state: &AppState,
+    identity: Option<&TrustedIdentity>,
+    meta: F,
+) -> Result<Option<QuotaGuard>, Box<AxumResponse>> {
+    let (Some(trusted), Some(id)) = (state.trusted.as_ref(), identity) else {
+        return Ok(None);
+    };
+    let Some(quota) = trusted.quota.as_ref() else {
+        return Ok(None);
+    };
+    let Some(tenant) = id.tenant.as_deref() else {
+        return Ok(None);
+    };
+    match quota.admit(tenant, id.plan.as_deref()) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(exceeded) => Err(Box::new(quota_exceeded_response(&exceeded, meta()))),
+    }
+}
+
+/// Builds the `429 QUOTA_EXCEEDED` response carrying the plan, limit, and current usage — the
+/// structured over-limit result. Retryable (a concurrency cap frees as executions finish), owned by
+/// the caller (the tenant is over its plan).
+fn quota_exceeded_response(exceeded: &QuotaExceeded, meta: Meta) -> AxumResponse {
+    let envelope = ErrorEnvelope::new(
+        ErrorCategory::Runtime,
+        ErrorSource::Engine,
+        "QUOTA_EXCEEDED".to_owned(),
+        true,
+        ErrorOwner::Caller,
+    )
+    .with_message(format!(
+        "tenant quota exceeded for plan `{plan}`: {usage} in-flight at limit {limit}",
+        plan = exceeded.plan,
+        usage = exceeded.usage,
+        limit = exceeded.limit,
+    ));
+    system_error_response(envelope, 429, meta)
+}
+
 /// Enforces the optional `/execute` bearer gate. Returns `Some(401)` when a token is
 /// configured and the request doesn't present a matching one; `None` when auth passes or no
 /// token is configured (auth handled upstream / loopback bind).
@@ -852,19 +1090,6 @@ fn request_authorized(headers: &HeaderMap, expected: &str) -> bool {
         return false;
     };
     ct_eq(token.trim().as_bytes(), expected.as_bytes())
-}
-
-/// Constant-time byte-slice equality. Length difference returns early (a token's length is
-/// not the secret); equal-length inputs are compared without an early exit.
-fn ct_eq(lhs: &[u8], rhs: &[u8]) -> bool {
-    if lhs.len() != rhs.len() {
-        return false;
-    }
-    let mut acc = 0_u8;
-    for (left, right) in lhs.iter().zip(rhs.iter()) {
-        acc |= left ^ right;
-    }
-    acc == 0
 }
 
 /// Builds the `401 UNAUTHORIZED` response for a missing/invalid bearer token.
@@ -938,9 +1163,10 @@ fn system_error_response(error: ErrorEnvelope, status: u16, meta: Meta) -> AxumR
 
 #[cfg(test)]
 mod tests {
-    //! `/execute` bearer-auth gate: constant-time compare + `Authorization` header parsing.
+    //! `/execute` bearer-auth gate: `Authorization` header parsing (constant-time compare itself is
+    //! tested in `fabric_wire::ct`).
 
-    use super::{ct_eq, request_authorized};
+    use super::request_authorized;
     use axum::http::HeaderMap;
     use axum::http::HeaderValue;
     use axum::http::header::AUTHORIZATION;
@@ -950,21 +1176,6 @@ mod tests {
         let mut headers = HeaderMap::new();
         drop(headers.insert(AUTHORIZATION, HeaderValue::from_static(value)));
         headers
-    }
-
-    /// Constant-time compare is true only for byte-identical inputs (incl. equal length).
-    #[test]
-    fn ct_eq_matches_only_identical_bytes() {
-        assert!(ct_eq(b"s3cret-token", b"s3cret-token"), "identical matches");
-        assert!(
-            !ct_eq(b"s3cret-token", b"s3cret-tokeX"),
-            "same length, one byte off"
-        );
-        assert!(
-            !ct_eq(b"short", b"longer-token"),
-            "different length differs"
-        );
-        assert!(ct_eq(b"", b""), "empty equals empty");
     }
 
     /// A matching bearer token authorizes, case-insensitively on the scheme.
@@ -1038,9 +1249,213 @@ mod request_io_tests {
             db: vec!["orders-db".to_owned(), "ignored".to_owned()],
             ..RequestIo::default()
         };
-        let init = io.wire_init(std::time::Duration::from_millis(1500));
+        let init = io.wire_init(std::time::Duration::from_millis(1500), Some("ws_acme"));
         assert_eq!(init.db.as_deref(), Some("orders-db"), "first name selected");
         assert_eq!(init.mongo, None, "unnamed kinds stay None");
         assert_eq!(init.timeout_ms, 1500);
+        assert_eq!(
+            init.tenant.as_deref(),
+            Some("ws_acme"),
+            "trusted tenant carried on the handshake"
+        );
+    }
+}
+
+#[cfg(test)]
+mod partition_tests {
+    //! The fairness/cache key source: caller-asserted in single-tenant mode, the trusted tenant id
+    //! (ignoring any caller-asserted value) in trusted mode.
+
+    use super::resolve_partition;
+    use crate::identity::TrustedIdentity;
+
+    /// Without a trusted identity the caller-asserted value is used (single-tenant behavior).
+    #[test]
+    fn single_tenant_uses_caller_asserted() {
+        let key = resolve_partition(None, Some("caller-key".to_owned()));
+        assert_eq!(key.as_deref(), Some("caller-key"));
+    }
+
+    /// In trusted mode the key is the trusted tenant id and the caller-asserted value is ignored.
+    #[test]
+    fn trusted_uses_tenant_and_ignores_caller() {
+        let identity = TrustedIdentity {
+            tenant: Some("ws_acme".to_owned()),
+            ..TrustedIdentity::default()
+        };
+        let key = resolve_partition(Some(&identity), Some("spoofed-partition".to_owned()));
+        assert_eq!(
+            key.as_deref(),
+            Some("ws_acme"),
+            "trusted tenant wins; caller-asserted partition is ignored"
+        );
+    }
+}
+
+#[cfg(test)]
+mod trusted_pipeline_tests {
+    //! End-to-end `/execute` in trusted-header mode (driving the handler directly): anonymous /
+    //! suspended / tenant-less / entitlement rejections (which return before any execution) and a
+    //! quota over-limit, plus a permitted deterministic execution. Egress is not wired (no sidecar),
+    //! so tests exercise deterministic scripts / pre-execution gates — tenant-scoped egress
+    //! resolution is covered in `fabric_backends::resources`.
+
+    use super::{
+        AppState, ExecRequest, RequestConfig, RequestIo, TrustedRuntime, default_context, execute,
+    };
+    use crate::config::TrustedHeaders;
+    use crate::quota::{PlanLimit, TenantQuota};
+    use crate::sidecar::SidecarTransport;
+    use axum::Json;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::response::IntoResponse as _;
+    use runlet_core::config::EngineConfig;
+    use runlet_core::host::{HostSettings, LogicHost};
+    use runlet_core::metrics::Metrics;
+    use runlet_core::modules::ModuleRegistry;
+    use runlet_core::pool::JsPool;
+    use runlet_core::registry::ScriptRegistry;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    /// Builds an app state in trusted mode with the given member-authz gate + optional quota, a tiny
+    /// runtime pool, and no egress sidecar.
+    fn state(gate: HashMap<String, String>, quota: Option<TenantQuota>) -> AppState {
+        let mut engine = EngineConfig::default();
+        engine
+            .resolve_limits()
+            .unwrap_or_else(|_err| unreachable!("engine limits resolve"));
+        let pool = JsPool::new(engine, Arc::new(ModuleRegistry::default()))
+            .unwrap_or_else(|_err| unreachable!("pool init"));
+        let registry = Arc::new(ScriptRegistry::default());
+        let host = LogicHost::new(
+            pool,
+            Arc::clone(&registry),
+            HostSettings {
+                limits: engine,
+                allow_private_targets: false,
+            },
+        );
+        AppState {
+            host,
+            registry,
+            engine_cfg: engine,
+            error_debug: false,
+            limiter: Arc::new(Semaphore::new(8)),
+            partition_limiter: None,
+            transport: SidecarTransport::None,
+            metrics: Arc::new(Metrics::default()),
+            bulkhead_capacity: 8,
+            access_token: None,
+            trusted: Some(Arc::new(TrustedRuntime {
+                headers: TrustedHeaders::default(),
+                capability_entitlements: gate,
+                quota,
+            })),
+        }
+    }
+
+    /// A `HeaderMap` from `(name, value)` pairs.
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            drop(map.insert(*name, HeaderValue::from_static(value)));
+        }
+        map
+    }
+
+    /// Drives `/execute` with the given headers + request config and returns the HTTP status.
+    async fn run(state: &AppState, hdrs: HeaderMap, config: RequestConfig) -> StatusCode {
+        let req = ExecRequest {
+            script: Some("function handler(ctx){ return { data: 1 }; }".to_owned()),
+            key: None,
+            partition: None,
+            context: default_context(),
+            config,
+        };
+        execute(State(state.clone()), hdrs, Ok(Json(req)))
+            .await
+            .into_response()
+            .status()
+    }
+
+    /// An anonymous caller is rejected `403` before any execution.
+    #[tokio::test]
+    async fn anonymous_is_forbidden() {
+        let app = state(HashMap::new(), None);
+        let hdrs = headers(&[("x-tenant-id", "ws_a"), ("x-auth-anonymous", "true")]);
+        assert_eq!(
+            run(&app, hdrs, RequestConfig::default()).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// A suspended principal is rejected `403`.
+    #[tokio::test]
+    async fn suspended_is_forbidden() {
+        let app = state(HashMap::new(), None);
+        let hdrs = headers(&[("x-tenant-id", "ws_a"), ("x-user-suspended", "true")]);
+        assert_eq!(
+            run(&app, hdrs, RequestConfig::default()).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// A request with no tenant header is rejected `403` in trusted mode.
+    #[tokio::test]
+    async fn missing_tenant_is_forbidden() {
+        let app = state(HashMap::new(), None);
+        assert_eq!(
+            run(&app, HeaderMap::new(), RequestConfig::default()).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// A member lacking the entitlement a requested capability needs is rejected `403` (before the
+    /// capability — and before the missing sidecar — is reached).
+    #[tokio::test]
+    async fn member_without_entitlement_is_forbidden() {
+        let mut gate = HashMap::new();
+        drop(gate.insert("db".to_owned(), "db.write".to_owned()));
+        let app = state(gate, None);
+        let hdrs = headers(&[
+            ("x-tenant-id", "ws_a"),
+            ("x-user-entitlements", "mail.send"),
+        ]);
+        let config = RequestConfig {
+            io: RequestIo {
+                db: vec!["orders-db".to_owned()],
+                ..RequestIo::default()
+            },
+            ..RequestConfig::default()
+        };
+        assert_eq!(run(&app, hdrs, config).await, StatusCode::FORBIDDEN);
+    }
+
+    /// A tenant over its plan's hard cap (a `max_concurrent: 0` plan denies the first request) gets
+    /// `429 QUOTA_EXCEEDED`.
+    #[tokio::test]
+    async fn over_quota_is_rejected() {
+        let mut plans = HashMap::new();
+        drop(plans.insert("denied".to_owned(), PlanLimit { max_concurrent: 0 }));
+        let app = state(HashMap::new(), Some(TenantQuota::new(plans)));
+        let hdrs = headers(&[("x-tenant-id", "ws_a"), ("x-tenant-plan", "denied")]);
+        assert_eq!(
+            run(&app, hdrs, RequestConfig::default()).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    /// A well-formed trusted request with a permitted capability executes (`200`).
+    #[tokio::test]
+    async fn permitted_request_executes() {
+        let app = state(HashMap::new(), None);
+        let hdrs = headers(&[("x-tenant-id", "ws_a"), ("x-user-id", "u1")]);
+        assert_eq!(
+            run(&app, hdrs, RequestConfig::default()).await,
+            StatusCode::OK
+        );
     }
 }

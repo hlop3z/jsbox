@@ -7,6 +7,7 @@
 //! Size fields accept human-readable strings: `"8mb"`, `"256kb"`, `"1gb"`,
 //! or plain numbers in bytes: `8388608`.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -14,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use runlet_core::config::EngineConfig;
 use serde::Deserialize;
+
+use crate::quota::PlanLimit;
 
 /// Top-level configuration. `Default` is derived — every field's default is its type
 /// default (`false` / `None` / the nested config's own `Default`), including the
@@ -77,6 +80,88 @@ pub(crate) struct Config {
     /// `docs/design/network-fabric.md` (QUIC remote transport).
     #[serde(default)]
     pub(crate) fabricd_quic: Option<FabricdQuic>,
+    /// Trusted-identity ("nexus edge") mode — off by default. When enabled the box consumes
+    /// trusted identity headers the edge injects (tenant/user/roles/entitlements/suspended/
+    /// anonymous), keys fairness + cache + egress + quota off the trusted tenant id, and rejects
+    /// anonymous/suspended principals. Requires network isolation (see the boot guard) because the
+    /// box then blindly trusts `x-*`. See `docs/design/multitenant-trust.md`.
+    #[serde(default)]
+    pub(crate) trusted: TrustedConfig,
+}
+
+/// Trusted-identity mode configuration (the `trusted` block).
+///
+/// `Default` (all off / empty) preserves the pre-change single-principal, caller-asserted-partition
+/// behavior: `enabled: false` means no header is trusted and `/execute` behaves exactly as before.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct TrustedConfig {
+    /// Turn on trusted-header identity mode. When `false`, no `x-*` identity header is read and the
+    /// caller-asserted `X-Partition-Key` path stays active (single-tenant behavior).
+    pub(crate) enabled: bool,
+    /// Operator assertion that this bind is reachable **only** through the edge (enforced out of
+    /// band by a k8s `NetworkPolicy`). Required to run trusted-header mode on a non-loopback bind —
+    /// the box trusts `x-*` blindly, so an exposed bind without this fails closed (see
+    /// [`Config::check_exposure`]). Mirrors `allow_unauthenticated`.
+    pub(crate) assert_network_isolation: bool,
+    /// The trusted header names (defaults `x-tenant-id`/`x-user-*`/`x-auth-anonymous`/`x-tenant-plan`).
+    pub(crate) headers: TrustedHeaders,
+    /// Coarse member-capability gate: capability kind (`"db"`, `"mongo"`, …) → the entitlement (or
+    /// role) a caller must hold in `x-user-entitlements`/`x-user-roles` to invoke it. A kind absent
+    /// from this map is ungated. Empty by default (no member gating).
+    pub(crate) capability_entitlements: HashMap<String, String>,
+    /// Per-tenant plan-gated quota (section 6). Off by default.
+    pub(crate) quota: QuotaConfig,
+}
+
+/// The configurable trusted-header names. Defaults match the nexus edge contract; every name is
+/// overridable so a drift between the edge and the box is pinned in one place.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub(crate) struct TrustedHeaders {
+    /// Tenant / acting-workspace id header (default `x-tenant-id`).
+    pub(crate) tenant: String,
+    /// User id header, for audit (default `x-user-id`).
+    pub(crate) user: String,
+    /// Comma-separated roles header (default `x-user-roles`).
+    pub(crate) roles: String,
+    /// Comma-separated entitlements header (default `x-user-entitlements`).
+    pub(crate) entitlements: String,
+    /// Suspended-principal flag header (default `x-user-suspended`).
+    pub(crate) suspended: String,
+    /// Anonymous-caller flag header (default `x-auth-anonymous`).
+    pub(crate) anonymous: String,
+    /// Tenant plan header, selecting the quota tier (default `x-tenant-plan`).
+    pub(crate) plan: String,
+}
+
+impl Default for TrustedHeaders {
+    fn default() -> Self {
+        Self {
+            tenant: "x-tenant-id".to_owned(),
+            user: "x-user-id".to_owned(),
+            roles: "x-user-roles".to_owned(),
+            entitlements: "x-user-entitlements".to_owned(),
+            suspended: "x-user-suspended".to_owned(),
+            anonymous: "x-auth-anonymous".to_owned(),
+            plan: "x-tenant-plan".to_owned(),
+        }
+    }
+}
+
+/// Per-tenant plan-gated quota configuration (the `trusted.quota` block).
+///
+/// Off by default. When `enabled`, every tenant-scoped request is gated: the tenant's plan (from
+/// the trusted plan header) selects a [`PlanLimit`], and the tenant's in-flight usage is capped at
+/// it. An unknown plan resolves to the most restrictive configured limit, and an **empty** `plans`
+/// map denies (fail-closed) — a misconfiguration never grants unbounded usage.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct QuotaConfig {
+    /// Consult the quota engine. `false` (default) disables all quota checks.
+    pub(crate) enabled: bool,
+    /// Plan name → its limit. Empty while `enabled` denies every request (fail-closed).
+    pub(crate) plans: HashMap<String, PlanLimit>,
 }
 
 /// Remote-`fabricd` QUIC transport settings (the box client side).
@@ -150,6 +235,31 @@ impl Config {
                  caller-supplied credentials, so an unauthenticated reachable port is a full \
                  compromise. Set `access_token`, bind loopback, or set \
                  `allow_unauthenticated: true` if auth is terminated upstream.",
+                host = self.server.host,
+            )
+            .into());
+        }
+        self.check_trusted_isolation(exposed)?;
+        Ok(())
+    }
+
+    /// Trusted-mode safety net (D2): trusting `x-*` identity headers rests on the box being
+    /// reachable **only** through the edge. Refuse to start in trusted-header mode on a non-loopback
+    /// bind unless the operator has asserted network isolation — mirroring the `allow_unauthenticated`
+    /// guard, because there is no TLS/JWT check to fall back on once headers are trusted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when trusted mode is enabled, the bind is exposed, and isolation is not
+    /// asserted.
+    fn check_trusted_isolation(&self, exposed: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if self.trusted.enabled && exposed && !self.trusted.assert_network_isolation {
+            return Err(format!(
+                "refusing to start: trusted-header mode is enabled on {host} (non-loopback) but \
+                 `trusted.assert_network_isolation` is unset. The box then trusts `x-*` identity \
+                 headers blindly, so it must be reachable only through the edge (enforce with a \
+                 NetworkPolicy). Bind loopback, or set `trusted.assert_network_isolation: true` \
+                 once the isolation is in place.",
                 host = self.server.host,
             )
             .into());
@@ -230,6 +340,56 @@ mod tests {
         assert!(
             cfg.check_exposure().is_ok(),
             "allow_unauthenticated unlocks an exposed bind"
+        );
+    }
+
+    /// Builds a config in trusted-header mode with a chosen bind + isolation assertion. A token is
+    /// set so the base `access_token` guard passes and only the trusted-isolation guard is exercised.
+    fn trusted_cfg(host: IpAddr, assert_isolation: bool) -> Config {
+        let mut cfg = exposure_cfg(host, Some("edge-cred"), false);
+        cfg.trusted.enabled = true;
+        cfg.trusted.assert_network_isolation = assert_isolation;
+        cfg
+    }
+
+    /// Trusted mode on a loopback bind never needs the isolation assertion.
+    #[test]
+    fn trusted_loopback_needs_no_isolation() {
+        let cfg = trusted_cfg(IpAddr::V4(Ipv4Addr::LOCALHOST), false);
+        assert!(
+            cfg.check_exposure().is_ok(),
+            "loopback trusted mode is fine without asserting isolation"
+        );
+    }
+
+    /// Trusted mode on an exposed bind without asserted isolation refuses to start.
+    #[test]
+    fn trusted_exposed_without_isolation_fails_closed() {
+        let cfg = trusted_cfg(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), false);
+        assert!(
+            cfg.check_exposure().is_err(),
+            "exposed trusted mode must refuse without asserted isolation"
+        );
+    }
+
+    /// Asserting isolation unlocks an exposed trusted-mode bind.
+    #[test]
+    fn trusted_exposed_with_isolation_ok() {
+        let cfg = trusted_cfg(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), true);
+        assert!(
+            cfg.check_exposure().is_ok(),
+            "asserted isolation unlocks an exposed trusted-mode bind"
+        );
+    }
+
+    /// Trusted mode disabled leaves an exposed (token-gated) bind unaffected by the isolation guard.
+    #[test]
+    fn trusted_disabled_ignores_isolation_guard() {
+        let mut cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), Some("tok"), false);
+        cfg.trusted.enabled = false;
+        assert!(
+            cfg.check_exposure().is_ok(),
+            "isolation guard applies only when trusted mode is enabled"
         );
     }
 }

@@ -1,0 +1,38 @@
+# NetworkPolicy: restrict the runlet backend pool (`pool_jsbox`) to the nexus edge.
+#
+# This is the load-bearing control behind the trusted-header trust model (see
+# docs/design/multitenant-trust.md). Once `runlet` runs in trusted-header mode it trusts the
+# `x-*` identity headers blindly, so it MUST be reachable only through the edge — this policy is
+# how that invariant is enforced in-cluster. The in-process boot guard
+# (`trusted.assert_network_isolation`) is the fail-closed backstop; the edge service credential
+# (`access_token`) is defense in depth. All three must hold.
+#
+# Adjust `namespaceSelector` / `podSelector` labels to match your edge deployment, and the port to
+# your runlet container port. Requires a CNI that enforces NetworkPolicy (Calico, Cilium, …).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pool-jsbox-edge-only
+  labels:
+    app.kubernetes.io/part-of: runlet
+spec:
+  # Applies to the runlet backend pods.
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: runlet
+      pool: jsbox
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only the nexus edge may reach /execute. Nothing else in the cluster (or outside it) can,
+    # so no caller can inject or forge trusted identity headers.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: nexus
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: edge
+      ports:
+        - protocol: TCP
+          port: 3000

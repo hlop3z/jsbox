@@ -1,7 +1,10 @@
 //! runlet: A sandboxed JS execution service powered by `QuickJS` (HTTP front for `runlet-core`).
 
+mod authz;
 mod config;
 mod handler;
+mod identity;
+mod quota;
 mod sidecar;
 
 use std::error::Error;
@@ -27,7 +30,8 @@ use runlet_core::pool::JsPool;
 use runlet_core::registry::ScriptRegistry;
 
 use crate::config::Config;
-use crate::handler::AppState;
+use crate::handler::{AppState, TrustedRuntime};
+use crate::quota::TenantQuota;
 use crate::sidecar::SidecarTransport;
 
 /// Use `mimalloc` as the global allocator for better small-allocation performance.
@@ -100,11 +104,34 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let modules = Arc::new(module_registry);
 
-    // Capture the `/execute` bearer token before the engine config moves into the pool.
+    // Capture the `/execute` bearer token before the engine config moves into the pool. In
+    // trusted-header mode this is the edge→box service credential.
     let access_token: Option<Arc<str>> = config.access_token.clone().map(Arc::from);
     info!(
         execute_auth = access_token.is_some(),
         "/execute bearer auth"
+    );
+
+    // Build the trusted-identity runtime (header names, member-authz gate, per-tenant quota) when
+    // trusted-header mode is enabled; `None` keeps the single-tenant, caller-asserted behavior.
+    let trusted = config.trusted.enabled.then(|| {
+        let quota = config
+            .trusted
+            .quota
+            .enabled
+            .then(|| TenantQuota::new(config.trusted.quota.plans.clone()));
+        Arc::new(TrustedRuntime {
+            headers: config.trusted.headers.clone(),
+            capability_entitlements: config.trusted.capability_entitlements.clone(),
+            quota,
+        })
+    });
+    info!(
+        trusted_mode = trusted.is_some(),
+        quota = trusted
+            .as_ref()
+            .is_some_and(|runtime| runtime.quota.is_some()),
+        "trusted-identity mode"
     );
 
     let js_pool = JsPool::new(config.engine, modules)?;
@@ -162,6 +189,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         metrics: Arc::new(Metrics::default()),
         bulkhead_capacity: max_concurrent,
         access_token,
+        trusted,
     };
 
     let app = Router::new()

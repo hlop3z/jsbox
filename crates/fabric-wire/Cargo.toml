@@ -27,6 +27,9 @@ quinn.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 sha2.workspace = true
+# The one shared constant-time equality primitive (`ct` module), adopted per design D4 — reused
+# by the box's edge-credential check and `fabricd`'s static-token check.
+subtle.workspace = true
 
 [dev-dependencies]
 # Mints a self-signed cert for the QUIC round-trip test.
