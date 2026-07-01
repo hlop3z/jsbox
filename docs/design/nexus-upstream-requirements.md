@@ -20,9 +20,22 @@ home org (`resourceowner`).
   mis-scoped — reaching A's resources and quota while acting in B, or being denied B's.
 - **Contract:** `x-tenant-id` = the authorized acting org for this request; `x-user-id` = the
   user (audit); the edge strips any client-supplied `x-*` before injecting these.
-- **Scope of impact:** single-workspace users are unaffected (their acting org is their only org);
-  the requirement gates the **multi-org** case.
-- **Status:** open — track as a release gate for multi-org tenancy. Until shipped, deploy `runlet`
-  trusted mode only where users have a single workspace, or accept the home-org scoping limitation.
+- **Acting-org assurance (enforced box-side):** on every authorized-acting-org request the edge
+  SHALL also emit a trusted `x-tenant-scope: acting` header. `runlet` now **enforces** this
+  fail-closed: in trusted-header mode a tenant-scoped `/execute` whose `x-tenant-scope` is absent or
+  not equal to `acting` is rejected `403 ACTING_SCOPE_REQUIRED` before any egress session or
+  execution. This turns a silent multi-org mis-scope (an edge that has not shipped N5, or has
+  drifted) into a loud rejection. It is a **contract tripwire, not cryptographic proof** — the header
+  rides the same trusted-edge boundary as `x-tenant-id`, so it is only as strong as the NetworkPolicy
+  (see D3). The header name is configurable box-side (`trusted.headers.scope`, default
+  `x-tenant-scope`); pin any rename in both repos.
+- **Bring-up ordering (producer before consumer):** the edge must emit `x-tenant-scope: acting`
+  **before** a box that enforces it is rolled out, or all trusted-mode traffic 403s. There is no live
+  traffic today (pre-users), so this is a fresh-deploy ordering note, not a migration.
+- **Scope of impact:** single-workspace users are unaffected (their acting org is their only org, so
+  the edge always emits `acting`); the requirement gates the **multi-org** case.
+- **Status:** box side **enforced**; nexus side open — track as a release gate for multi-org
+  tenancy. Until the edge emits `x-tenant-scope: acting`, trusted-mode traffic is rejected, so bring
+  the edge up first.
 
-Related: `docs/design/multitenant-trust.md` (decision D3).
+Related: `docs/design/multitenant-trust.md` (decision D3; the acting-org gate).

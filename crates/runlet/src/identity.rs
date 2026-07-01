@@ -31,6 +31,9 @@ pub(crate) struct TrustedIdentity {
     pub(crate) anonymous: bool,
     /// The tenant's plan (quota tier), if present.
     pub(crate) plan: Option<String>,
+    /// The acting-org assurance the edge asserts per request (nexus N5). Populated from the
+    /// configured scope header; the gate requires `Some("acting")` for tenant-scoped work.
+    pub(crate) scope: Option<String>,
 }
 
 impl TrustedIdentity {
@@ -46,6 +49,7 @@ impl TrustedIdentity {
             suspended: header_flag(headers, &names.suspended),
             anonymous: header_flag(headers, &names.anonymous),
             plan: header_value(headers, &names.plan),
+            scope: header_value(headers, &names.scope),
         }
     }
 
@@ -117,6 +121,7 @@ mod tests {
             ("x-user-suspended", "false"),
             ("x-auth-anonymous", "0"),
             ("x-tenant-plan", "pro"),
+            ("x-tenant-scope", "acting"),
         ]);
         let id = TrustedIdentity::from_headers(&map, &TrustedHeaders::default());
         assert_eq!(id.tenant.as_deref(), Some("ws_acme"));
@@ -126,6 +131,7 @@ mod tests {
         assert!(!id.suspended, "'false' is not suspended");
         assert!(!id.anonymous, "'0' is not anonymous");
         assert_eq!(id.plan.as_deref(), Some("pro"));
+        assert_eq!(id.scope.as_deref(), Some("acting"));
         assert!(id.has_grant("db"), "entitlement grant matches");
         assert!(id.has_grant("admin"), "role grant matches");
         assert!(!id.has_grant("mongo"), "absent grant does not match");
@@ -156,6 +162,30 @@ mod tests {
             id.tenant.as_deref(),
             Some("ws_real"),
             "only the configured trusted header is read"
+        );
+    }
+
+    /// The acting-org scope is read only from the configured scope header name; a value under the
+    /// default name has no effect once the operator renamed it.
+    #[test]
+    fn scope_reads_only_configured_name() {
+        let names = TrustedHeaders {
+            scope: "x-acting-scope".to_owned(),
+            ..TrustedHeaders::default()
+        };
+        let map = headers(&[("x-tenant-scope", "acting"), ("x-acting-scope", "acting")]);
+        let id = TrustedIdentity::from_headers(&map, &names);
+        assert_eq!(
+            id.scope.as_deref(),
+            Some("acting"),
+            "the configured scope header is read"
+        );
+        // The default name is now inert.
+        let only_default = headers(&[("x-tenant-scope", "acting")]);
+        let id = TrustedIdentity::from_headers(&only_default, &names);
+        assert_eq!(
+            id.scope, None,
+            "the default scope name is not read once overridden"
         );
     }
 }

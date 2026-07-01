@@ -933,6 +933,18 @@ fn resolve_identity(
             "trusted-header mode requires a tenant identity",
         )));
     }
+    // Acting-org assurance (nexus N5, fail-closed): the edge must assert, per request, that the
+    // tenant id is the caller's *authorized acting org* by setting the trusted scope header to
+    // `acting`. Missing or any other value means the edge has not satisfied N5 for this request —
+    // reject before any session or execution so a silent multi-org mis-scope becomes a loud 403.
+    // `runlet` checks only the scope label; it never derives the org relationship itself (D3).
+    if identity.scope.as_deref() != Some("acting") {
+        return Err(Box::new(identity_rejected(
+            trace_id,
+            "ACTING_SCOPE_REQUIRED",
+            "trusted-header mode requires the edge to assert acting-org scope",
+        )));
+    }
     // Audit trail: bind the trusted tenant + user id to this request's trace so a support query can
     // grep one id across the mesh (the user id is otherwise only carried for audit).
     tracing::debug!(
@@ -1422,6 +1434,7 @@ mod trusted_pipeline_tests {
         let app = state(gate, None);
         let hdrs = headers(&[
             ("x-tenant-id", "ws_a"),
+            ("x-tenant-scope", "acting"),
             ("x-user-entitlements", "mail.send"),
         ]);
         let config = RequestConfig {
@@ -1441,21 +1454,73 @@ mod trusted_pipeline_tests {
         let mut plans = HashMap::new();
         drop(plans.insert("denied".to_owned(), PlanLimit { max_concurrent: 0 }));
         let app = state(HashMap::new(), Some(TenantQuota::new(plans)));
-        let hdrs = headers(&[("x-tenant-id", "ws_a"), ("x-tenant-plan", "denied")]);
+        let hdrs = headers(&[
+            ("x-tenant-id", "ws_a"),
+            ("x-tenant-scope", "acting"),
+            ("x-tenant-plan", "denied"),
+        ]);
         assert_eq!(
             run(&app, hdrs, RequestConfig::default()).await,
             StatusCode::TOO_MANY_REQUESTS
         );
     }
 
-    /// A well-formed trusted request with a permitted capability executes (`200`).
+    /// A well-formed trusted request with the acting-org assurance executes (`200`).
     #[tokio::test]
     async fn permitted_request_executes() {
         let app = state(HashMap::new(), None);
-        let hdrs = headers(&[("x-tenant-id", "ws_a"), ("x-user-id", "u1")]);
+        let hdrs = headers(&[
+            ("x-tenant-id", "ws_a"),
+            ("x-tenant-scope", "acting"),
+            ("x-user-id", "u1"),
+        ]);
         assert_eq!(
             run(&app, hdrs, RequestConfig::default()).await,
             StatusCode::OK
+        );
+    }
+
+    /// The acting-org gate matrix (nexus N5): a tenant-scoped request missing the scope assurance,
+    /// or carrying a non-`acting` value, is rejected `403` before any execution; `acting` proceeds.
+    #[tokio::test]
+    async fn acting_scope_gate_matrix() {
+        let app = state(HashMap::new(), None);
+
+        // Absent scope → rejected.
+        let missing = headers(&[("x-tenant-id", "ws_a")]);
+        assert_eq!(
+            run(&app, missing, RequestConfig::default()).await,
+            StatusCode::FORBIDDEN,
+            "a tenant-scoped request without the acting-org assurance is refused"
+        );
+
+        // Non-`acting` scope → rejected.
+        let wrong = headers(&[("x-tenant-id", "ws_a"), ("x-tenant-scope", "home")]);
+        assert_eq!(
+            run(&app, wrong, RequestConfig::default()).await,
+            StatusCode::FORBIDDEN,
+            "a non-acting scope is refused"
+        );
+
+        // `acting` scope → proceeds (executes the deterministic script).
+        let ok = headers(&[("x-tenant-id", "ws_a"), ("x-tenant-scope", "acting")]);
+        assert_eq!(
+            run(&app, ok, RequestConfig::default()).await,
+            StatusCode::OK,
+            "the authorized acting-org request proceeds"
+        );
+    }
+
+    /// The scope header is consulted only in trusted mode: with trusted mode off, a request carrying
+    /// no scope header (and no trusted headers at all) executes normally — the gate never runs.
+    #[tokio::test]
+    async fn non_trusted_mode_ignores_scope() {
+        let mut app = state(HashMap::new(), None);
+        app.trusted = None;
+        assert_eq!(
+            run(&app, HeaderMap::new(), RequestConfig::default()).await,
+            StatusCode::OK,
+            "non-trusted mode does not consult the scope header"
         );
     }
 }

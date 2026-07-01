@@ -75,6 +75,16 @@ class Runner:
             if resp:
                 print(f"       {json.dumps(resp)}")
 
+    def check(self, name: str, ok: bool):
+        """Record a boolean assertion (for tests that post outside the default BASE_URL,
+        e.g. a dedicated trusted-mode box, where `test()` can't be used)."""
+        if ok:
+            self.passed += 1
+            print(f"  \033[32mPASS\033[0m {name}")
+        else:
+            self.failed += 1
+            print(f"  \033[31mFAIL\033[0m {name}")
+
     def summary(self):
         print("\n" + "-" * 36)
         if self.failed == 0:
@@ -99,6 +109,24 @@ def _post(body: dict, headers: dict | None = None) -> dict | None:
         return _parse_response(err.code, err.read())
     except Exception:
         return None
+
+
+def _post_status(url: str, body: dict, headers: dict | None = None):
+    """POST to an explicit URL, returning `(http_status, parsed_envelope)`. Unlike `_post`
+    (which targets BASE_URL and hides the status), this keeps the status so a caller can assert
+    on the code — used by the trusted-mode box which runs on its own port."""
+    data = json.dumps(body).encode()
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, data=data, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.getcode(), _parse_response(resp.getcode(), resp.read())
+    except urllib.error.HTTPError as err:
+        return err.code, _parse_response(err.code, err.read())
+    except Exception:
+        return None, None
 
 
 def _parse_response(status: int, raw: bytes) -> dict:
@@ -1455,6 +1483,68 @@ def _start_servers(resources: dict) -> list:
     return [fabricd, runlet]
 
 
+def _start_trusted_box(port: int = 3010):
+    """Start a dedicated `runlet` in trusted-header mode on a loopback port, for the N5 acting-org
+    gate. No `fabricd` is needed — the gate fires before any egress session, and the probe script is
+    deterministic. Loopback needs no `assert_network_isolation`. Returns `(proc, base_url)` or
+    `(None, None)` if the box could not be built/started (the caller self-skips)."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+    run_dir = os.path.join(repo, ".test-run", "trusted")
+    os.makedirs(run_dir, exist_ok=True)
+    cfg = {"server": {"host": "127.0.0.1", "port": port}, "trusted": {"enabled": True}}
+    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh)
+    try:
+        subprocess.run(["cargo", "build", "-p", "runlet"], cwd=repo, check=True)
+    except Exception:
+        return None, None
+    binpath = os.path.join(repo, "target", "debug", "runlet")
+    proc = subprocess.Popen(
+        [binpath], cwd=run_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    url = f"http://127.0.0.1:{port}/execute"
+    probe = h("return json(1, null);")
+    acting = {"x-tenant-id": "ws_probe", "x-tenant-scope": "acting"}
+    for _ in range(40):
+        st, _r = _post_status(url, probe, acting)
+        if st is not None:
+            return proc, url
+        time.sleep(0.5)
+    proc.terminate()
+    return None, None
+
+
+def test_trusted_acting_scope(t: Runner):
+    """Nexus N5: in trusted-header mode a tenant-scoped request must carry `x-tenant-scope: acting`
+    (the edge's acting-org assertion) or it is rejected `403 ACTING_SCOPE_REQUIRED` before any
+    execution. Runs against a dedicated trusted-mode box on its own port."""
+    t.section("Trusted-mode acting-org assurance (nexus N5)")
+    proc, url = _start_trusted_box()
+    if proc is None:
+        print("  \033[33mSKIP\033[0m trusted-mode box failed to build/start — asserts skipped\n")
+        return
+    try:
+        script = h("return json(1, null);")
+        tenant = {"x-tenant-id": "ws_a"}
+
+        st, r = _post_status(url, script, {**tenant, "x-tenant-scope": "acting"})
+        t.check("acting-org request executes (200, data == 1)",
+                st == 200 and r is not None and r.get("data") == 1)
+
+        st, r = _post_status(url, script, tenant)
+        t.check("missing scope rejected 403 ACTING_SCOPE_REQUIRED",
+                st == 403 and _err_code(r) == "ACTING_SCOPE_REQUIRED")
+
+        st, r = _post_status(url, script, {**tenant, "x-tenant-scope": "home"})
+        t.check("non-acting scope rejected 403 ACTING_SCOPE_REQUIRED",
+                st == 403 and _err_code(r) == "ACTING_SCOPE_REQUIRED")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+
+
 def main():
     procs: list = []
 
@@ -1526,6 +1616,14 @@ def main():
 
     # Auth tests — for whichever providers were reachable at discovery (before startup).
     run_auth_tests(t, auth_providers)
+
+    # Trusted-mode acting-org gate (nexus N5): needs its own box in trusted mode. Only when this
+    # harness owns the local build/run (it spins up a second runlet on a loopback port); skipped when
+    # pointed at an already-running / remote server (JSBOX_URL), which we don't reconfigure.
+    if procs:
+        test_trusted_acting_scope(t)
+    else:
+        print("\n  \033[33mSKIP\033[0m trusted-mode N5 tests (external server; harness didn't start it)\n")
 
     t.summary()
 

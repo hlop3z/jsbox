@@ -23,6 +23,7 @@ trusted identity. `runlet` consumes that identity from operator-configured trust
 | suspended flag     | `x-user-suspended`     | `suspended` → hard reject |
 | anonymous flag     | `x-auth-anonymous`     | `anonymous` → hard reject |
 | plan (quota tier)  | `x-tenant-plan`        | `plan`                    |
+| acting-org scope   | `x-tenant-scope`       | `scope` → must be `acting` (N5) |
 
 Every name is configurable (`trusted.headers.*`) so a drift between the edge contract and the box is
 pinned in one place. Trusted mode is **opt-in** (`trusted.enabled`); the default preserves the
@@ -67,6 +68,32 @@ is the single key for:
 and never learns how the acting workspace was chosen (that is nexus upstream requirement **N5** —
 see `nexus-upstream-requirements.md`).
 
+## Acting-org assurance (the N5 tripwire)
+
+Because `x-tenant-id` is opaque, `runlet` cannot tell an *authorized acting org* apart from a user's
+*home org* — an edge that has not shipped N5 (or has drifted) would inject the home org and `runlet`
+would **silently mis-scope** a multi-org user across all four boundaries above. To close that gap the
+edge asserts acting-org authorization per request with a trusted `x-tenant-scope: acting` header, and
+`runlet` **enforces it fail-closed**: a tenant-scoped `/execute` whose `scope` is absent or not equal
+to `acting` is rejected `403 ACTING_SCOPE_REQUIRED` before any egress session or execution. The gate
+sits in `resolve_identity` alongside the anonymous / suspended / tenant-less hard-rejects — one more
+trusted-header read at the same altitude.
+
+This is **intrinsic to trusted mode** — no opt-in flag, no "accept home-org scoping" escape hatch —
+because trusted mode *means* "behind an edge doing N5." A single-workspace deployment is unaffected
+for free (home == acting, so its edge always emits `acting`). Preserving D3, `runlet` checks only the
+scope *label*; it never interprets the org relationship. Honest scope: this is a **contract tripwire,
+not cryptographic proof** — the header rides the same trusted-edge boundary as `x-tenant-id`, so it is
+only as strong as the NetworkPolicy. It defends against the *accidental* hazard (an edge without N5),
+not a compromised edge, which the trust invariant already owns. In-box JWT verification was rejected:
+it re-litigates the "no crypto in the box" decision and puts a JWKS-refresh surface on every
+`/execute`. The header name is configurable (`trusted.headers.scope`, default `x-tenant-scope`).
+
+**Runbook — bring-up ordering (producer before consumer):** the edge must emit `x-tenant-scope:
+acting` **before** a box that enforces it is rolled out, or all trusted-mode traffic 403s. There is no
+live traffic today (pre-users), so this is a fresh-deploy ordering note, not a migration: stand up the
+N5-emitting edge first, then enable trusted mode on the box.
+
 ## Coarse member authorization
 
 A config-driven `capability → required entitlement` map (`trusted.capability_entitlements`) gates
@@ -91,7 +118,7 @@ edge (Envoy per-`x-tenant-id` rate-limit). The quota engine (`quota.rs`) mirrors
 ## Request pipeline (trusted mode)
 
 ```
-edge service credential  →  trusted identity (reject anonymous/suspended/tenant-less)
+edge service credential  →  trusted identity (reject anonymous/suspended/tenant-less/non-acting-scope)
   →  partition = trusted tenant (caller-asserted ignored)  →  member-capability authz
   →  per-tenant quota admit  →  fabricd session (tenant-scoped)  →  Tier 5 + bulkhead  →  execute
 ```

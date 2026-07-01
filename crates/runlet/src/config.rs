@@ -133,6 +133,11 @@ pub(crate) struct TrustedHeaders {
     pub(crate) anonymous: String,
     /// Tenant plan header, selecting the quota tier (default `x-tenant-plan`).
     pub(crate) plan: String,
+    /// Acting-org assurance header (default `x-tenant-scope`). The edge asserts, per request, that
+    /// the tenant id is the caller's *authorized acting org* by setting this to `acting`; a
+    /// tenant-scoped request whose value is not `acting` is rejected fail-closed (nexus upstream
+    /// requirement N5). See `docs/design/multitenant-trust.md`.
+    pub(crate) scope: String,
 }
 
 impl Default for TrustedHeaders {
@@ -145,6 +150,7 @@ impl Default for TrustedHeaders {
             suspended: "x-user-suspended".to_owned(),
             anonymous: "x-auth-anonymous".to_owned(),
             plan: "x-tenant-plan".to_owned(),
+            scope: "x-tenant-scope".to_owned(),
         }
     }
 }
