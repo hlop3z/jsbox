@@ -803,8 +803,12 @@ def test_bulkhead(t: Runner):
     t.section("Bulkhead / overload (resilience)")
     import concurrent.futures
 
-    # A request that holds its permit for a few hundred ms of CPU work.
-    slow = h("var x=0; for (var i=0;i<15000000;i++){ x+=i; } return json(x>0, null);")
+    # A request that holds its permit for a few hundred ms of CPU work. Calibrated so the
+    # ~6 admitted requests finish inside the 4s engine wall-clock even on a slow shared CI
+    # runner (debug build, 6-way contention over few cores): 15M iterations blew the budget
+    # there (all admitted -> TIMEOUT, zero "ok"), 4M passes with >2x margin on a 2-CPU cgroup
+    # while still holding permits far longer than the burst ramp, so shedding stays exercised.
+    slow = h("var x=0; for (var i=0;i<4000000;i++){ x+=i; } return json(x>0, null);")
 
     def fire(_):
         r = _post(slow)
@@ -812,10 +816,16 @@ def test_bulkhead(t: Runner):
             return "none"
         if _err_code(r) == "OVERLOADED":
             return "429"
-        return "ok" if r.get("data") is True else "other"
+        if r.get("data") is True:
+            return "ok"
+        # Keep the real error code visible so a failure shows WHAT the non-ok
+        # outcomes were (PARTITION_OVERLOADED? TIMEOUT?), not an opaque "other".
+        return _err_code(r) or "other"
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=24) as ex:
         outcomes = list(ex.map(fire, range(24)))
+    from collections import Counter
+    print(f"  \033[36mINFO\033[0m burst outcomes: {dict(Counter(outcomes))}")
 
     # The bulkhead only sheds load when the configured bound is below the burst size.
     # If the server runs the default (auto, high) bound, nothing is shed — probe, don't fail.
