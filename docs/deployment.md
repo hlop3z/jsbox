@@ -229,6 +229,8 @@ cardinality rule: identity would explode Prometheus series at multi-tenant scale
 ## 9. Supply chain
 
 `task supply-chain` runs cargo-audit (advisories) + cargo-deny (licenses/bans/sources) +
-cargo-vet (every dependency audited or exempted). Wire it as a CI gate so a new or bumped
-dependency that isn't vetted fails the build. Releases are CI-only
+cargo-vet (every dependency audited or exempted). It runs as a CI gate on every PR/push
+(`ci.yml`, `audit + deny + vet` job), so a new or bumped dependency that isn't vetted fails
+the build. The cargo-vet version is pinned in lockstep between `task setup` and `ci.yml`
+(the `imports.lock` format is version-sensitive) — bump both together. Releases are CI-only
 (`.github/workflows/release.yml`, manual `workflow_dispatch`) — don't hand-edit versions.
