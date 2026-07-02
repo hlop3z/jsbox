@@ -97,9 +97,12 @@ services:
   # Subject-based messaging server for the `amq` nats-backend tests. `-js` enables
   # JetStream (harmless; the suite uses only core publish + request-reply). No auth — the
   # suite points `config.amq` at host port 4222 with `backend: "nats"`. In-network: nats:4222.
+  # `-m 8222` matters: overriding `command` drops the image's default config (which is what
+  # normally enables the 8222 monitoring port), so without it the healthz check below can
+  # never pass and `docker compose up --wait` declares the container unhealthy.
   nats:
     image: nats:2-alpine
-    command: ["-js"]
+    command: ["-js", "-m", "8222"]
     ports:
       - "4222:4222"
       - "8222:8222"

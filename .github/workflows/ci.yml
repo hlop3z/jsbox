@@ -66,7 +66,17 @@ jobs:
       - name: Install supply-chain tools
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit,cargo-deny,cargo-vet
+          tool: cargo-audit,cargo-deny
+
+      # cargo-vet is pinned and built from crates.io (cached across runs): the GitHub
+      # releases (what install-action ships) stop at 0.10.0, which cannot parse the
+      # `trusted-publisher` entries that 0.10.2 writes into imports.lock — and that
+      # upstream audit sets now contain. Keep this pin in lockstep with the local
+      # cargo-vet that (re)generates supply-chain/imports.lock.
+      - name: Install cargo-vet
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: cargo-vet@0.10.2
 
       - name: cargo audit
         run: cargo audit
