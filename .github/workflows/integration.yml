@@ -39,7 +39,14 @@ jobs:
       - name: Start backends
         run: >
           docker compose up -d --wait
-          postgres pgbouncer cockroach cockroach-init httpbin redis rabbitmq mongo nats
+          postgres pgbouncer cockroach httpbin redis rabbitmq mongo nats
+
+      # cockroach-init is a one-shot job (create db/user/grant, then exit). It must
+      # NOT be in the --wait set above: `up --wait` treats a waited-on container that
+      # exits — even with code 0 — as a wait failure and returns 1. Run it to
+      # completion here instead, so a genuine init error still fails the step.
+      - name: Initialize CockroachDB
+        run: docker compose run --rm cockroach-init
 
       # Warm the build so the harness's `cargo run` starts promptly.
       - name: Pre-build server
