@@ -1,6 +1,7 @@
 //! HTTP handler for the `/execute` endpoint.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,7 @@ use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use serde_json::{Value, json};
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task;
@@ -43,6 +45,7 @@ use runlet_core::sys::SysConfig;
 
 use crate::authz::authorize_capabilities;
 use crate::config::TrustedHeaders;
+use crate::events::{AuditBody, CapabilityOps, Event, EventBody, Sink, UsageBody};
 use crate::identity::TrustedIdentity;
 use crate::quota::{QuotaExceeded, QuotaGuard, TenantQuota};
 use crate::sidecar::{SessionError, SidecarEgress, SidecarTransport, connect_session};
@@ -86,6 +89,12 @@ pub(crate) struct AppState {
     /// configured trusted headers, rejects anonymous/suspended, and keys fairness/cache/egress/
     /// quota off the trusted tenant id. `None` = single-tenant behavior (caller-asserted partition).
     pub(crate) trusted: Option<Arc<TrustedRuntime>>,
+    /// Per-tenant usage + audit event sink (Change C). `None` when event emission is disabled;
+    /// every emit site is a no-op then. Non-blocking + fail-open (see `events.rs`).
+    pub(crate) events: Option<Arc<dyn Sink>>,
+    /// Live handle to the dropped-events counter, rendered as `runlet_events_dropped_total` (the
+    /// backpressure signal). `None` when events are disabled.
+    pub(crate) event_dropped: Option<Arc<AtomicU64>>,
 }
 
 /// Resolved trusted-header-mode runtime state, shared into the handler. Present only when
@@ -577,6 +586,13 @@ async fn run_execute(
         Ok(Json(req)) => req,
         Err(rejection) => {
             state.metrics.record_rejection();
+            emit_denied(
+                &state,
+                identity.as_ref(),
+                &trace_id,
+                "MALFORMED_REQUEST",
+                None,
+            );
             return malformed_request_response(&state, &rejection);
         }
     };
@@ -609,6 +625,13 @@ async fn run_execute(
         Ok(source) => source,
         Err(rejection) => {
             state.metrics.record_rejection();
+            emit_denied(
+                &state,
+                identity.as_ref(),
+                &trace_id,
+                "SCRIPT_NOT_FOUND",
+                None,
+            );
             let (status, envelope) = *rejection;
             let meta = Meta::new(trace_id, 0, context_bytes, 0)
                 .with_key(key)
@@ -626,6 +649,13 @@ async fn run_execute(
         engine_cfg.max_context_size,
     ) {
         state.metrics.record_rejection();
+        emit_denied(
+            &state,
+            identity.as_ref(),
+            &trace_id,
+            "INPUT_TOO_LARGE",
+            None,
+        );
         let meta = Meta::new(trace_id, script_bytes, context_bytes, 0)
             .with_key(key)
             .with_partition(partition);
@@ -638,7 +668,7 @@ async fn run_execute(
     // Per-tenant quota (trusted mode): attribute this execution to the trusted tenant and enforce
     // the plan's hard cap. The guard is held across the execution span (released on drop) and
     // returns the structured over-limit result when at/above the limit.
-    let _quota_guard = match enforce_quota(&state, identity.as_ref(), || {
+    let _quota_guard = match enforce_quota(&state, identity.as_ref(), &trace_id, || {
         base_error_meta(
             &trace_id,
             script_bytes,
@@ -664,6 +694,13 @@ async fn run_execute(
             Ok(conn) => Some(conn),
             Err(err) => {
                 state.metrics.record_rejection();
+                emit_denied(
+                    &state,
+                    identity.as_ref(),
+                    &trace_id,
+                    "EGRESS_UNAVAILABLE",
+                    None,
+                );
                 let meta = Meta::new(trace_id, script_bytes, context_bytes, 0)
                     .with_key(key)
                     .with_partition(partition);
@@ -686,7 +723,10 @@ async fn run_execute(
     );
     let (partition_permit, permit) = match admit(&state, partition.as_deref(), busy_meta) {
         Ok(permits) => permits,
-        Err(shed) => return *shed,
+        Err(shed) => {
+            emit_denied(&state, identity.as_ref(), &trace_id, "OVERLOADED", None);
+            return *shed;
+        }
     };
 
     // The blocking task wraps the pre-connected `fabricd` session as the egress, runs the
@@ -747,7 +787,7 @@ async fn run_execute(
     let base_meta = Meta::new(trace_id, script_bytes, context_bytes, exec_time_us)
         .with_key(key)
         .with_partition(partition);
-    build_response(result, base_meta, error_debug, &state.metrics)
+    build_response(result, base_meta, error_debug, &state, identity.as_ref())
 }
 
 /// `GET /metrics` — Prometheus text exposition of the process-wide counters and live
@@ -758,9 +798,19 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> impl IntoResponse 
     // reports zero trips, keeping the `runlet_db_breaker_trips_total` series present when the breaker is off.
     let trips = 0_u64;
     let cache = state.host.bytecode_cache_stats();
-    let body = state
+    let mut body = state
         .metrics
         .render(available, state.bulkhead_capacity, trips, cache);
+    // Event-pipeline backpressure gauge (Change C): appended here since the counter lives in
+    // `runlet` (the event sink), not the `runlet-core` metrics registry. Absent series ⇒ 0.
+    if let Some(counter) = state.event_dropped.as_ref() {
+        let dropped = counter.load(Ordering::Relaxed);
+        body = format!(
+            "{body}# HELP runlet_events_dropped_total Usage/audit events dropped due to a full buffer.\n\
+             # TYPE runlet_events_dropped_total counter\n\
+             runlet_events_dropped_total {dropped}\n"
+        );
+    }
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -768,14 +818,85 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> impl IntoResponse 
     )
 }
 
+/// Extracts `(tenant, user, plan)` from an optional trusted identity for event attribution.
+fn identity_fields(
+    identity: Option<&TrustedIdentity>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    identity.map_or((None, None, None), |id| {
+        (id.tenant.clone(), id.user.clone(), id.plan.clone())
+    })
+}
+
+/// Emits a `usage` event plus an `allowed` audit event for an executed request (Change C). A no-op
+/// when event emission is disabled. Every request that reaches execution produces exactly these two.
+fn emit_executed(state: &AppState, identity: Option<&TrustedIdentity>, meta: &Meta, outcome: &str) {
+    let Some(sink) = state.events.as_deref() else {
+        return;
+    };
+    let (tenant, user, plan) = identity_fields(identity);
+    let ops = CapabilityOps {
+        db: meta.db_requests.len(),
+        mongo: meta.mongo_requests.len(),
+        http: meta.http_requests.len(),
+        mail: meta.mail_requests.len(),
+        s3: meta.s3_requests.len(),
+        redis: meta.redis_requests.len(),
+        amq: meta.amq_requests.len(),
+        auth: meta.auth_requests.len(),
+    };
+    let usage = EventBody::Usage(UsageBody {
+        outcome: outcome.to_owned(),
+        exec_time_us: meta.exec_time_us,
+        input_bytes: meta.total_input_bytes,
+        ops,
+    });
+    sink.record(Event::new(
+        tenant.clone(),
+        user.clone(),
+        plan.clone(),
+        meta.trace_id.clone(),
+        usage,
+    ));
+    let audit = EventBody::Audit(AuditBody {
+        decision: "allowed",
+        reason: None,
+        detail: None,
+    });
+    sink.record(Event::new(tenant, user, plan, meta.trace_id.clone(), audit));
+}
+
+/// Emits a `denied` audit event carrying the reject reason code (and optional detail) at a gate.
+/// A no-op when event emission is disabled.
+fn emit_denied(
+    state: &AppState,
+    identity: Option<&TrustedIdentity>,
+    trace_id: &str,
+    reason: &str,
+    detail: Option<Value>,
+) {
+    let Some(sink) = state.events.as_deref() else {
+        return;
+    };
+    let (tenant, user, plan) = identity_fields(identity);
+    let audit = EventBody::Audit(AuditBody {
+        decision: "denied",
+        reason: Some(reason.to_owned()),
+        detail,
+    });
+    sink.record(Event::new(tenant, user, plan, trace_id.to_owned(), audit));
+}
+
 /// Turns the `spawn_blocking` result into the final HTTP response, attaching metrics to
-/// `meta` on success and classifying the error otherwise.
+/// `meta` on success and classifying the error otherwise. Also emits the per-request `usage` +
+/// `allowed` audit events (the single executed-request event site, Change C).
 fn build_response(
     result: Result<(Result<Outcome, EngineError>, BackendMetrics), task::JoinError>,
     base_meta: Meta,
     error_debug: bool,
-    metrics: &Metrics,
+    state: &AppState,
+    identity: Option<&TrustedIdentity>,
 ) -> AxumResponse {
+    let metrics: &Metrics = &state.metrics;
     // Record latency for every execution that ran (shed/rejected requests return earlier).
     metrics.observe_execution(base_meta.exec_time_us);
     match result {
@@ -786,26 +907,33 @@ fn build_response(
             let meta = base_meta.with_metrics(exec.metrics, backend);
             match exec.result {
                 ExecOutcome::Success(js_json) => {
+                    emit_executed(state, identity, &meta, "success");
                     metrics.record_success();
                     record_span_outcome("success");
                     success_response(&js_json, meta, error_debug)
                 }
                 ExecOutcome::Error(engine_err) => {
+                    let outcome = engine_error_outcome(&engine_err);
+                    emit_executed(state, identity, &meta, outcome);
                     metrics.record_engine_error(&engine_err);
-                    record_span_outcome(engine_error_outcome(&engine_err));
+                    record_span_outcome(outcome);
                     engine_error_response(engine_err, meta, error_debug)
                 }
             }
         }
         Ok((Err(engine_err), _backend)) => {
+            let outcome = engine_error_outcome(&engine_err);
+            emit_executed(state, identity, &base_meta, outcome);
             metrics.record_engine_error(&engine_err);
-            record_span_outcome(engine_error_outcome(&engine_err));
+            record_span_outcome(outcome);
             engine_error_response(engine_err, base_meta, error_debug)
         }
         Err(join_err) => {
             let engine_err = EngineError::Internal(format!("task panicked: {join_err}"));
+            let outcome = engine_error_outcome(&engine_err);
+            emit_executed(state, identity, &base_meta, outcome);
             metrics.record_engine_error(&engine_err);
-            record_span_outcome(engine_error_outcome(&engine_err));
+            record_span_outcome(outcome);
             engine_error_response(engine_err, base_meta, error_debug)
         }
     }
@@ -1030,6 +1158,13 @@ fn resolve_identity(
     };
     let identity = TrustedIdentity::from_headers(headers, &trusted.headers);
     if identity.anonymous {
+        emit_denied(
+            state,
+            Some(&identity),
+            trace_id,
+            "ANONYMOUS_FORBIDDEN",
+            None,
+        );
         return Err(Box::new(identity_rejected(
             trace_id,
             "ANONYMOUS_FORBIDDEN",
@@ -1037,6 +1172,13 @@ fn resolve_identity(
         )));
     }
     if identity.suspended {
+        emit_denied(
+            state,
+            Some(&identity),
+            trace_id,
+            "SUSPENDED_FORBIDDEN",
+            None,
+        );
         return Err(Box::new(identity_rejected(
             trace_id,
             "SUSPENDED_FORBIDDEN",
@@ -1044,6 +1186,7 @@ fn resolve_identity(
         )));
     }
     if identity.tenant.is_none() {
+        emit_denied(state, Some(&identity), trace_id, "TENANT_REQUIRED", None);
         return Err(Box::new(identity_rejected(
             trace_id,
             "TENANT_REQUIRED",
@@ -1056,6 +1199,13 @@ fn resolve_identity(
     // reject before any session or execution so a silent multi-org mis-scope becomes a loud 403.
     // `runlet` checks only the scope label; it never derives the org relationship itself (D3).
     if identity.scope.as_deref() != Some("acting") {
+        emit_denied(
+            state,
+            Some(&identity),
+            trace_id,
+            "ACTING_SCOPE_REQUIRED",
+            None,
+        );
         return Err(Box::new(identity_rejected(
             trace_id,
             "ACTING_SCOPE_REQUIRED",
@@ -1140,6 +1290,13 @@ fn enforce_member_authz(
                 "capability `{}` requires entitlement `{}`",
                 denied.capability, denied.required
             );
+            emit_denied(
+                state,
+                identity,
+                trace_id,
+                "ENTITLEMENT_REQUIRED",
+                Some(json!({ "capability": denied.capability, "required": denied.required })),
+            );
             let meta = Meta::new(trace_id.to_owned(), 0, 0, 0);
             Some(Box::new(system_error_response(
                 request_error("ENTITLEMENT_REQUIRED", message),
@@ -1156,6 +1313,7 @@ fn enforce_member_authz(
 fn enforce_quota<F: FnOnce() -> Meta>(
     state: &AppState,
     identity: Option<&TrustedIdentity>,
+    trace_id: &str,
     meta: F,
 ) -> Result<Option<QuotaGuard>, Box<AxumResponse>> {
     let (Some(trusted), Some(id)) = (state.trusted.as_ref(), identity) else {
@@ -1169,7 +1327,20 @@ fn enforce_quota<F: FnOnce() -> Meta>(
     };
     match quota.admit(tenant, id.plan.as_deref()) {
         Ok(guard) => Ok(Some(guard)),
-        Err(exceeded) => Err(Box::new(quota_exceeded_response(&exceeded, meta()))),
+        Err(exceeded) => {
+            emit_denied(
+                state,
+                identity,
+                trace_id,
+                "QUOTA_EXCEEDED",
+                Some(json!({
+                    "plan": exceeded.plan,
+                    "limit": exceeded.limit,
+                    "usage": exceeded.usage,
+                })),
+            );
+            Err(Box::new(quota_exceeded_response(&exceeded, meta())))
+        }
     }
 }
 
@@ -1433,6 +1604,7 @@ mod trusted_pipeline_tests {
         AppState, ExecRequest, RequestConfig, RequestIo, TrustedRuntime, default_context, execute,
     };
     use crate::config::TrustedHeaders;
+    use crate::events::{Event, Sink};
     use crate::quota::{PlanLimit, TenantQuota};
     use crate::sidecar::SidecarTransport;
     use axum::Json;
@@ -1447,6 +1619,7 @@ mod trusted_pipeline_tests {
     use runlet_core::registry::ScriptRegistry;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use tokio::sync::Semaphore;
 
     /// Builds an app state in trusted mode with the given member-authz gate + optional quota, a tiny
@@ -1483,6 +1656,8 @@ mod trusted_pipeline_tests {
                 capability_entitlements: gate,
                 quota,
             })),
+            events: None,
+            event_dropped: None,
         }
     }
 
@@ -1508,6 +1683,102 @@ mod trusted_pipeline_tests {
             .await
             .into_response()
             .status()
+    }
+
+    /// A test sink that captures each event's serialized JSON, so a flow test can assert the
+    /// per-path emit-count invariant without exposing `Event`'s private fields.
+    #[derive(Debug, Default)]
+    struct CapturingSink {
+        /// Serialized JSON of every recorded event.
+        lines: Mutex<Vec<String>>,
+    }
+
+    impl Sink for CapturingSink {
+        fn record(&self, event: Event) {
+            let Ok(json) = serde_json::to_string(&event) else {
+                return;
+            };
+            if let Ok(mut lines) = self.lines.lock() {
+                lines.push(json);
+            }
+        }
+    }
+
+    impl CapturingSink {
+        /// A snapshot of the captured event JSON lines.
+        fn lines(&self) -> Vec<String> {
+            self.lines
+                .lock()
+                .map_or_else(|_| Vec::new(), |guard| guard.clone())
+        }
+    }
+
+    /// Executed request ⇒ exactly one `usage` + one `allowed` audit event.
+    #[tokio::test]
+    async fn events_executed_emits_usage_plus_allowed_audit() {
+        let sink = Arc::new(CapturingSink::default());
+        let sink_concrete = Arc::clone(&sink);
+        let sink_dyn: Arc<dyn Sink> = sink_concrete;
+        let mut app = state(HashMap::new(), None);
+        app.events = Some(sink_dyn);
+        let hdrs = headers(&[("x-tenant-id", "ws_a"), ("x-tenant-scope", "acting")]);
+        assert_eq!(
+            run(&app, hdrs, RequestConfig::default()).await,
+            StatusCode::OK
+        );
+        let lines = sink.lines();
+        let usage = lines
+            .iter()
+            .filter(|line| line.contains("\"type\":\"usage\""))
+            .count();
+        let allowed = lines
+            .iter()
+            .filter(|line| {
+                line.contains("\"type\":\"audit\"") && line.contains("\"decision\":\"allowed\"")
+            })
+            .count();
+        assert_eq!(usage, 1, "one usage event for an executed request");
+        assert_eq!(allowed, 1, "one allowed audit event");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.contains("\"tenant\":\"ws_a\"")),
+            "events attributed to the tenant"
+        );
+    }
+
+    /// Rejected request ⇒ zero `usage`, exactly one `denied` audit carrying the reason.
+    #[tokio::test]
+    async fn events_denied_emits_audit_only_with_reason() {
+        let sink = Arc::new(CapturingSink::default());
+        let sink_concrete = Arc::clone(&sink);
+        let sink_dyn: Arc<dyn Sink> = sink_concrete;
+        let mut plans = HashMap::new();
+        let _ = plans.insert("denied".to_owned(), PlanLimit { max_concurrent: 0 });
+        let mut app = state(HashMap::new(), Some(TenantQuota::new(plans)));
+        app.events = Some(sink_dyn);
+        let hdrs = headers(&[
+            ("x-tenant-id", "ws_a"),
+            ("x-tenant-scope", "acting"),
+            ("x-tenant-plan", "denied"),
+        ]);
+        assert_eq!(
+            run(&app, hdrs, RequestConfig::default()).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let lines = sink.lines();
+        let usage = lines
+            .iter()
+            .filter(|line| line.contains("\"type\":\"usage\""))
+            .count();
+        let denied = lines
+            .iter()
+            .filter(|line| {
+                line.contains("\"decision\":\"denied\"") && line.contains("QUOTA_EXCEEDED")
+            })
+            .count();
+        assert_eq!(usage, 0, "no usage event for a rejected request");
+        assert_eq!(denied, 1, "one denied audit carrying the quota reason");
     }
 
     /// An anonymous caller is rejected `403` before any execution.

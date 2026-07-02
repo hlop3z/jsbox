@@ -92,6 +92,32 @@ pub(crate) struct Config {
     /// `telemetry.rs` and `docs/design/nexus-upstream-requirements.md` (N6).
     #[serde(default)]
     pub(crate) telemetry: TelemetryConfig,
+    /// Per-tenant usage + audit event emission (the `events` block). Off by default. See
+    /// `events.rs`.
+    #[serde(default)]
+    pub(crate) events: EventsConfig,
+}
+
+/// Per-tenant usage + audit event emission (the `events` block). Emits one `usage` event per
+/// executed request and one `audit` event per request (allowed / denied-with-reason) to a
+/// dedicated stdout stream, non-blocking and fail-open. Off by default (fully inert).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub(crate) struct EventsConfig {
+    /// Turn on usage + audit event emission. `false` (default) ⇒ no events, no writer task.
+    pub(crate) enabled: bool,
+    /// Bounded event-channel capacity; beyond it events are dropped (fail-open) and the
+    /// `runlet_events_dropped_total` counter increments. Default `4096`.
+    pub(crate) buffer: usize,
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            buffer: 4096,
+        }
+    }
 }
 
 /// Distributed-tracing config (the `telemetry` block). Metrics stay Prometheus PULL; this block
@@ -411,6 +437,21 @@ mod tests {
             cfg.telemetry.service_name, "runlet",
             "omitted service_name falls back to the default"
         );
+    }
+
+    /// Events emission is off by default with a sane buffer; a block parses enabled + buffer.
+    #[test]
+    fn events_defaults_and_parse() {
+        let cfg = Config::default();
+        assert!(!cfg.events.enabled, "events off by default (inert)");
+        assert_eq!(cfg.events.buffer, 4096);
+
+        let json = r#"{"events":{"enabled":true,"buffer":256}}"#;
+        let parsed = serde_json::from_str::<Config>(json);
+        assert!(parsed.is_ok(), "events block should parse");
+        let parsed_cfg = parsed.unwrap_or_default();
+        assert!(parsed_cfg.events.enabled);
+        assert_eq!(parsed_cfg.events.buffer, 256);
     }
 
     /// Builds a config in trusted-header mode with a chosen bind + isolation assertion. A token is

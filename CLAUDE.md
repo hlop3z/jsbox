@@ -115,7 +115,12 @@ context and returns `{data, error, meta}`. The single endpoint is the whole prod
   **pushed** OTLP/gRPC to a collector (plaintext to a local collector ⇒ no second crypto stack;
   `cargo tree -i ring` still empty). Identity (tenant/user/plan) rides spans/logs as **attributes,
   never metric labels** (cardinality). Tracing continues a W3C `traceparent` from the edge (N6) or
-  starts its own root; export is non-blocking + fail-open. Optional **trusted-identity mode**
+  starts its own root; export is non-blocking + fail-open. Optional **per-tenant events**
+  (`events.rs`, opt-in `config.events`): one unified versioned envelope per request to a dedicated
+  stdout JSON stream — a `usage` event per executed request (billing dims) + an `audit` event per
+  request (`allowed`, or `denied`+reason at each gate), keyed by tenant. Non-blocking + unsampled
+  (bounded channel, drop-on-full → `runlet_events_dropped_total`); the `event_id` + schema are the
+  seam for a later durable billing outbox. Optional **trusted-identity mode**
   (`config.trusted`, opt-in): behind the nexus edge the box derives tenant/user identity from
   configured trusted headers (`identity.rs`), rejects anonymous/suspended callers, keys Tier 5
   fairness + the bytecode-cache namespace off the trusted tenant id (dropping the caller-asserted

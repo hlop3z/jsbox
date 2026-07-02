@@ -2,6 +2,7 @@
 
 mod authz;
 mod config;
+mod events;
 mod handler;
 mod identity;
 mod quota;
@@ -186,6 +187,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // A cheap clone (all `Arc`-backed) kept out of `AppState` so the warm runtime pool can be
     // disposed after axum has drained in-flight requests.
     let host_lifecycle = host.clone();
+
+    // Per-tenant usage + audit event pipeline (Change C): a bounded, non-blocking writer task
+    // streaming JSON events to stdout. `None` when disabled — every emit site is then a no-op.
+    let (event_pipeline, event_sink, event_dropped) = if config.events.enabled {
+        let (pipeline, sink) = events::EventPipeline::spawn(config.events.buffer);
+        let dropped = pipeline.dropped_handle();
+        info!(buffer = config.events.buffer, "per-tenant events enabled");
+        (Some(pipeline), Some(sink), Some(dropped))
+    } else {
+        (None, None, None)
+    };
+
     let state = AppState {
         host,
         registry,
@@ -198,6 +211,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         bulkhead_capacity: max_concurrent,
         access_token,
         trusted,
+        events: event_sink,
+        event_dropped,
     };
 
     let app = Router::new()
@@ -228,6 +243,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Flush + shut down the tracer provider so buffered spans are exported before exit (no-op
     // when tracing is disabled).
     telemetry_guard.shutdown();
+
+    // Best-effort flush of buffered events: the router (and its event sink) has been dropped with
+    // `app`, so the channel is closed; await the writer draining the remainder.
+    if let Some(pipeline) = event_pipeline {
+        pipeline.shutdown().await;
+    }
 
     info!("server shut down gracefully");
     Ok(())

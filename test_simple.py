@@ -1634,6 +1634,97 @@ def test_telemetry_tracing(t: Runner):
             proc.kill()
 
 
+def _start_events_box(port: int = 3012):
+    """Start a dedicated trusted-mode `runlet` with per-tenant events enabled, capturing stdout so
+    the test can read the emitted usage/audit event stream. Returns `(proc, url, log_path)` or
+    `(None, None, None)`."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+    run_dir = os.path.join(repo, ".test-run", "events")
+    os.makedirs(run_dir, exist_ok=True)
+    cfg = {
+        "server": {"host": "127.0.0.1", "port": port},
+        "trusted": {"enabled": True},
+        "events": {"enabled": True, "buffer": 1024},
+    }
+    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh)
+    try:
+        subprocess.run(["cargo", "build", "-p", "runlet"], cwd=repo, check=True)
+    except Exception:
+        return None, None, None
+    binpath = os.path.join(repo, "target", "debug", "runlet")
+    log_path = os.path.join(run_dir, "stdout.log")
+    logf = open(log_path, "w", encoding="utf-8")  # noqa: SIM115 (held for the child's lifetime)
+    proc = subprocess.Popen([binpath], cwd=run_dir, stdout=logf, stderr=subprocess.STDOUT)
+    url = f"http://127.0.0.1:{port}/execute"
+    probe = h("return json(1, null);")
+    for _ in range(40):
+        st, _r = _post_status(url, probe, {"x-tenant-id": "ws_probe", "x-tenant-scope": "acting"})
+        if st is not None:
+            return proc, url, log_path
+        time.sleep(0.5)
+    proc.terminate()
+    return None, None, None
+
+
+def _read_events(log_path: str) -> list:
+    """Parse the emitted event stream from the box's stdout: JSON lines carrying `event_id`
+    (distinct from the JSON app-log lines)."""
+    events = []
+    with open(log_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and "event_id" in obj:
+                events.append(obj)
+    return events
+
+
+def test_per_tenant_events(t: Runner):
+    """Per-tenant usage + audit events: an executed request emits one `usage` + one `allowed`
+    audit event attributed to the tenant; a scope-denied request emits one `denied` audit event
+    with the reason and no usage event. Every event carries `event_id` + `trace_id`."""
+    t.section("Per-tenant usage + audit events")
+    proc, url, log_path = _start_events_box()
+    if proc is None:
+        print("  \033[33mSKIP\033[0m events box failed to build/start — asserts skipped\n")
+        return
+    try:
+        script = h("return json(1, null);")
+        # Executed request (acting scope) → usage + allowed audit.
+        st, _r = _post_status(url, script, {"x-tenant-id": "ws_ev", "x-tenant-scope": "acting"})
+        t.check("acting request executes (200)", st == 200)
+        # Denied request (no acting scope) → denied audit, no usage.
+        st2, _r2 = _post_status(url, script, {"x-tenant-id": "ws_ev"})
+        t.check("missing scope rejected (403)", st2 == 403)
+
+        time.sleep(0.6)  # let the writer task flush
+        events = _read_events(log_path)
+        usage = [e for e in events if e.get("type") == "usage" and e.get("tenant") == "ws_ev"]
+        allowed = [e for e in events
+                   if e.get("type") == "audit" and e.get("decision") == "allowed"
+                   and e.get("tenant") == "ws_ev"]
+        denied = [e for e in events
+                  if e.get("type") == "audit" and e.get("decision") == "denied"
+                  and e.get("reason") == "ACTING_SCOPE_REQUIRED"]
+        t.check("usage event emitted for the executed request", len(usage) >= 1)
+        t.check("allowed audit event emitted", len(allowed) >= 1)
+        t.check("denied audit event carries ACTING_SCOPE_REQUIRED", len(denied) >= 1)
+        t.check("every event carries event_id + trace_id",
+                bool(events) and all("event_id" in e and "trace_id" in e for e in events))
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+
+
 def main():
     procs: list = []
 
@@ -1712,8 +1803,9 @@ def main():
     if procs:
         test_trusted_acting_scope(t)
         test_telemetry_tracing(t)
+        test_per_tenant_events(t)
     else:
-        print("\n  \033[33mSKIP\033[0m trusted-mode N5 + telemetry tests (external server; harness didn't start it)\n")
+        print("\n  \033[33mSKIP\033[0m trusted-mode N5 + telemetry + events tests (external server; harness didn't start it)\n")
 
     t.summary()
 

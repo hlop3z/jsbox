@@ -204,6 +204,28 @@ cardinality rule: identity would explode Prometheus series at multi-tenant scale
   a W3C `traceparent`; the box continues it. Until then, box-rooted traces still work. See
   `docs/design/nexus-upstream-requirements.md` (N6).
 
+**Per-tenant usage + audit events** (billing/quota-tuning + the compliance trail). Enable with an
+`events` block:
+
+```json
+"events": { "enabled": true, "buffer": 4096 }
+```
+
+- One **unified, versioned event** per request to a dedicated **stdout JSON stream** (distinct from
+  the app logs — route on the envelope: `{v, event_id, ts, tenant, user, plan, trace_id, type}`):
+  a `usage` event per executed request (outcome, exec time, input bytes, per-capability op counts),
+  and an `audit` event per request — `allowed`, or `denied` with a reason code (anonymous /
+  suspended / tenant-less / acting-scope / entitlement / quota / oversized / egress / overload).
+- Identity (tenant/user/plan) rides **events**, never metric labels (cardinality). Events are
+  **unsampled** (every request) — unlike traces.
+- Emission is **non-blocking + fail-open**: events go to a bounded channel (`buffer`) drained by a
+  writer task; a full buffer **drops** events (the request never blocks) and increments
+  `runlet_events_dropped_total` (the backpressure gauge on `/metrics` — watch it and raise `buffer`
+  or scale if it climbs). Off by default; fully inert when disabled.
+- **`event_id`** is a per-event dedup key: today the stream is observability-grade (lossy under
+  pressure); the schema + key are designed so a **durable, billing-grade outbox** can be added later
+  (a new sink impl) without changing what the box emits.
+
 ## 9. Supply chain
 
 `task supply-chain` runs cargo-audit (advisories) + cargo-deny (licenses/bans/sources) +
