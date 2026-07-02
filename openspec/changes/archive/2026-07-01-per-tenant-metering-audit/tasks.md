@@ -56,5 +56,5 @@
 - [x] 6.2 Run the full gate in Docker: `cargo fmt --check`, `cargo clippy` (clean), `cargo test`,
   supply-chain (`cargo audit`/`deny`/`vet`); confirm no new dependencies and `cargo tree -i ring`
   unchanged.
-- [ ] 6.3 Run `/opsx:sync` to fold the `tenant-metering` + `tenant-audit` specs into the main specs,
+- [x] 6.3 Run `/opsx:sync` to fold the `tenant-metering` + `tenant-audit` specs into the main specs,
   then archive.
